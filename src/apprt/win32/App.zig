@@ -180,6 +180,9 @@ extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
 extern "user32" fn SetFocus(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
+extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
+const WS_CAPTION_BIT: u32 = 0x00C00000;
+const WS_EX_TOPMOST: i32 = 0x00000008;
 extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
@@ -839,6 +842,43 @@ pub fn performAction(
             if (self.hwnd) |hwnd| _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
             return true;
         },
+        .toggle_window_decorations => {
+            if (self.hwnd) |hwnd| {
+                const style = GetWindowLongW(hwnd, GWL_STYLE);
+                const has_caption = (style & WS_CAPTION_BIT) != 0;
+                const new_style = if (has_caption)
+                    style & ~@as(i32, @bitCast(WS_CAPTION_BIT))
+                else
+                    style | @as(i32, @bitCast(WS_CAPTION_BIT));
+                _ = SetWindowLongW(hwnd, GWL_STYLE, new_style);
+                _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x0020 | 0x0001 | 0x0002 | 0x0004); // SWP_FRAMECHANGED | SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER
+            }
+            return true;
+        },
+        .toggle_visibility => {
+            if (self.hwnd) |hwnd| {
+                const visible = IsWindowVisible(hwnd) != 0;
+                _ = ShowWindow(hwnd, if (visible) 0 else SW_SHOWNORMAL); // SW_HIDE=0
+            }
+            return true;
+        },
+        .float_window => {
+            if (self.hwnd) |hwnd| {
+                const topmost: ?HWND = switch (value) {
+                    .on => @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))), // HWND_TOPMOST
+                    .off => @ptrFromInt(@as(usize, @bitCast(@as(isize, -2)))), // HWND_NOTOPMOST
+                    .toggle => blk: {
+                        const ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                        break :blk if ((ex & WS_EX_TOPMOST) != 0)
+                            @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))))
+                        else
+                            @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+                    },
+                };
+                _ = SetWindowPos(hwnd, topmost, 0, 0, 0, 0, 0x0001 | 0x0002); // SWP_NOSIZE | SWP_NOMOVE
+            }
+            return true;
+        },
         .goto_split => {
             self.gotoSplit(value);
             return true;
@@ -858,10 +898,8 @@ pub fn performAction(
         .new_tab,
         .close_tab,
         .toggle_tab_overview,
-        .toggle_window_decorations,
         .toggle_quick_terminal,
         .toggle_command_palette,
-        .toggle_visibility,
         .toggle_background_opacity,
         .move_tab,
         .goto_tab,
@@ -870,7 +908,6 @@ pub fn performAction(
         .render_inspector,
         .set_tab_title,
         .prompt_title,
-        .float_window,
         .key_sequence,
         .key_table,
         .undo,
