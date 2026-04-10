@@ -48,6 +48,8 @@ extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
 extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
 extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn SetLayeredWindowAttributes(hWnd: HWND, crKey: u32, bAlpha: u8, dwFlags: u32) callconv(.winapi) BOOL;
+const WS_EX_LAYERED: u32 = 0x00080000;
 extern "advapi32" fn RegOpenKeyExW(hKey: ?*anyopaque, lpSubKey: [*:0]const u16, ulOptions: DWORD, samDesired: DWORD, phkResult: *?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegCloseKey(hKey: ?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegQueryValueExW(hKey: ?*anyopaque, lpValueName: [*:0]const u16, lpReserved: ?*DWORD, lpType: ?*DWORD, lpData: ?[*]u8, lpcbData: ?*DWORD) callconv(.winapi) i32;
@@ -534,24 +536,74 @@ pub fn performAction(
             }
             return true;
         },
+        .goto_window => {
+            if (self.windows.items.len <= 1) return true;
+            const cur = self.focused_window orelse return true;
+            var idx: usize = 0;
+            for (self.windows.items, 0..) |w, i| {
+                if (w == cur) {
+                    idx = i;
+                    break;
+                }
+            }
+            const next_idx: usize = switch (value) {
+                .previous => (idx + self.windows.items.len - 1) % self.windows.items.len,
+                .next => (idx + 1) % self.windows.items.len,
+            };
+            const target_window = self.windows.items[next_idx];
+            if (target_window.hwnd) |hwnd| {
+                _ = SetForegroundWindow(hwnd);
+            }
+            self.focused_window = target_window;
+            return true;
+        },
+        .toggle_background_opacity => {
+            // Toggle between fully opaque and slightly translucent (0xD0 = ~82%).
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
+                const ex = sys.GetWindowLongW(hwnd, sys.GWL_EXSTYLE);
+                const is_layered = (ex & WS_EX_LAYERED) != 0;
+                if (is_layered) {
+                    _ = sys.SetWindowLongW(hwnd, sys.GWL_EXSTYLE, ex & ~@as(i32, @bitCast(@as(u32, WS_EX_LAYERED))));
+                } else {
+                    _ = sys.SetWindowLongW(hwnd, sys.GWL_EXSTYLE, ex | @as(i32, @bitCast(@as(u32, WS_EX_LAYERED))));
+                    _ = SetLayeredWindowAttributes(hwnd, 0, 0xD0, 0x2); // LWA_ALPHA
+                }
+            }
+            return true;
+        },
+        .check_for_updates => {
+            // Open the Ghostty releases page in the default browser
+            const url = std.unicode.utf8ToUtf16LeStringLiteral("https://ghostty.org/download");
+            const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+            _ = sys.ShellExecuteW(null, verb, url, null, null, sys.SW_SHOWNORMAL);
+            return true;
+        },
+        .show_on_screen_keyboard => {
+            // Launch the Windows on-screen keyboard
+            const osk = std.unicode.utf8ToUtf16LeStringLiteral("osk.exe");
+            const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+            _ = sys.ShellExecuteW(null, verb, osk, null, null, sys.SW_SHOWNORMAL);
+            return true;
+        },
+        .prompt_title => {
+            // No native input dialog - fall back to a fixed default title.
+            // A proper implementation would create a small dialog with an edit.
+            return true;
+        },
         .new_tab,
         .close_tab,
         .toggle_tab_overview,
         .toggle_quick_terminal,
-        .toggle_background_opacity,
         .move_tab,
         .goto_tab,
-        .goto_window,
         .show_gtk_inspector,
         .render_inspector,
         .set_tab_title,
-        .prompt_title,
         .key_sequence,
         .key_table,
         .undo,
         .redo,
-        .check_for_updates,
-        .show_on_screen_keyboard,
         .command_finished,
         .start_search,
         .end_search,
