@@ -101,6 +101,12 @@ core_surface: ?*CoreSurface = null,
 width: u32 = 800,
 height: u32 = 600,
 
+/// Last known cursor position in client pixels.
+cursor_pos: apprt.CursorPos = .{ .x = 0, .y = 0 },
+
+/// UTF-8 window title cache for title reporting.
+title_buf: [1024:0]u8 = [_:0]u8{0} ** 1024,
+
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 
@@ -360,13 +366,23 @@ pub fn getSize(self: *const Self) !apprt.SurfaceSize {
     };
 }
 
-pub fn getCursorPos(_: *const Self) !apprt.CursorPos {
-    // TODO: track mouse position
-    return .{ .x = 0, .y = 0 };
+pub fn getCursorPos(self: *const Self) !apprt.CursorPos {
+    return self.cursor_pos;
 }
 
-pub fn getTitle(_: *Self) ?[:0]const u8 {
-    return null;
+pub fn getTitle(self: *Self) ?[:0]const u8 {
+    const window = self.window orelse return null;
+    const hwnd = window.hwnd orelse return null;
+
+    var title_utf16: [512]u16 = undefined;
+    const len = GetWindowTextW(hwnd, &title_utf16, title_utf16.len);
+    if (len <= 0) return null;
+
+    const title_slice: []const u16 = title_utf16[0..@intCast(len)];
+    const out_len = std.unicode.utf16LeToUtf8(self.title_buf[0 .. self.title_buf.len - 1], title_slice) catch
+        return null;
+    self.title_buf[out_len] = 0;
+    return self.title_buf[0..out_len :0];
 }
 
 pub fn close(self: *Self, process_active: bool) void {
@@ -383,6 +399,7 @@ pub fn close(self: *Self, process_active: bool) void {
 
 extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
 extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
+extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
 
 pub fn supportsClipboard(_: *Self, _: apprt.Clipboard) bool {
     // Windows has only one clipboard; alias selection/primary to standard.

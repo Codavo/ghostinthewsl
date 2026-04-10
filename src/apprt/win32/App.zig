@@ -322,8 +322,6 @@ pub fn performAction(
     comptime action: apprt.Action.Key,
     value: apprt.Action.Value(action),
 ) !bool {
-    _ = target;
-
     switch (action) {
         .quit => {
             sys.PostQuitMessage(0);
@@ -438,7 +436,27 @@ pub fn performAction(
             return true;
         },
         .config_change => return true,
-        .show_child_exited => return false,
+        .show_child_exited => {
+            const surface = switch (target) {
+                .app => return false,
+                .surface => |core| core.rt_surface,
+            };
+            const window = surface.window orelse return false;
+            const hwnd = window.hwnd orelse return false;
+
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(
+                &msg_buf,
+                "Process exited with code {} after {} ms.",
+                .{ value.exit_code, value.runtime_ms },
+            ) catch return false;
+            const msg_w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, msg) catch return false;
+            defer self.alloc.free(msg_w);
+
+            const caption = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+            _ = MessageBoxW(hwnd, msg_w.ptr, caption, 0x00000040);
+            return true;
+        },
         .open_config => {
             const path = configpkg.edit.openPath(self.alloc) catch return false;
             defer self.alloc.free(path);
@@ -689,12 +707,55 @@ pub fn performAction(
 }
 
 pub fn performIpc(
-    _: Allocator,
-    _: apprt.ipc.Target,
+    alloc: Allocator,
+    target: apprt.ipc.Target,
     comptime action: apprt.ipc.Action.Key,
-    _: apprt.ipc.Action.Value(action),
+    value: apprt.ipc.Action.Value(action),
 ) !bool {
-    return false;
+    var buf: [256]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&buf);
+    const stderr = &stderr_writer.interface;
+
+    switch (action) {
+        .new_window => {
+            switch (target) {
+                .class => |class| {
+                    try stderr.print(
+                        "Win32 IPC does not yet support targeting a custom Ghostty class: {s}\n",
+                        .{class},
+                    );
+                    try stderr.flush();
+                    return error.IPCFailed;
+                },
+                .detect => {},
+            }
+
+            if (value.arguments != null) {
+                try stderr.print(
+                    "Win32 IPC does not yet support passing command arguments to +new-window.\n",
+                    .{},
+                );
+                try stderr.flush();
+                return error.IPCFailed;
+            }
+
+            const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
+            const hwnd = sys.FindWindowW(class_name, null) orelse {
+                try stderr.print("No running Ghostty Win32 instance was found.\n", .{});
+                try stderr.flush();
+                return error.IPCFailed;
+            };
+
+            if (sys.PostMessageW(hwnd, sys.WM_APP_NEW_WINDOW, 0, 0) == 0) {
+                try stderr.print("Failed to send a new-window request to Ghostty.\n", .{});
+                try stderr.flush();
+                return error.IPCFailed;
+            }
+
+            _ = alloc;
+            return true;
+        },
+    }
 }
 
 pub fn redrawInspector(_: *App, _: *Surface) void {}
@@ -996,12 +1057,17 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             if (surface.core_surface) |core| {
                 const x: f32 = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF)));
                 const y: f32 = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
+                surface.cursor_pos = .{ .x = x, .y = y };
                 core.cursorPosCallback(.{ .x = x, .y = y }, getModifiers()) catch {};
             }
             return 0;
         },
         0x0201, 0x0204, 0x0207 => {
             if (surface.core_surface) |core| {
+                surface.cursor_pos = .{
+                    .x = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF))),
+                    .y = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF))),
+                };
                 const input = @import("../../input.zig");
                 const button: input.MouseButton = switch (msg) {
                     0x0201 => .left,
@@ -1022,6 +1088,10 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         0x0202, 0x0205, 0x0208 => {
             if (surface.core_surface) |core| {
+                surface.cursor_pos = .{
+                    .x = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF))),
+                    .y = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF))),
+                };
                 const input = @import("../../input.zig");
                 const button: input.MouseButton = switch (msg) {
                     0x0202 => .left,
@@ -1036,6 +1106,10 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         0x020A => {
             if (surface.core_surface) |core| {
+                surface.cursor_pos = .{
+                    .x = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF))),
+                    .y = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF))),
+                };
                 const delta: i16 = @truncate(@as(isize, @bitCast(wparam)) >> 16);
                 const yoff: f64 = @as(f64, @floatFromInt(delta)) / 120.0;
                 const input = @import("../../input.zig");
