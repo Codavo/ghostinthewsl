@@ -182,8 +182,29 @@ pub fn run(self: *App) !void {
             log.err("GetMessage failed", .{});
             return error.Win32Error;
         }
+
+        // Let the command palette intercept keys if it's open
+        if (self.command_palette_initialized and self.command_palette.hwnd != null) {
+            if (msg.hwnd) |mh| {
+                if (self.command_palette.preTranslateMessage(msg.message, mh, msg.wParam)) {
+                    continue;
+                }
+            }
+        }
+
         _ = sys.TranslateMessage(&msg);
         _ = sys.DispatchMessageW(&msg);
+
+        // After WM_CHAR processing, if palette is open, re-filter
+        if (self.command_palette_initialized and self.command_palette.hwnd != null) {
+            if (msg.message == WM_CHAR) {
+                if (msg.hwnd) |mh| {
+                    if (mh == self.command_palette.edit_hwnd) {
+                        self.command_palette.refilter();
+                    }
+                }
+            }
+        }
     }
 }
 

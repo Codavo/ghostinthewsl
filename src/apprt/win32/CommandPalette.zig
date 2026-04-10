@@ -161,15 +161,6 @@ fn open(self: *CommandPalette, window: *Window) !void {
         null,
     );
 
-    // Subclass the edit control so we can intercept arrow/enter/escape keys
-    if (self.edit_hwnd) |eh| {
-        const GWLP_WNDPROC: c_int = -4;
-        const old = GetWindowLongPtrW(eh, GWLP_WNDPROC);
-        original_edit_proc = @ptrFromInt(@as(usize, @bitCast(old)));
-        _ = SetWindowLongPtrW(eh, GWLP_WNDPROC, @bitCast(@intFromPtr(&editSubclassProc)));
-        // Store palette pointer in edit's userdata
-        _ = SetWindowLongPtrW(eh, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
-    }
 
     // Create list box
     const listbox_class = std.unicode.utf8ToUtf16LeStringLiteral("LISTBOX");
@@ -260,62 +251,53 @@ fn executeSelected(self: *CommandPalette) void {
     }
 }
 
-var original_edit_proc: ?*const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT = null;
+extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
 
-fn editSubclassProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
-    const ptr = GetWindowLongPtrW(hwnd, sys.GWLP_USERDATA);
-    const self: ?*CommandPalette = if (ptr != 0)
-        @ptrFromInt(@as(usize, @bitCast(ptr)))
-    else
-        null;
+/// Called by App.run() before DispatchMessageW to pre-process messages
+/// while the command palette is open. Returns true if the message was
+/// consumed and should not be dispatched further.
+pub fn preTranslateMessage(self: *CommandPalette, msg: UINT, hwnd: HWND, wparam: WPARAM) bool {
+    if (self.hwnd == null) return false;
+    // Only intercept keys targeted at our edit control
+    if (self.edit_hwnd) |eh| {
+        if (hwnd != eh) return false;
+    } else return false;
 
-    switch (msg) {
-        WM_KEYDOWN => {
-            if (self) |s| {
-                switch (wparam) {
-                    VK_ESCAPE => {
-                        s.close();
-                        return 0;
-                    },
-                    VK_RETURN => {
-                        s.executeSelected();
-                        return 0;
-                    },
-                    VK_UP, VK_DOWN => {
-                        const lb = s.list_hwnd orelse return 0;
-                        const count: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCOUNT, 0, 0))));
-                        if (count <= 0) return 0;
-                        var sel: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCURSEL, 0, 0))));
-                        if (wparam == VK_UP and sel > 0) sel -= 1;
-                        if (wparam == VK_DOWN and sel < count - 1) sel += 1;
-                        _ = SendMessageW(lb, LB_SETCURSEL, @bitCast(sel), 0);
-                        return 0;
-                    },
-                    else => {},
-                }
-            }
+    if (msg != WM_KEYDOWN) return false;
+
+    switch (wparam) {
+        VK_ESCAPE => {
+            self.close();
+            return true;
         },
-        WM_CHAR => {
-            // Let the edit control process the character first, then re-filter
-            const proc = original_edit_proc orelse return 0;
-            const result = proc(hwnd, msg, wparam, lparam);
-            if (self) |s| {
-                var buf: [256]u16 = undefined;
-                const len_raw = GetWindowTextW(hwnd, &buf, buf.len);
-                const len: usize = if (len_raw > 0) @intCast(len_raw) else 0;
-                var u8_buf: [1024]u8 = undefined;
-                const u8_len = std.unicode.utf16LeToUtf8(&u8_buf, buf[0..len]) catch 0;
-                s.filter(u8_buf[0..u8_len]) catch {};
-            }
-            return result;
+        VK_RETURN => {
+            self.executeSelected();
+            return true;
         },
-        else => {},
+        VK_UP, VK_DOWN => {
+            const lb = self.list_hwnd orelse return true;
+            const count: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCOUNT, 0, 0))));
+            if (count <= 0) return true;
+            var sel: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCURSEL, 0, 0))));
+            if (wparam == VK_UP and sel > 0) sel -= 1;
+            if (wparam == VK_DOWN and sel < count - 1) sel += 1;
+            _ = SendMessageW(lb, LB_SETCURSEL, @bitCast(sel), 0);
+            return true;
+        },
+        else => return false,
     }
-    const proc = original_edit_proc orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
-    return proc(hwnd, msg, wparam, lparam);
 }
 
-extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
+/// Re-run the filter from the current edit control text.
+pub fn refilter(self: *CommandPalette) void {
+    const eh = self.edit_hwnd orelse return;
+    var buf: [256]u16 = undefined;
+    const len_raw = GetWindowTextW(eh, &buf, buf.len);
+    const len: usize = if (len_raw > 0) @intCast(len_raw) else 0;
+    var u8_buf: [1024]u8 = undefined;
+    const u8_len = std.unicode.utf16LeToUtf8(&u8_buf, buf[0..len]) catch 0;
+    self.filter(u8_buf[0..u8_len]) catch {};
+}
 extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn DeleteObject(hObject: ?*anyopaque) callconv(.winapi) sys.BOOL;
 extern "gdi32" fn SetTextColor(hdc: ?*anyopaque, color: u32) callconv(.winapi) u32;
