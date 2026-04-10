@@ -296,8 +296,9 @@ pub fn close(self: *Self, process_active: bool) void {
 extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
 extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
 
-pub fn supportsClipboard(_: *Self, clipboard: apprt.Clipboard) bool {
-    return clipboard == .standard;
+pub fn supportsClipboard(_: *Self, _: apprt.Clipboard) bool {
+    // Windows has only one clipboard; alias selection/primary to standard.
+    return true;
 }
 
 pub fn clipboardRequest(

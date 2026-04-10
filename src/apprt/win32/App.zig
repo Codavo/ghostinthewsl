@@ -129,6 +129,34 @@ extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BO
 extern "user32" fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) callconv(.winapi) ?*anyopaque;
 extern "user32" fn GetMonitorInfoW(hMonitor: ?*anyopaque, lpmi: *MONITORINFO) callconv(.winapi) BOOL;
 extern "shell32" fn ShellExecuteW(hwnd: ?HWND, lpOperation: ?[*:0]const u16, lpFile: [*:0]const u16, lpParameters: ?[*:0]const u16, lpDirectory: ?[*:0]const u16, nShowCmd: c_int) callconv(.winapi) ?*anyopaque;
+extern "shell32" fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *NOTIFYICONDATAW) callconv(.winapi) BOOL;
+
+const NIM_ADD: DWORD = 0x00000000;
+const NIM_MODIFY: DWORD = 0x00000001;
+const NIM_DELETE: DWORD = 0x00000002;
+const NIF_MESSAGE: DWORD = 0x00000001;
+const NIF_ICON: DWORD = 0x00000002;
+const NIF_TIP: DWORD = 0x00000004;
+const NIF_INFO: DWORD = 0x00000010;
+const NIIF_INFO: DWORD = 0x00000001;
+
+const NOTIFYICONDATAW = extern struct {
+    cbSize: DWORD,
+    hWnd: HWND,
+    uID: UINT,
+    uFlags: UINT,
+    uCallbackMessage: UINT = 0,
+    hIcon: HICON,
+    szTip: [128]u16 = [_]u16{0} ** 128,
+    dwState: DWORD = 0,
+    dwStateMask: DWORD = 0,
+    szInfo: [256]u16 = [_]u16{0} ** 256,
+    uTimeoutOrVersion: UINT = 0,
+    szInfoTitle: [64]u16 = [_]u16{0} ** 64,
+    dwInfoFlags: DWORD = 0,
+    guidItem: extern struct { a: u32 = 0, b: u16 = 0, c: u16 = 0, d: [8]u8 = [_]u8{0} ** 8 } = .{},
+    hBalloonIcon: ?*anyopaque = null,
+};
 extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
 extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
 extern "advapi32" fn RegOpenKeyExW(hKey: ?*anyopaque, lpSubKey: [*:0]const u16, ulOptions: DWORD, samDesired: DWORD, phkResult: *?*anyopaque) callconv(.winapi) i32;
@@ -199,6 +227,9 @@ hwnd: ?HWND = null,
 
 /// The surface for the main window.
 surface: Surface = undefined,
+
+/// Whether the tray icon is registered (for notifications).
+tray_registered: bool = false,
 
 pub fn init(
     self: *App,
@@ -282,6 +313,16 @@ pub fn run(self: *App) !void {
 }
 
 pub fn terminate(self: *App) void {
+    // Remove tray icon if registered
+    if (self.tray_registered) {
+        if (self.hwnd) |hwnd| {
+            var nid: NOTIFYICONDATAW = std.mem.zeroes(NOTIFYICONDATAW);
+            nid.cbSize = @sizeOf(NOTIFYICONDATAW);
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
+    }
     self.surface.deinit();
     if (self.hwnd) |hwnd| {
         _ = DestroyWindow(hwnd);
@@ -353,8 +394,8 @@ pub fn performAction(
             return false;
         },
         .desktop_notification => {
-            // TODO: implement via Shell_NotifyIconW balloon or WinRT Toast
-            return false;
+            if (self.hwnd) |hwnd| self.showNotification(hwnd, value.title, value.body);
+            return true;
         },
         .quit_timer => {
             // Single-window app: we quit immediately when the only
@@ -404,10 +445,59 @@ pub fn performAction(
             }
             return true;
         },
-        .new_window => {
-            return false;
-        },
-        else => return false,
+        // --- Actions intentionally unsupported on Win32 ---
+        // These return true to indicate the action was "handled" (as a no-op)
+        // so that callers do not treat them as errors.
+        .new_window,
+        .new_tab,
+        .close_tab,
+        .new_split,
+        .close_all_windows,
+        .toggle_tab_overview,
+        .toggle_window_decorations,
+        .toggle_quick_terminal,
+        .toggle_command_palette,
+        .toggle_visibility,
+        .toggle_background_opacity,
+        .move_tab,
+        .goto_tab,
+        .goto_split,
+        .goto_window,
+        .resize_split,
+        .equalize_splits,
+        .toggle_split_zoom,
+        .present_terminal,
+        .size_limit,
+        .reset_window_size,
+        .initial_size,
+        .cell_size,
+        .scrollbar,
+        .render,
+        .show_gtk_inspector,
+        .render_inspector,
+        .set_tab_title,
+        .prompt_title,
+        .pwd,
+        .renderer_health,
+        .open_config,
+        .float_window,
+        .secure_input,
+        .key_sequence,
+        .key_table,
+        .color_change,
+        .close_window,
+        .undo,
+        .redo,
+        .check_for_updates,
+        .show_on_screen_keyboard,
+        .command_finished,
+        .start_search,
+        .end_search,
+        .search_total,
+        .search_selected,
+        .readonly,
+        .copy_title_to_clipboard,
+        => return true,
     }
 }
 
@@ -420,6 +510,41 @@ const FullscreenState = struct {
 };
 
 var fullscreen_state: FullscreenState = .{};
+
+fn showNotification(self: *App, hwnd: HWND, title: [:0]const u8, body: [:0]const u8) void {
+    var nid: NOTIFYICONDATAW = std.mem.zeroes(NOTIFYICONDATAW);
+    nid.cbSize = @sizeOf(NOTIFYICONDATAW);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_INFO | NIF_TIP;
+    nid.dwInfoFlags = NIIF_INFO;
+    nid.hIcon = LoadIconW(GetModuleHandleW(null), @ptrFromInt(1));
+
+    // Convert title/body to UTF-16
+    const title_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, title) catch return;
+    defer self.alloc.free(title_utf16);
+    const body_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, body) catch return;
+    defer self.alloc.free(body_utf16);
+
+    const title_len = @min(title_utf16.len, nid.szInfoTitle.len - 1);
+    @memcpy(nid.szInfoTitle[0..title_len], title_utf16[0..title_len]);
+    nid.szInfoTitle[title_len] = 0;
+
+    const body_len = @min(body_utf16.len, nid.szInfo.len - 1);
+    @memcpy(nid.szInfo[0..body_len], body_utf16[0..body_len]);
+    nid.szInfo[body_len] = 0;
+
+    const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    @memcpy(nid.szTip[0..tip.len], tip);
+
+    // Add the tray icon (first time), then modify to show the balloon
+    if (!self.tray_registered) {
+        _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        self.tray_registered = true;
+    } else {
+        _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
 
 fn toggleFullscreen(self: *App, hwnd: HWND) void {
     _ = self;
