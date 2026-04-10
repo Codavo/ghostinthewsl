@@ -325,7 +325,10 @@ pub fn closeSurface(self: *App, surface: *Surface) void {
     const empty = tree.removeLeaf(self.alloc, surface);
 
     if (empty) {
-        // Last surface closed - quit the app
+        // Last surface closed - quit the app.
+        // Clear the tree pointer since its root has been freed; otherwise
+        // terminate() would walk freed memory.
+        self.tree = null;
         if (is_primary) self.surface_initialized = false;
         PostQuitMessage(0);
         return;
