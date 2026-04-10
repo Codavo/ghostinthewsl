@@ -702,6 +702,31 @@ jobs:
       - name: Build libghostty-vt
         run: zig build -Demit-lib-vt
 
+  build-ghostty-windows:
+    runs-on: namespace-profile-ghostty-windows
+    timeout-minutes: 45
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: Build Ghostty (Windows)
+        shell: pwsh
+        run: |
+          zig build -Dtarget=native-native-gnu -Doptimize=ReleaseSafe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ghostty-windows
+          path: |-
+            zig-out/bin/ghostty.exe
+            zig-out/bin/*.pdb
+          if-no-files-found: error
+
   build-linux:
     strategy:
       fail-fast: false
