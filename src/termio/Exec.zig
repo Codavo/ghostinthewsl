@@ -1555,11 +1555,17 @@ fn execCommand(
             defer args.deinit(alloc);
 
             if (comptime builtin.os.tag == .windows) {
-                // We run our shell wrapped in `cmd.exe` so that we don't have
-                // to parse the command line ourselves if it has arguments.
+                // If the shell value is a simple program with no arguments,
+                // run it directly so that features like cmd.exe's AutoRun
+                // registry value (init.cmd) work properly. Wrapping in
+                // `cmd.exe /C ...` disables AutoRun on the wrapped shell.
+                if (std.mem.indexOfAny(u8, v, " \t") == null) {
+                    try args.append(alloc, try alloc.dupeZ(u8, v));
+                    break :shell try args.toOwnedSlice(alloc);
+                }
 
-                // Note we don't free any of the memory below since it is
-                // allocated in the arena.
+                // Otherwise (shell contains arguments), wrap in cmd.exe /C
+                // so we don't have to parse the command line ourselves.
                 const windir = std.process.getEnvVarOwned(
                     alloc,
                     "WINDIR",
