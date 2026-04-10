@@ -156,6 +156,9 @@ focused_window: ?*Window = null,
 /// Whether the tray icon is registered (for notifications).
 tray_registered: bool = false,
 
+/// Dedicated quick terminal window, if one has been created.
+quick_terminal_window: ?*Window = null,
+
 /// The command palette (created lazily).
 command_palette: CommandPalette = undefined,
 command_palette_initialized: bool = false,
@@ -410,6 +413,7 @@ pub fn wakeup(self: *App) void {
 pub fn newWindow(self: *App, opts: NewWindowOptions) !void {
     const window = try Window.create(self.alloc, self, opts);
     try self.windows.append(self.alloc, window);
+    if (opts.quick_terminal) self.quick_terminal_window = window;
     self.focused_window = window;
 }
 
@@ -424,6 +428,9 @@ pub fn closeWindow(self: *App, window: *Window) void {
     }
 
     // Destroy the Window's HWND if still alive (normally done already)
+    if (self.quick_terminal_window == window) {
+        self.quick_terminal_window = null;
+    }
     window.deinit();
     self.alloc.destroy(window);
 
@@ -860,8 +867,27 @@ pub fn performAction(
             if (window.tab_hwnd) |hwnd| _ = sys.SetFocus(hwnd);
             return true;
         },
-        .toggle_quick_terminal,
-        => return true,
+        .toggle_quick_terminal => {
+            if (self.quick_terminal_window) |window| {
+                if (window.hwnd) |hwnd| {
+                    if (IsWindowVisible(hwnd) != 0) {
+                        _ = sys.ShowWindow(hwnd, 0);
+                    } else {
+                        window.applyQuickTerminalLayout();
+                        _ = sys.ShowWindow(hwnd, sys.SW_SHOWNORMAL);
+                        _ = SetForegroundWindow(hwnd);
+                        self.focused_window = window;
+                    }
+                    return true;
+                }
+            }
+
+            self.newWindow(.{ .quick_terminal = true }) catch return false;
+            if (self.quick_terminal_window) |window| {
+                if (window.hwnd) |hwnd| _ = SetForegroundWindow(hwnd);
+            }
+            return true;
+        },
         .move_tab => {
             const window = self.focused_window orelse return false;
             _ = window.moveTab(value.amount);

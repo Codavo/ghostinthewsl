@@ -73,6 +73,7 @@ pub const CreateOptions = struct {
     command: ?configpkg.Command = null,
     working_directory: ?configpkg.WorkingDirectory = null,
     title: ?[:0]const u8 = null,
+    quick_terminal: bool = false,
 
     pub const none: @This() = .{};
 
@@ -104,6 +105,7 @@ surface_initialized: bool = false,
 tabs: std.ArrayListUnmanaged(TabState) = .{},
 current_tab: usize = 0,
 fullscreen: FullscreenState = .{},
+quick_terminal: bool = false,
 
 const FullscreenState = struct {
     active: bool = false,
@@ -119,6 +121,7 @@ pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
     self.* = .{
         .app = app,
         .primary_surface = undefined,
+        .quick_terminal = opts.quick_terminal,
     };
 
     try self.createHwnd(opts.title);
@@ -130,7 +133,7 @@ pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
     _ = sys.SetWindowLongPtrW(self.hwnd.?, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
     _ = try self.insertTab(0, opts, true);
-    self.applyConfiguredWindowSize();
+    if (self.quick_terminal) self.applyQuickTerminalLayout() else self.applyConfiguredWindowSize();
     self.relayout();
 
     if (self.focused_surface) |surface| {
@@ -185,10 +188,10 @@ fn createHwnd(self: *Window, title_override: ?[:0]const u8) !void {
     defer if (title) |v| self.app.alloc.free(v);
 
     self.hwnd = sys.CreateWindowExW(
-        0,
+        if (self.quick_terminal) @intCast(sys.WS_EX_TOPMOST) else 0,
         class_name,
         if (title) |v| v.ptr else std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
-        sys.WS_OVERLAPPEDWINDOW,
+        if (self.quick_terminal) sys.WS_OVERLAPPEDWINDOW & ~sys.WS_CAPTION_BIT else sys.WS_OVERLAPPEDWINDOW,
         sys.CW_USEDEFAULT,
         sys.CW_USEDEFAULT,
         900,
@@ -623,6 +626,40 @@ pub fn applyConfiguredWindowSize(self: *Window) void {
     var rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = h };
     _ = sys.AdjustWindowRectEx(&rect, sys.WS_OVERLAPPEDWINDOW, 0, 0);
     _ = sys.SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, 0x0002 | 0x0004);
+}
+
+pub fn applyQuickTerminalLayout(self: *Window) void {
+    const hwnd = self.hwnd orelse return;
+    var mi: sys.MONITORINFO = std.mem.zeroes(sys.MONITORINFO);
+    mi.cbSize = @sizeOf(sys.MONITORINFO);
+    const monitor = sys.MonitorFromWindow(hwnd, 2);
+    if (sys.GetMonitorInfoW(monitor, &mi) == 0) return;
+
+    const dims: configpkg.Config.QuickTerminalSize.Dimensions = .{
+        .width = @intCast(mi.rcWork.right - mi.rcWork.left),
+        .height = @intCast(mi.rcWork.bottom - mi.rcWork.top),
+    };
+    const size = self.app.config.@"quick-terminal-size".calculate(
+        self.app.config.@"quick-terminal-position",
+        dims,
+    );
+
+    const width: i32 = @intCast(size.width);
+    const height: i32 = @intCast(size.height);
+    const work_w = mi.rcWork.right - mi.rcWork.left;
+    const work_h = mi.rcWork.bottom - mi.rcWork.top;
+    const origin: struct { x: i32, y: i32 } = switch (self.app.config.@"quick-terminal-position") {
+        .top => .{ .x = mi.rcWork.left + @divTrunc(work_w - width, 2), .y = mi.rcWork.top },
+        .bottom => .{ .x = mi.rcWork.left + @divTrunc(work_w - width, 2), .y = mi.rcWork.bottom - height },
+        .left => .{ .x = mi.rcWork.left, .y = mi.rcWork.top + @divTrunc(work_h - height, 2) },
+        .right => .{ .x = mi.rcWork.right - width, .y = mi.rcWork.top + @divTrunc(work_h - height, 2) },
+        .center => .{
+            .x = mi.rcWork.left + @divTrunc(work_w - width, 2),
+            .y = mi.rcWork.top + @divTrunc(work_h - height, 2),
+        },
+    };
+
+    _ = sys.SetWindowPos(hwnd, @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))), origin.x, origin.y, width, height, 0x0004);
 }
 
 pub fn relayout(self: *Window) void {
