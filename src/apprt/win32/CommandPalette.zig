@@ -89,6 +89,9 @@ target_window: ?*Window = null,
 /// Currently filtered command indices (into input.command.defaults)
 filtered: std.ArrayListUnmanaged(usize) = .{},
 
+/// True while open() is in progress; blocks WM_ACTIVATE-driven close.
+opening: bool = false,
+
 pub fn init(alloc: Allocator, app: *App) CommandPalette {
     return .{
         .alloc = alloc,
@@ -98,6 +101,7 @@ pub fn init(alloc: Allocator, app: *App) CommandPalette {
         .list_hwnd = null,
         .target_window = null,
         .filtered = .{},
+        .opening = false,
     };
 }
 
@@ -118,6 +122,8 @@ pub fn toggle(self: *CommandPalette, window: *Window) void {
 
 fn open(self: *CommandPalette, window: *Window) !void {
     self.target_window = window;
+    self.opening = true;
+    defer self.opening = false;
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyCommandPalette");
     try registerClass();
@@ -135,7 +141,7 @@ fn open(self: *CommandPalette, window: *Window) !void {
 
     const hinstance = sys.GetModuleHandleW(null);
     self.hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        WS_EX_TOOLWINDOW,
         class_name,
         std.unicode.utf8ToUtf16LeStringLiteral("Command Palette"),
         WS_POPUP | WS_BORDER,
@@ -394,7 +400,8 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             _ = SetTextColor(hdc, FG_COLOR);
             _ = SetBkColor(hdc, BG_COLOR);
             const brush = dark_brush orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
-            return @as(LRESULT, @intCast(@intFromPtr(brush)));
+            // @bitCast preserves the bit pattern (pointer may have high bit set)
+            return @bitCast(@intFromPtr(brush));
         },
         WM_COMMAND => {
             const self = getPalette(hwnd) orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -417,9 +424,16 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_ACTIVATE => {
-            // Previously we auto-closed on WA_INACTIVE, but that can cause
-            // re-entrant close during open. User dismisses via ESC instead.
-            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+            // When we lose activation, schedule a close via PostMessage to
+            // avoid re-entrancy. `opening` guards against closing during open().
+            if ((wparam & 0xFFFF) == 0) { // WA_INACTIVE
+                if (getPalette(hwnd)) |self| {
+                    if (!self.opening) {
+                        _ = sys.PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    }
+                }
+            }
+            return 0;
         },
         else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
