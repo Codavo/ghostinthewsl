@@ -322,9 +322,9 @@ pub fn closeSurface(self: *App, surface: *Surface) void {
     const is_primary = surface == &self.surface;
 
     // Remove from the split tree
-    const empty = tree.removeLeaf(self.alloc, surface);
+    const result = tree.removeLeaf(self.alloc, surface);
 
-    if (empty) {
+    if (result.empty) {
         // Last surface closed - quit the app.
         // Clear the tree pointer since its root has been freed; otherwise
         // terminate() would walk freed memory.
@@ -343,12 +343,10 @@ pub fn closeSurface(self: *App, surface: *Surface) void {
         self.surface_initialized = false;
     }
 
-    // Pick a new focused surface from remaining leaves.
-    var buf: [32]*Surface = undefined;
-    const count = tree.collectLeaves(&buf);
-    if (count > 0) {
-        self.focused_surface = buf[0];
-        _ = SetFocus(buf[0].hwnd);
+    // Focus the sibling of the removed surface.
+    if (result.focus) |new_focus| {
+        self.focused_surface = new_focus;
+        _ = SetFocus(new_focus.hwnd);
     } else {
         self.focused_surface = null;
     }

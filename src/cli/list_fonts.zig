@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("ghostty.zig").Action;
@@ -77,6 +78,11 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype) !u8 {
 
     // Its possible to build Ghostty without font discovery!
     if (comptime font.Discover == void) {
+        // On Windows, scan the system font directory directly using FreeType.
+        if (comptime builtin.os.tag == .windows) {
+            return try listWindowsFonts(alloc_gpa, alloc, config);
+        }
+
         var buffer: [1024]u8 = undefined;
         var stderr_writer = std.fs.File.stderr().writer(&buffer);
         const stderr = &stderr_writer.interface;
@@ -155,6 +161,103 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype) !u8 {
             }.lessThan);
         }
 
+        try stdout.print("{s}\n", .{family});
+        for (list.items) |item| try stdout.print("  {s}\n", .{item});
+        try stdout.print("\n", .{});
+    }
+
+    try stdout.flush();
+    return 0;
+}
+
+/// List fonts on Windows by scanning C:\Windows\Fonts directly with FreeType.
+fn listWindowsFonts(alloc_gpa: Allocator, alloc: Allocator, config: Options) !u8 {
+    _ = alloc_gpa;
+
+    var buffer: [2048]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&buffer);
+    const stdout = &stdout_writer.interface;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var families: std.ArrayList([]const u8) = .empty;
+    var map: std.StringHashMap(std.ArrayListUnmanaged([]const u8)) = .init(alloc);
+
+    var dir = std.fs.openDirAbsoluteZ("C:\\Windows\\Fonts", .{ .iterate = true }) catch |err| {
+        log.err("failed to open C:\\Windows\\Fonts: {}", .{err});
+        return 1;
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.name;
+        const is_font = std.mem.endsWith(u8, name, ".ttf") or
+            std.mem.endsWith(u8, name, ".ttc") or
+            std.mem.endsWith(u8, name, ".otf") or
+            std.mem.endsWith(u8, name, ".TTF") or
+            std.mem.endsWith(u8, name, ".TTC") or
+            std.mem.endsWith(u8, name, ".OTF");
+        if (!is_font) continue;
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const full_path = std.fmt.bufPrintZ(&path_buf, "C:/Windows/Fonts/{s}", .{name}) catch continue;
+
+        // Try multiple face indices for .ttc (collection) files
+        var face_index: i32 = 0;
+        while (face_index < 16) : (face_index += 1) {
+            var face = font.Face.initFile(
+                lib,
+                full_path,
+                face_index,
+                .{ .size = .{ .points = 12 } },
+            ) catch break;
+            defer face.deinit();
+
+            const ft_family: ?[*:0]const u8 = face.face.handle.*.family_name;
+            if (ft_family == null) {
+                if (std.mem.endsWith(u8, name, ".ttc") or std.mem.endsWith(u8, name, ".TTC")) continue;
+                break;
+            }
+            const family_raw = std.mem.span(ft_family.?);
+
+            // Apply filter
+            if (config.family) |filter| {
+                if (std.ascii.indexOfIgnoreCase(family_raw, filter) == null) {
+                    if (std.mem.endsWith(u8, name, ".ttc") or std.mem.endsWith(u8, name, ".TTC")) continue;
+                    break;
+                }
+            }
+
+            const family = try alloc.dupe(u8, family_raw);
+            const gop = try map.getOrPut(family);
+            if (!gop.found_existing) {
+                try families.append(alloc, family);
+                gop.value_ptr.* = .{};
+            }
+
+            // Try to get the style name too
+            const ft_style: ?[*:0]const u8 = face.face.handle.*.style_name;
+            const style = if (ft_style) |s| std.mem.span(s) else "Regular";
+            const full_name = try std.fmt.allocPrint(alloc, "{s} {s}", .{ family, style });
+            try gop.value_ptr.append(alloc, full_name);
+
+            if (!std.mem.endsWith(u8, name, ".ttc") and !std.mem.endsWith(u8, name, ".TTC")) break;
+        }
+    }
+
+    // Sort families
+    std.mem.sortUnstable([]const u8, families.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.order(u8, lhs, rhs) == .lt;
+        }
+    }.lessThan);
+
+    for (families.items) |family| {
+        const list = map.get(family) orelse continue;
+        if (list.items.len == 0) continue;
         try stdout.print("{s}\n", .{family});
         for (list.items) |item| try stdout.print("  {s}\n", .{item});
         try stdout.print("\n", .{});

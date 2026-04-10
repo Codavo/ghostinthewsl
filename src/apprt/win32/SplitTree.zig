@@ -130,15 +130,23 @@ fn layoutNode(node: *Node, bounds: Rect, cb: *const fn (surface: *Surface, rect:
     }
 }
 
+pub const RemoveResult = struct {
+    /// True if the tree is now empty.
+    empty: bool,
+    /// The surface that should receive focus next (first leaf of the sibling).
+    /// Null if the tree is empty.
+    focus: ?*Surface,
+};
+
 /// Remove the leaf containing the given surface. The sibling is promoted
-/// to replace the parent split node. Returns true if the tree is now empty.
-pub fn removeLeaf(self: *SplitTree, alloc: Allocator, surface: *Surface) bool {
-    const result = self.findLeaf(surface) orelse return false;
+/// to replace the parent split node.
+pub fn removeLeaf(self: *SplitTree, alloc: Allocator, surface: *Surface) RemoveResult {
+    const result = self.findLeaf(surface) orelse return .{ .empty = false, .focus = null };
 
     // If the leaf is the root, the tree becomes empty.
     if (result.parent == null) {
         alloc.destroy(result.slot.*);
-        return true;
+        return .{ .empty = true, .focus = null };
     }
 
     // Find which child of the parent we are, promote the sibling.
@@ -150,12 +158,22 @@ pub fn removeLeaf(self: *SplitTree, alloc: Allocator, surface: *Surface) bool {
     else
         parent_split.children[0];
 
+    // Find a leaf within the sibling to focus
+    const focus = firstLeaf(sibling);
+
     // The parent becomes the sibling (copy contents).
     alloc.destroy(leaf_node);
     parent.* = sibling.*;
     alloc.destroy(sibling);
 
-    return false;
+    return .{ .empty = false, .focus = focus };
+}
+
+fn firstLeaf(node: *Node) *Surface {
+    return switch (node.*) {
+        .leaf => |s| s,
+        .split => |sp| firstLeaf(sp.children[0]),
+    };
 }
 
 /// Collect all leaf surfaces into the given buffer, returning the count.
