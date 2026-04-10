@@ -301,6 +301,59 @@ pub fn init(
     }
 }
 
+/// Remove a surface from the split tree and destroy its child window.
+/// If the tree becomes empty, post a quit message.
+pub fn closeSurface(self: *App, surface: *Surface) void {
+    const tree = &(self.tree orelse return);
+
+    // Remove from CoreApp's surface list
+    self.core_app.deleteSurface(surface);
+
+    // Deinit the CoreSurface
+    if (surface.core_surface) |core| {
+        core.deinit();
+        self.alloc.destroy(core);
+        surface.core_surface = null;
+    }
+
+    // Destroy the child window and release WGL context
+    surface.deinit();
+
+    const is_primary = surface == &self.surface;
+
+    // Remove from the split tree
+    const empty = tree.removeLeaf(self.alloc, surface);
+
+    if (empty) {
+        // Last surface closed - quit the app
+        if (is_primary) self.surface_initialized = false;
+        PostQuitMessage(0);
+        return;
+    }
+
+    // Free heap-allocated (non-primary) surface
+    if (!is_primary) {
+        self.alloc.destroy(surface);
+    } else {
+        // Primary was closed but other surfaces still exist.
+        // Mark it as no longer valid so terminate() doesn't double-deinit.
+        self.surface_initialized = false;
+    }
+
+    // Pick a new focused surface from remaining leaves.
+    var buf: [32]*Surface = undefined;
+    const count = tree.collectLeaves(&buf);
+    if (count > 0) {
+        self.focused_surface = buf[0];
+        _ = SetFocus(buf[0].hwnd);
+    } else {
+        self.focused_surface = null;
+    }
+
+    // Re-layout remaining surfaces
+    self.relayout();
+}
+
 /// Perform a layout pass, resizing each surface's child window.
 pub fn relayout(self: *App) void {
     const tree = &(self.tree orelse return);
@@ -410,7 +463,18 @@ pub fn terminate(self: *App) void {
             _ = Shell_NotifyIconW(NIM_DELETE, &nid);
         }
     }
-    self.surface.deinit();
+    // Deinit any remaining surfaces in the tree.
+    if (self.tree) |*tree| {
+        var buf: [32]*Surface = undefined;
+        const count = tree.collectLeaves(&buf);
+        for (buf[0..count]) |s| {
+            s.deinit();
+            if (s != &self.surface) self.alloc.destroy(s);
+        }
+        tree.deinit(self.alloc);
+    } else if (self.surface_initialized) {
+        self.surface.deinit();
+    }
     if (self.hwnd) |hwnd| {
         _ = DestroyWindow(hwnd);
         self.hwnd = null;

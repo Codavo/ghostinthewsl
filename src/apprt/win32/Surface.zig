@@ -378,7 +378,13 @@ pub fn close(self: *Self, process_active: bool) void {
             return;
         }
     }
-    PostQuitMessage(0);
+    // Ask the app to remove this surface from the tree, destroying the
+    // child window. If this is the last surface, the app will quit.
+    if (self.app) |app| {
+        app.closeSurface(self);
+    } else {
+        PostQuitMessage(0);
+    }
 }
 
 extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;

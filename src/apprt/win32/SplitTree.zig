@@ -130,6 +130,34 @@ fn layoutNode(node: *Node, bounds: Rect, cb: *const fn (surface: *Surface, rect:
     }
 }
 
+/// Remove the leaf containing the given surface. The sibling is promoted
+/// to replace the parent split node. Returns true if the tree is now empty.
+pub fn removeLeaf(self: *SplitTree, alloc: Allocator, surface: *Surface) bool {
+    const result = self.findLeaf(surface) orelse return false;
+
+    // If the leaf is the root, the tree becomes empty.
+    if (result.parent == null) {
+        alloc.destroy(result.slot.*);
+        return true;
+    }
+
+    // Find which child of the parent we are, promote the sibling.
+    const parent = result.parent.?;
+    const parent_split = &parent.split;
+    const leaf_node = result.slot.*;
+    const sibling = if (parent_split.children[0] == leaf_node)
+        parent_split.children[1]
+    else
+        parent_split.children[0];
+
+    // The parent becomes the sibling (copy contents).
+    alloc.destroy(leaf_node);
+    parent.* = sibling.*;
+    alloc.destroy(sibling);
+
+    return false;
+}
+
 /// Collect all leaf surfaces into the given buffer, returning the count.
 pub fn collectLeaves(self: *SplitTree, buf: []*Surface) usize {
     var i: usize = 0;
