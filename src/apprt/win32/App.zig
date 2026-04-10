@@ -637,6 +637,38 @@ pub fn performAction(
             }
             return true;
         },
+        .key_sequence => {
+            // Show/hide a hint in the window title when a multi-key binding
+            // sequence is in progress.
+            const window = self.focused_window orelse return true;
+            if (window.hwnd) |hwnd| {
+                const title = switch (value) {
+                    .trigger => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty (key sequence...)"),
+                    .end => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                };
+                _ = sys.SetWindowTextW(hwnd, title);
+            }
+            return true;
+        },
+        .key_table => {
+            // Show the active key table name (if any) in the window title.
+            const window = self.focused_window orelse return true;
+            if (window.hwnd) |hwnd| {
+                switch (value) {
+                    .activate => |name| {
+                        var buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrintZ(&buf, "Ghostty ({s})", .{name}) catch return true;
+                        const wtext = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, msg) catch return true;
+                        defer self.alloc.free(wtext);
+                        _ = sys.SetWindowTextW(hwnd, wtext.ptr);
+                    },
+                    .deactivate, .deactivate_all => {
+                        _ = sys.SetWindowTextW(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"));
+                    },
+                }
+            }
+            return true;
+        },
         .new_tab,
         .close_tab,
         .toggle_tab_overview,
@@ -646,8 +678,6 @@ pub fn performAction(
         .show_gtk_inspector,
         .render_inspector,
         .set_tab_title,
-        .key_sequence,
-        .key_table,
         .undo,
         .redo,
         .start_search,
