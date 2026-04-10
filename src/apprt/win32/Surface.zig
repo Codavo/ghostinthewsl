@@ -277,9 +277,24 @@ pub fn getTitle(_: *Self) ?[:0]const u8 {
     return null;
 }
 
-pub fn close(_: *Self, _: bool) void {
-    // TODO: handle close with confirmation
+pub fn close(self: *Self, process_active: bool) void {
+    if (process_active) {
+        const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+        const msg = std.unicode.utf8ToUtf16LeStringLiteral(
+            "Close this terminal? There are still running processes.",
+        );
+        const MB_OKCANCEL: u32 = 0x00000001;
+        const MB_ICONWARNING: u32 = 0x00000030;
+        const IDOK: c_int = 1;
+        if (MessageBoxW(self.hwnd, msg, title, MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
+            return;
+        }
+    }
+    PostQuitMessage(0);
 }
+
+extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
+extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
 
 pub fn supportsClipboard(_: *Self, clipboard: apprt.Clipboard) bool {
     return clipboard == .standard;

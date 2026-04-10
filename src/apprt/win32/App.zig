@@ -112,6 +112,7 @@ extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
 extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) HDC;
 extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
 extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: ?[*:0]align(1) const u16) callconv(.winapi) HCURSOR;
+extern "user32" fn LoadIconW(hInstance: ?HINSTANCE, lpIconName: ?[*:0]align(1) const u16) callconv(.winapi) HICON;
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) LONG_PTR;
 extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
@@ -129,6 +130,7 @@ extern "user32" fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) callconv(.winap
 extern "user32" fn GetMonitorInfoW(hMonitor: ?*anyopaque, lpmi: *MONITORINFO) callconv(.winapi) BOOL;
 extern "shell32" fn ShellExecuteW(hwnd: ?HWND, lpOperation: ?[*:0]const u16, lpFile: [*:0]const u16, lpParameters: ?[*:0]const u16, lpDirectory: ?[*:0]const u16, nShowCmd: c_int) callconv(.winapi) ?*anyopaque;
 extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
+extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
 extern "advapi32" fn RegOpenKeyExW(hKey: ?*anyopaque, lpSubKey: [*:0]const u16, ulOptions: DWORD, samDesired: DWORD, phkResult: *?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegCloseKey(hKey: ?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegQueryValueExW(hKey: ?*anyopaque, lpValueName: [*:0]const u16, lpReserved: ?*DWORD, lpType: ?*DWORD, lpData: ?[*]u8, lpcbData: ?*DWORD) callconv(.winapi) i32;
@@ -346,6 +348,49 @@ pub fn performAction(
             _ = MessageBeep(0xFFFFFFFF); // MB_OK
             return true;
         },
+        .progress_report => {
+            // TODO: implement via ITaskbarList3 COM interface
+            return false;
+        },
+        .desktop_notification => {
+            // TODO: implement via Shell_NotifyIconW balloon or WinRT Toast
+            return false;
+        },
+        .reload_config => {
+            // Load new config from disk (unless soft reload)
+            if (!value.soft) {
+                var new_config = Config.load(self.alloc) catch |err| {
+                    log.err("failed to reload config: {}", .{err});
+                    return false;
+                };
+                self.config.deinit();
+                self.config.* = new_config;
+                _ = &new_config; // consumed by self.config
+            }
+            // Propagate to all surfaces
+            self.core_app.updateConfig(self, self.config) catch |err| {
+                log.err("failed to update config: {}", .{err});
+                return false;
+            };
+            return true;
+        },
+        .config_change => {
+            // Nothing apprt-specific to do for win32 on config change
+            return true;
+        },
+        .show_child_exited => {
+            if (self.hwnd) |hwnd| {
+                const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Process exited with code {}", .{value.exit_code}) catch return false;
+                const msg_w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, msg) catch return false;
+                defer self.alloc.free(msg_w);
+                const MB_OK: u32 = 0x00000000;
+                const MB_ICONINFORMATION: u32 = 0x00000040;
+                _ = MessageBoxW(hwnd, msg_w.ptr, title, MB_OK | MB_ICONINFORMATION);
+            }
+            return true;
+        },
         .new_window => {
             return false;
         },
@@ -493,12 +538,12 @@ fn createWindow(self: *App) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = hinstance,
-        .hIcon = null,
+        .hIcon = LoadIconW(hinstance, @ptrFromInt(1)), // ID_ICON_GHOSTTY
         .hCursor = LoadCursorW(null, IDC_ARROW),
         .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = class_name,
-        .hIconSm = null,
+        .hIconSm = LoadIconW(hinstance, @ptrFromInt(1)),
     };
 
     if (RegisterClassExW(&wc) == 0) {
@@ -613,6 +658,12 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
         WM_CLOSE => {
+            if (getApp(hwnd)) |app| {
+                if (app.surface.core_surface) |core| {
+                    core.close();
+                    return 0;
+                }
+            }
             PostQuitMessage(0);
             return 0;
         },
