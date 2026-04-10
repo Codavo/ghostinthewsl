@@ -140,6 +140,14 @@ fn open(self: *CommandPalette, window: *Window) !void {
         hinstance,
         null,
     ) orelse return error.Win32Error;
+    errdefer {
+        if (self.hwnd) |h| {
+            _ = DestroyWindow(h);
+            self.hwnd = null;
+            self.edit_hwnd = null;
+            self.list_hwnd = null;
+        }
+    }
 
     // Store `self` on the window so the wndProc can access it
     _ = SetWindowLongPtrW(self.hwnd.?, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -366,11 +374,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             return 0;
         },
         WM_ACTIVATE => {
-            // Close when losing focus (popup dismissal)
-            if ((wparam & 0xFFFF) == 0) { // WA_INACTIVE
-                if (getPalette(hwnd)) |self| self.close();
-            }
-            return 0;
+            // Previously we auto-closed on WA_INACTIVE, but that can cause
+            // re-entrant close during open. User dismisses via ESC instead.
+            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
