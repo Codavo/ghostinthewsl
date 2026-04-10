@@ -986,10 +986,30 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 const key = mapVirtualKey(wparam);
                 if (key != .unidentified) {
                     const input = @import("../../input.zig");
+                    // Provide unshifted_codepoint for letter/digit/punct keys
+                    // so that keybindings defined with .unicode = 'x' match.
+                    const unshifted: u21 = switch (wparam) {
+                        0x41...0x5A => @intCast(wparam + 32), // A-Z -> a-z
+                        0x30...0x39 => @intCast(wparam), // 0-9
+                        0x20 => ' ',
+                        0xBD => '-',
+                        0xBB => '=',
+                        0xDB => '[',
+                        0xDD => ']',
+                        0xDC => '\\',
+                        0xBA => ';',
+                        0xDE => '\'',
+                        0xBC => ',',
+                        0xBE => '.',
+                        0xBF => '/',
+                        0xC0 => '`',
+                        else => 0,
+                    };
                     const event = input.KeyEvent{
                         .action = .press,
                         .key = key,
                         .mods = mods,
+                        .unshifted_codepoint = unshifted,
                     };
                     const effect = core.keyCallback(event) catch |err| {
                         log.err("key callback error: {}", .{err});
