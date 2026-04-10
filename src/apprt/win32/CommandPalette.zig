@@ -282,7 +282,7 @@ fn executeSelected(self: *CommandPalette) void {
     // Perform the action on the target surface
     _ = self.app;
     if (target) |w| {
-        const surface = w.focused_surface orelse w.primary_surface;
+        const surface = w.getFocusedSurface() orelse return;
         if (surface.core_surface) |core| {
             _ = core.performBindingAction(cmd.action) catch |err| {
                 log.err("failed to execute command {s}: {}", .{ cmd.title, err });

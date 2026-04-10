@@ -58,6 +58,7 @@ const PFD_MAIN_PLANE = 0;
 // WGL / GDI extern declarations
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) c_int;
+extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const std.os.windows.RECT, bErase: BOOL) callconv(.winapi) BOOL;
 extern "gdi32" fn ChoosePixelFormat(hdc: HDC, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) c_int;
 extern "gdi32" fn SetPixelFormat(hdc: HDC, format: c_int, ppfd: *const PIXELFORMATDESCRIPTOR) callconv(.winapi) BOOL;
 extern "gdi32" fn SwapBuffers(hdc: HDC) callconv(.winapi) BOOL;
@@ -478,4 +479,6 @@ pub fn defaultTermioEnv(self: *Self) !std.process.EnvMap {
     return try @import("../../os/main.zig").getEnvMap(alloc);
 }
 
-pub fn redrawInspector(_: *Self) void {}
+pub fn redrawInspector(self: *Self) void {
+    _ = InvalidateRect(self.hwnd, null, 0);
+}

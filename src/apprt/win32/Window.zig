@@ -1,16 +1,11 @@
-//! A single top-level Win32 window. Each Window owns one HWND, one primary
-//! Surface (embedded in the child HWND), and a SplitTree that can manage
-//! additional Surfaces for split panes.
-//!
-//! An App may own multiple Windows.
+//! A single top-level Win32 window. Each Window owns one HWND and a set of
+//! tabs. Every tab owns its own split tree and active surface state.
 const Window = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
-const Config = configpkg.Config;
-const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const Surface = @import("Surface.zig");
 const SplitTree = @import("SplitTree.zig");
@@ -18,13 +13,61 @@ const sys = @import("sys.zig");
 
 const App = @import("App.zig");
 
-const log = std.log.scoped(.win32_window);
-
 const HWND = sys.HWND;
 const RECT = sys.RECT;
 const BOOL = sys.BOOL;
 const UINT = sys.UINT;
 const DWORD = sys.DWORD;
+const LPARAM = sys.LPARAM;
+const WPARAM = sys.WPARAM;
+const LRESULT = sys.LRESULT;
+
+const WS_CHILD: u32 = 0x40000000;
+const WS_VISIBLE: u32 = 0x10000000;
+const WS_TABSTOP: u32 = 0x00010000;
+const TCS_FIXEDWIDTH: u32 = 0x0400;
+const WM_NOTIFY: UINT = 0x004E;
+const WM_SETFONT: UINT = 0x0030;
+const SW_HIDE: c_int = 0;
+const TCM_FIRST: UINT = 0x1300;
+const TCM_GETCURSEL: UINT = TCM_FIRST + 11;
+const TCM_SETCURSEL: UINT = TCM_FIRST + 12;
+const TCM_DELETEITEM: UINT = TCM_FIRST + 8;
+const TCM_DELETEALLITEMS: UINT = TCM_FIRST + 9;
+const TCM_INSERTITEMW: UINT = TCM_FIRST + 62;
+const TCM_SETITEMW: UINT = TCM_FIRST + 61;
+const TCM_SETITEMSIZE: UINT = TCM_FIRST + 41;
+const TCIF_TEXT: UINT = 0x0001;
+const TCN_FIRST: i32 = -550;
+const TCN_SELCHANGE: i32 = TCN_FIRST - 1;
+const ICC_TAB_CLASSES: DWORD = 0x00000008;
+const TAB_HEIGHT: i32 = 30;
+
+const NMHDR = extern struct {
+    hwndFrom: HWND,
+    idFrom: usize,
+    code: i32,
+};
+
+const INITCOMMONCONTROLSEX = extern struct {
+    dwSize: DWORD,
+    dwICC: DWORD,
+};
+
+const TCITEMW = extern struct {
+    mask: UINT,
+    dwState: DWORD = 0,
+    dwStateMask: DWORD = 0,
+    pszText: ?[*:0]u16 = null,
+    cchTextMax: c_int = 0,
+    iImage: c_int = 0,
+    lParam: LPARAM = 0,
+};
+
+extern "comctl32" fn InitCommonControlsEx(lpInitCtrls: *const INITCOMMONCONTROLSEX) callconv(.winapi) BOOL;
+extern "gdi32" fn CreateFontW(cHeight: c_int, cWidth: c_int, cEscapement: c_int, cOrientation: c_int, cWeight: c_int, bItalic: DWORD, bUnderline: DWORD, bStrikeOut: DWORD, iCharSet: DWORD, iOutPrecision: DWORD, iClipPrecision: DWORD, iQuality: DWORD, iPitchAndFamily: DWORD, pszFaceName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+
+var ui_font: ?*anyopaque = null;
 
 pub const CreateOptions = struct {
     command: ?configpkg.Command = null,
@@ -44,26 +87,22 @@ pub const CreateOptions = struct {
     }
 };
 
-/// Back-pointer to the owning App.
+const TabState = struct {
+    primary_surface: *Surface,
+    tree: SplitTree,
+    focused_surface: ?*Surface = null,
+    title: [:0]const u8,
+};
+
 app: *App,
-
-/// The top-level window handle.
 hwnd: ?HWND = null,
-
-/// The primary (first) surface created with this window. Additional surfaces
-/// live in the split tree. All surfaces are heap-allocated.
+tab_hwnd: ?HWND = null,
 primary_surface: *Surface,
-
-/// Split tree managing all surfaces within this window.
 tree: ?SplitTree = null,
-
-/// The surface that currently has focus within this window.
 focused_surface: ?*Surface = null,
-
-/// Whether the primary surface has been initialized yet.
 surface_initialized: bool = false,
-
-/// Fullscreen state (for restoring from fullscreen).
+tabs: std.ArrayListUnmanaged(TabState) = .{},
+current_tab: usize = 0,
 fullscreen: FullscreenState = .{},
 
 const FullscreenState = struct {
@@ -73,74 +112,46 @@ const FullscreenState = struct {
     rect: RECT = std.mem.zeroes(RECT),
 };
 
-/// Allocate and initialize a new Window. The caller owns the returned pointer.
 pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
 
-    const primary = try alloc.create(Surface);
-    errdefer alloc.destroy(primary);
-    primary.* = .{ .hwnd = undefined };
-
     self.* = .{
         .app = app,
-        .primary_surface = primary,
+        .primary_surface = undefined,
     };
 
-    // Create the top-level window
     try self.createHwnd(opts.title);
     errdefer {
-        if (self.hwnd) |h| {
-            _ = sys.DestroyWindow(h);
-        }
+        if (self.hwnd) |h| _ = sys.DestroyWindow(h);
     }
 
-    // Initialize the primary surface (creates a child HWND with WGL context)
-    try primary.init(self.hwnd.?, app);
-    primary.window = self;
-    self.surface_initialized = true;
-
-    // Set back-pointer from the HWND so the wndProc can find us
+    try self.createTabControl();
     _ = sys.SetWindowLongPtrW(self.hwnd.?, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    // Initialize split tree with primary surface as root leaf
-    self.tree = try SplitTree.initLeaf(alloc, primary);
-    self.focused_surface = primary;
-
-    // Initialize the CoreSurface for the primary surface
-    try self.initCoreSurface(primary, opts);
-
-    // Resize window to configured grid size and apply layout
+    _ = try self.insertTab(0, opts, true);
     self.applyConfiguredWindowSize();
     self.relayout();
 
-    // Focus the primary surface
-    _ = sys.SetFocus(primary.hwnd);
-
-    // Apply initial color scheme
-    if (primary.core_surface) |core| {
-        core.colorSchemeCallback(app.detectColorScheme()) catch {};
+    if (self.focused_surface) |surface| {
+        _ = sys.SetFocus(surface.hwnd);
+        if (surface.core_surface) |core| {
+            core.colorSchemeCallback(app.detectColorScheme()) catch {};
+        }
     }
 
     return self;
 }
 
-/// Deinitialize this window and all its surfaces. Does not free `self`.
 pub fn deinit(self: *Window) void {
-    if (self.tree) |*tree| {
-        var buf: [32]*Surface = undefined;
-        const count = tree.collectLeaves(&buf);
-        for (buf[0..count]) |s| {
-            if (s.core_surface) |core| {
-                core.deinit();
-                self.app.alloc.destroy(core);
-                s.core_surface = null;
-            }
-            s.deinit();
-            self.app.alloc.destroy(s);
-        }
-        tree.deinit(self.app.alloc);
-        self.tree = null;
+    self.syncActiveTabFromWindow();
+    for (self.tabs.items) |*tab| self.deinitTab(tab);
+    self.tabs.deinit(self.app.alloc);
+    self.tree = null;
+    self.surface_initialized = false;
+    if (self.tab_hwnd) |hwnd| {
+        _ = sys.DestroyWindow(hwnd);
+        self.tab_hwnd = null;
     }
     if (self.hwnd) |hwnd| {
         _ = sys.DestroyWindow(hwnd);
@@ -151,8 +162,6 @@ pub fn deinit(self: *Window) void {
 fn createHwnd(self: *Window, title_override: ?[:0]const u8) !void {
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
     const hinstance = sys.GetModuleHandleW(null);
-
-    // Register the window class (idempotent across windows — only first call succeeds)
     const wc: sys.WNDCLASSEXW = .{
         .cbSize = @sizeOf(sys.WNDCLASSEXW),
         .style = sys.CS_HREDRAW | sys.CS_VREDRAW | sys.CS_OWNDC,
@@ -167,13 +176,14 @@ fn createHwnd(self: *Window, title_override: ?[:0]const u8) !void {
         .lpszClassName = class_name,
         .hIconSm = sys.LoadIconW(hinstance, @ptrFromInt(1)),
     };
-    _ = sys.RegisterClassExW(&wc); // Ignore duplicate registrations
+    _ = sys.RegisterClassExW(&wc);
 
     const title = if (title_override) |title_utf8|
         try std.unicode.utf8ToUtf16LeAllocZ(self.app.alloc, title_utf8)
     else
         null;
     defer if (title) |v| self.app.alloc.free(v);
+
     self.hwnd = sys.CreateWindowExW(
         0,
         class_name,
@@ -181,17 +191,400 @@ fn createHwnd(self: *Window, title_override: ?[:0]const u8) !void {
         sys.WS_OVERLAPPEDWINDOW,
         sys.CW_USEDEFAULT,
         sys.CW_USEDEFAULT,
-        800,
-        600,
+        900,
+        650,
         null,
         null,
         hinstance,
         null,
     );
-
     if (self.hwnd == null) return error.Win32Error;
     _ = sys.ShowWindow(self.hwnd.?, sys.SW_SHOWNORMAL);
     _ = sys.UpdateWindow(self.hwnd.?);
+}
+
+fn createTabControl(self: *Window) !void {
+    const icc: INITCOMMONCONTROLSEX = .{
+        .dwSize = @sizeOf(INITCOMMONCONTROLSEX),
+        .dwICC = ICC_TAB_CLASSES,
+    };
+    _ = InitCommonControlsEx(&icc);
+    self.tab_hwnd = sys.CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("SysTabControl32"),
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | TCS_FIXEDWIDTH,
+        0,
+        0,
+        0,
+        TAB_HEIGHT,
+        self.hwnd,
+        null,
+        sys.GetModuleHandleW(null),
+        null,
+    ) orelse return error.Win32Error;
+    if (ui_font == null) {
+        ui_font = CreateFontW(
+            -18,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        );
+    }
+    if (ui_font) |font| {
+        _ = sys.SendMessageW(self.tab_hwnd.?, WM_SETFONT, @intFromPtr(font), 1);
+    }
+}
+
+fn makeTabTitle(self: *Window, requested: ?[:0]const u8, index: usize) ![:0]const u8 {
+    if (requested) |title| return try self.app.alloc.dupeZ(u8, title);
+    return try std.fmt.allocPrintSentinel(self.app.alloc, "Tab {d}", .{index + 1}, 0);
+}
+
+fn insertTab(self: *Window, raw_index: usize, opts: CreateOptions, select: bool) !usize {
+    const alloc = self.app.alloc;
+    const surface = try alloc.create(Surface);
+    errdefer alloc.destroy(surface);
+    surface.* = .{ .hwnd = undefined };
+
+    try surface.init(self.hwnd.?, self.app);
+    surface.window = self;
+    errdefer surface.deinit();
+
+    try self.initCoreSurface(surface, opts);
+    errdefer {
+        if (surface.core_surface) |core| {
+            core.deinit();
+            alloc.destroy(core);
+            surface.core_surface = null;
+        }
+    }
+
+    const tab: TabState = .{
+        .primary_surface = surface,
+        .tree = try SplitTree.initLeaf(alloc, surface),
+        .focused_surface = surface,
+        .title = try self.makeTabTitle(opts.title, raw_index),
+    };
+    errdefer alloc.free(tab.title);
+
+    const index = @min(raw_index, self.tabs.items.len);
+    if (self.tabs.items.len > 0) self.syncActiveTabFromWindow();
+    try self.tabs.insert(alloc, index, tab);
+
+    if (self.tabs.items.len == 1) {
+        self.current_tab = 0;
+        self.loadActiveTabIntoWindow();
+    } else if (index <= self.current_tab and !select) {
+        self.current_tab += 1;
+    }
+
+    self.rebuildTabControl();
+    self.updateTabVisibility();
+
+    if (select or self.tabs.items.len == 1) {
+        try self.activateTab(index);
+    } else {
+        self.hideTabSurfaces(&self.tabs.items[index]);
+        _ = sys.SendMessageW(self.tab_hwnd.?, TCM_SETCURSEL, self.current_tab, 0);
+    }
+
+    return index;
+}
+
+fn deinitTab(self: *Window, tab: *TabState) void {
+    var leaves: [64]*Surface = undefined;
+    const count = tab.tree.collectLeaves(&leaves);
+    for (leaves[0..count]) |surface| {
+        self.app.core_app.deleteSurface(surface);
+        if (surface.core_surface) |core| {
+            core.deinit();
+            self.app.alloc.destroy(core);
+            surface.core_surface = null;
+        }
+        surface.deinit();
+        self.app.alloc.destroy(surface);
+    }
+    tab.tree.deinit(self.app.alloc);
+    self.app.alloc.free(tab.title);
+}
+
+fn syncActiveTabFromWindow(self: *Window) void {
+    if (self.tabs.items.len == 0 or self.current_tab >= self.tabs.items.len) return;
+    const tab = &self.tabs.items[self.current_tab];
+    tab.primary_surface = self.primary_surface;
+    tab.tree = self.tree orelse return;
+    tab.focused_surface = self.focused_surface orelse self.primary_surface;
+}
+
+fn loadActiveTabIntoWindow(self: *Window) void {
+    const tab = &self.tabs.items[self.current_tab];
+    self.primary_surface = tab.primary_surface;
+    self.tree = tab.tree;
+    self.focused_surface = tab.focused_surface orelse tab.primary_surface;
+    self.surface_initialized = true;
+}
+
+fn activeTab(self: *Window) ?*TabState {
+    if (self.tabs.items.len == 0 or self.current_tab >= self.tabs.items.len) return null;
+    return &self.tabs.items[self.current_tab];
+}
+
+pub fn getFocusedSurface(self: *Window) ?*Surface {
+    return self.focused_surface orelse if (self.tabs.items.len > 0) self.primary_surface else null;
+}
+
+pub fn getActiveTabTitle(self: *Window) ?[:0]const u8 {
+    const tab = self.activeTab() orelse return null;
+    return tab.title;
+}
+
+pub fn setActiveTabTitle(self: *Window, title: [:0]const u8) !void {
+    const tab = self.activeTab() orelse return;
+    self.app.alloc.free(tab.title);
+    tab.title = try self.app.alloc.dupeZ(u8, title);
+    self.updateTabControlTitle(self.current_tab);
+}
+
+fn updateTabVisibility(self: *Window) void {
+    const hwnd = self.tab_hwnd orelse return;
+    _ = sys.ShowWindow(hwnd, if (self.tabs.items.len > 1) sys.SW_SHOWNORMAL else SW_HIDE);
+    self.updateTabMetrics();
+}
+
+fn tabClientHeight(self: *Window) i32 {
+    return if (self.tabs.items.len > 1) TAB_HEIGHT else 0;
+}
+
+fn tabLeaves(tab: *TabState, buf: []*Surface) []const *Surface {
+    const count = tab.tree.collectLeaves(buf);
+    return buf[0..count];
+}
+
+fn hideTabSurfaces(_: *Window, tab: *TabState) void {
+    var leaves: [64]*Surface = undefined;
+    for (tabLeaves(tab, &leaves)) |surface| {
+        _ = sys.ShowWindow(surface.hwnd, SW_HIDE);
+    }
+}
+
+fn showTabSurfaces(_: *Window, tab: *TabState) void {
+    var leaves: [64]*Surface = undefined;
+    for (tabLeaves(tab, &leaves)) |surface| {
+        _ = sys.ShowWindow(surface.hwnd, sys.SW_SHOWNORMAL);
+    }
+}
+
+fn rebuildTabControl(self: *Window) void {
+    const hwnd = self.tab_hwnd orelse return;
+    _ = sys.SendMessageW(hwnd, TCM_DELETEALLITEMS, 0, 0);
+    for (self.tabs.items, 0..) |_, i| self.insertTabControlItem(i) catch {};
+    if (self.tabs.items.len > 0) {
+        _ = sys.SendMessageW(hwnd, TCM_SETCURSEL, self.current_tab, 0);
+    }
+    self.updateTabMetrics();
+}
+
+fn updateTabMetrics(self: *Window) void {
+    const hwnd = self.tab_hwnd orelse return;
+    if (self.tabs.items.len <= 1) return;
+
+    var rect: RECT = std.mem.zeroes(RECT);
+    if (sys.GetClientRect(self.hwnd orelse return, &rect) == 0) return;
+
+    const total_width = rect.right - rect.left;
+    if (total_width <= 0) return;
+
+    const tabs_i32: i32 = @intCast(self.tabs.items.len);
+    const width = @max(110, @divTrunc(total_width - 24, tabs_i32));
+    const size_param: LPARAM = (@as(LPARAM, TAB_HEIGHT) << 16) | @as(LPARAM, @intCast(width & 0xFFFF));
+    _ = sys.SendMessageW(hwnd, TCM_SETITEMSIZE, 0, size_param);
+    _ = sys.InvalidateRect(hwnd, null, 1);
+}
+
+fn insertTabControlItem(self: *Window, index: usize) !void {
+    const hwnd = self.tab_hwnd orelse return;
+    const utf16 = try std.unicode.utf8ToUtf16LeAllocZ(self.app.alloc, self.tabs.items[index].title);
+    defer self.app.alloc.free(utf16);
+    var item: TCITEMW = .{
+        .mask = TCIF_TEXT,
+        .pszText = utf16.ptr,
+    };
+    _ = sys.SendMessageW(hwnd, TCM_INSERTITEMW, index, @bitCast(@intFromPtr(&item)));
+}
+
+fn updateTabControlTitle(self: *Window, index: usize) void {
+    const hwnd = self.tab_hwnd orelse return;
+    const utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.app.alloc, self.tabs.items[index].title) catch return;
+    defer self.app.alloc.free(utf16);
+    var item: TCITEMW = .{
+        .mask = TCIF_TEXT,
+        .pszText = utf16.ptr,
+    };
+    _ = sys.SendMessageW(hwnd, TCM_SETITEMW, index, @bitCast(@intFromPtr(&item)));
+}
+
+fn activateTab(self: *Window, index: usize) !void {
+    if (self.tabs.items.len == 0 or index >= self.tabs.items.len) return;
+    if (index == self.current_tab and self.tree != null) {
+        _ = sys.SendMessageW(self.tab_hwnd.?, TCM_SETCURSEL, index, 0);
+        self.relayout();
+        if (self.focused_surface) |surface| _ = sys.SetFocus(surface.hwnd);
+        return;
+    }
+
+    if (self.tabs.items.len > 0 and self.tree != null and self.current_tab < self.tabs.items.len) {
+        self.syncActiveTabFromWindow();
+        self.hideTabSurfaces(&self.tabs.items[self.current_tab]);
+    }
+
+    self.current_tab = index;
+    self.loadActiveTabIntoWindow();
+    self.showTabSurfaces(&self.tabs.items[self.current_tab]);
+    if (self.tab_hwnd) |hwnd| _ = sys.SendMessageW(hwnd, TCM_SETCURSEL, index, 0);
+    self.relayout();
+    if (self.focused_surface) |surface| _ = sys.SetFocus(surface.hwnd);
+}
+
+fn findTabIndexForSurface(self: *Window, surface: *Surface) ?usize {
+    if (self.tabs.items.len == 0) return null;
+    if (self.tree) |tree| {
+        if (tree.findLeaf(surface) != null and self.current_tab < self.tabs.items.len) return self.current_tab;
+    }
+    for (self.tabs.items, 0..) |tab, i| {
+        if (i == self.current_tab and self.tree != null) continue;
+        if (tab.tree.findLeaf(surface) != null) return i;
+    }
+    return null;
+}
+
+fn closeTabAt(self: *Window, index: usize) void {
+    if (index >= self.tabs.items.len) return;
+    const was_current = index == self.current_tab;
+
+    if (was_current and self.tree != null) {
+        self.syncActiveTabFromWindow();
+    }
+
+    var tab = self.tabs.orderedRemove(index);
+    self.deinitTab(&tab);
+    if (self.tab_hwnd) |hwnd| _ = sys.SendMessageW(hwnd, TCM_DELETEITEM, index, 0);
+
+    if (self.tabs.items.len == 0) {
+        self.tree = null;
+        self.focused_surface = null;
+        self.surface_initialized = false;
+        self.app.closeWindow(self);
+        return;
+    }
+
+    if (index < self.current_tab or self.current_tab >= self.tabs.items.len) {
+        self.current_tab = if (self.current_tab == 0) 0 else self.current_tab - 1;
+    }
+
+    self.updateTabVisibility();
+    self.rebuildTabControl();
+    self.activateTab(self.current_tab) catch {};
+}
+
+fn closeEmptyTabAt(self: *Window, index: usize) void {
+    if (index >= self.tabs.items.len) return;
+    const was_current = index == self.current_tab;
+
+    if (was_current) {
+        self.tree = null;
+        self.focused_surface = null;
+        self.surface_initialized = false;
+    }
+
+    const tab = self.tabs.orderedRemove(index);
+    self.app.alloc.free(tab.title);
+
+    if (self.tabs.items.len == 0) {
+        self.app.closeWindow(self);
+        return;
+    }
+
+    if (index < self.current_tab or self.current_tab >= self.tabs.items.len) {
+        self.current_tab = if (self.current_tab == 0) 0 else self.current_tab - 1;
+    }
+
+    self.updateTabVisibility();
+    self.rebuildTabControl();
+    self.activateTab(self.current_tab) catch {};
+}
+
+pub fn closeTab(self: *Window, mode: apprt.action.CloseTabMode) void {
+    if (self.tabs.items.len == 0) return;
+    switch (mode) {
+        .this => self.closeTabAt(self.current_tab),
+        .other => {
+            var i = self.tabs.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (i == self.current_tab) continue;
+                self.closeTabAt(i);
+            }
+        },
+        .right => {
+            var i = self.tabs.items.len;
+            while (i > self.current_tab + 1) {
+                i -= 1;
+                self.closeTabAt(i);
+            }
+        },
+    }
+}
+
+pub fn moveTab(self: *Window, amount: isize) bool {
+    if (self.tabs.items.len <= 1 or amount == 0) return false;
+    self.syncActiveTabFromWindow();
+    const old_idx = self.current_tab;
+    var desired: isize = @intCast(old_idx);
+    desired = std.math.clamp(desired + amount, 0, @as(isize, @intCast(self.tabs.items.len - 1)));
+    const new_idx: usize = @intCast(desired);
+    if (new_idx == old_idx) return false;
+    const moved = self.tabs.orderedRemove(old_idx);
+    self.tabs.insert(self.app.alloc, new_idx, moved) catch return false;
+    self.current_tab = new_idx;
+    self.rebuildTabControl();
+    self.activateTab(new_idx) catch {};
+    return true;
+}
+
+pub fn gotoTab(self: *Window, target: apprt.action.GotoTab) bool {
+    if (self.tabs.items.len == 0) return false;
+    const idx: usize = switch (target) {
+        .previous => (self.current_tab + self.tabs.items.len - 1) % self.tabs.items.len,
+        .next => (self.current_tab + 1) % self.tabs.items.len,
+        .last => self.tabs.items.len - 1,
+        else => blk: {
+            const raw: i32 = @intFromEnum(target);
+            if (raw < 0) break :blk self.current_tab;
+            break :blk @min(@as(usize, @intCast(raw)), self.tabs.items.len - 1);
+        },
+    };
+    self.activateTab(idx) catch return false;
+    return true;
+}
+
+pub fn focusSurface(self: *Window, surface: *Surface) void {
+    const idx = self.findTabIndexForSurface(surface) orelse return;
+    if (idx != self.current_tab) self.activateTab(idx) catch return;
+    self.focused_surface = surface;
+    if (self.current_tab < self.tabs.items.len) {
+        self.tabs.items[self.current_tab].focused_surface = surface;
+    }
 }
 
 pub fn initCoreSurface(self: *Window, surface: *Surface, opts: CreateOptions) !void {
@@ -205,19 +598,12 @@ pub fn initCoreSurface(self: *Window, surface: *Surface, opts: CreateOptions) !v
     var config = try apprt.surface.newConfig(self.app.core_app, self.app.config, .window);
     defer config.deinit();
 
-    if (opts.command) |cmd| {
-        config.command = try cmd.clone(alloc);
-    }
-    if (opts.working_directory) |wd| {
-        config.@"working-directory" = try wd.clone(alloc);
-    }
-    if (opts.title) |title| {
-        config.title = try alloc.dupeZ(u8, title);
-    }
+    if (opts.command) |cmd| config.command = try cmd.clone(alloc);
+    if (opts.working_directory) |wd| config.@"working-directory" = try wd.clone(alloc);
+    if (opts.title) |title| config.title = try alloc.dupeZ(u8, title);
 
     try core.init(alloc, &config, self.app.core_app, self.app, surface);
     errdefer core.deinit();
-
     surface.core_surface = core;
 }
 
@@ -232,7 +618,7 @@ pub fn applyConfiguredWindowSize(self: *Window) void {
     if (cell_width == 0 or cell_height == 0) return;
 
     const w: i32 = @intCast(@max(10, cfg_w) * cell_width);
-    const h: i32 = @intCast(@max(4, cfg_h) * cell_height);
+    const h: i32 = @intCast(@as(i32, @intCast(@max(4, cfg_h) * cell_height)) + self.tabClientHeight());
 
     var rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = h };
     _ = sys.AdjustWindowRectEx(&rect, sys.WS_OVERLAPPEDWINDOW, 0, 0);
@@ -244,17 +630,27 @@ pub fn relayout(self: *Window) void {
     const hwnd = self.hwnd orelse return;
     var rect: RECT = std.mem.zeroes(RECT);
     if (sys.GetClientRect(hwnd, &rect) == 0) return;
+    self.updateTabMetrics();
+    const tab_h = self.tabClientHeight();
+    if (self.tab_hwnd) |tab_hwnd| {
+        _ = sys.SetWindowPos(tab_hwnd, null, 0, 0, rect.right - rect.left, tab_h, 0x0004);
+    }
     const bounds = SplitTree.Rect{
         .x = 0,
-        .y = 0,
+        .y = tab_h,
         .w = rect.right - rect.left,
-        .h = rect.bottom - rect.top,
+        .h = rect.bottom - rect.top - tab_h,
     };
     tree.layout(bounds, relayoutCb);
 }
 
 fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
     _ = sys.SetWindowPos(surface.hwnd, null, rect.x, rect.y, rect.w, rect.h, 0x0004);
+}
+
+pub fn newTab(self: *Window, opts: CreateOptions) !void {
+    const insert_at = if (self.tabs.items.len == 0) 0 else self.current_tab + 1;
+    _ = try self.insertTab(insert_at, opts, true);
 }
 
 pub fn newSplit(self: *Window, existing: *Surface, dir: apprt.action.SplitDirection) !void {
@@ -285,18 +681,21 @@ pub fn newSplit(self: *Window, existing: *Surface, dir: apprt.action.SplitDirect
     try tree.split(alloc, existing, new_surface, split_dir, after);
 
     self.focused_surface = new_surface;
+    if (self.current_tab < self.tabs.items.len) {
+        self.tabs.items[self.current_tab].focused_surface = new_surface;
+    }
     _ = sys.SetFocus(new_surface.hwnd);
     self.relayout();
 }
 
-/// Remove a surface from this window. If it was the last one, the window
-/// is closed (which may close the app if it was the last window).
 pub fn closeSurface(self: *Window, surface: *Surface) void {
-    const tree = &(self.tree orelse return);
+    const tab_idx = self.findTabIndexForSurface(surface) orelse return;
+    const use_active = tab_idx == self.current_tab and self.tree != null;
+    var tree_copy = if (use_active) self.tree.? else self.tabs.items[tab_idx].tree;
+    const tree = &tree_copy;
     const alloc = self.app.alloc;
 
     self.app.core_app.deleteSurface(surface);
-
     if (surface.core_surface) |core| {
         core.deinit();
         alloc.destroy(core);
@@ -308,21 +707,22 @@ pub fn closeSurface(self: *Window, surface: *Surface) void {
     alloc.destroy(surface);
 
     if (result.empty) {
-        // Last surface closed in this window -> close the window
-        self.tree = null;
-        self.surface_initialized = false;
-        self.app.closeWindow(self);
+        self.closeEmptyTabAt(tab_idx);
         return;
     }
 
-    if (result.focus) |new_focus| {
-        self.focused_surface = new_focus;
-        _ = sys.SetFocus(new_focus.hwnd);
+    if (use_active) {
+        self.tree = tree_copy;
+        self.focused_surface = result.focus;
+        if (self.current_tab < self.tabs.items.len) {
+            self.tabs.items[self.current_tab].focused_surface = result.focus;
+        }
+        if (result.focus) |focus| _ = sys.SetFocus(focus.hwnd);
+        self.relayout();
     } else {
-        self.focused_surface = null;
+        self.tabs.items[tab_idx].tree = tree_copy;
+        self.tabs.items[tab_idx].focused_surface = result.focus;
     }
-
-    self.relayout();
 }
 
 pub fn gotoSplit(self: *Window, target: apprt.action.GotoSplit) void {
@@ -335,9 +735,9 @@ pub fn gotoSplit(self: *Window, target: apprt.action.GotoSplit) void {
     if (sys.GetClientRect(hwnd, &cr) == 0) return;
     const bounds: SplitTree.Rect = .{
         .x = 0,
-        .y = 0,
+        .y = self.tabClientHeight(),
         .w = cr.right - cr.left,
-        .h = cr.bottom - cr.top,
+        .h = cr.bottom - cr.top - self.tabClientHeight(),
     };
     const count = tree.collectLeafRects(bounds, &buf);
     if (count == 0) return;
@@ -385,6 +785,7 @@ pub fn gotoSplit(self: *Window, target: apprt.action.GotoSplit) void {
 
     const new_focus = buf[next_idx].surface;
     self.focused_surface = new_focus;
+    if (self.current_tab < self.tabs.items.len) self.tabs.items[self.current_tab].focused_surface = new_focus;
     _ = sys.SetFocus(new_focus.hwnd);
 }
 
@@ -408,7 +809,6 @@ fn equalizeNode(node: *SplitTree.Node) void {
 pub fn resizeSplit(self: *Window, req: apprt.action.ResizeSplit) void {
     const tree = &(self.tree orelse return);
     const current = self.focused_surface orelse return;
-
     const want_horizontal = req.direction == .left or req.direction == .right;
     const grow = req.direction == .right or req.direction == .down;
 
@@ -449,9 +849,7 @@ fn findPath(node: *SplitTree.Node, target: *Surface, path: []*SplitTree.Node, le
     path[len.*] = node;
     len.* += 1;
     switch (node.*) {
-        .leaf => |s| {
-            if (s == target) return true;
-        },
+        .leaf => |s| if (s == target) return true,
         .split => |sp| {
             if (findPath(sp.children[0], target, path, len)) return true;
             if (findPath(sp.children[1], target, path, len)) return true;
@@ -466,6 +864,23 @@ fn containsLeaf(node: *SplitTree.Node, target: *Surface) bool {
         .leaf => |s| s == target,
         .split => |sp| containsLeaf(sp.children[0], target) or containsLeaf(sp.children[1], target),
     };
+}
+
+pub fn handleTopLevelMessage(self: *Window, msg: UINT, wparam: WPARAM, lparam: LPARAM) ?LRESULT {
+    _ = wparam;
+    switch (msg) {
+        WM_NOTIFY => {
+            const hdr: *const NMHDR = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (self.tab_hwnd != null and hdr.hwndFrom == self.tab_hwnd.? and hdr.code == TCN_SELCHANGE) {
+                const sel = sys.SendMessageW(self.tab_hwnd.?, TCM_GETCURSEL, 0, 0);
+                const idx: usize = @intCast(sel);
+                self.activateTab(idx) catch {};
+                return 0;
+            }
+        },
+        else => {},
+    }
+    return null;
 }
 
 pub fn toggleFullscreen(self: *Window) void {

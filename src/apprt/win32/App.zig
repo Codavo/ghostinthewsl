@@ -16,6 +16,8 @@ const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("SplitTree.zig");
 const CommandPalette = @import("CommandPalette.zig");
+const PromptDialog = @import("PromptDialog.zig");
+const SearchPanel = @import("SearchPanel.zig");
 const sys = @import("sys.zig");
 
 const log = std.log.scoped(.win32);
@@ -157,6 +159,14 @@ tray_registered: bool = false,
 /// The command palette (created lazily).
 command_palette: CommandPalette = undefined,
 command_palette_initialized: bool = false,
+
+/// Prompt dialog for title editing.
+prompt_dialog: PromptDialog = undefined,
+prompt_dialog_initialized: bool = false,
+
+/// Search panel for incremental search.
+search_panel: SearchPanel = undefined,
+search_panel_initialized: bool = false,
 
 /// Single-instance mutex handle.
 instance_mutex: ?*anyopaque = null,
@@ -325,6 +335,20 @@ pub fn run(self: *App) !void {
                 }
             }
         }
+        if (self.prompt_dialog_initialized and self.prompt_dialog.hwnd != null) {
+            if (msg.hwnd) |mh| {
+                if (self.prompt_dialog.preTranslateMessage(msg.message, mh, msg.wParam)) {
+                    continue;
+                }
+            }
+        }
+        if (self.search_panel_initialized and self.search_panel.hwnd != null) {
+            if (msg.hwnd) |mh| {
+                if (self.search_panel.preTranslateMessage(msg.message, mh, msg.wParam)) {
+                    continue;
+                }
+            }
+        }
 
         _ = sys.TranslateMessage(&msg);
         _ = sys.DispatchMessageW(&msg);
@@ -346,6 +370,8 @@ pub fn terminate(self: *App) void {
     if (self.command_palette_initialized) {
         self.command_palette.deinit();
     }
+    if (self.prompt_dialog_initialized) self.prompt_dialog.deinit();
+    if (self.search_panel_initialized) self.search_panel.deinit();
     if (self.tray_registered) {
         if (self.windows.items.len > 0) {
             if (self.windows.items[0].hwnd) |hwnd| {
@@ -466,7 +492,7 @@ pub fn performAction(
         },
         .new_split => {
             const window = self.focused_window orelse return false;
-            const existing = window.focused_surface orelse window.primary_surface;
+            const existing = window.getFocusedSurface() orelse return false;
             window.newSplit(existing, value) catch |err| {
                 log.err("new_split failed: {}", .{err});
                 return false;
@@ -490,12 +516,12 @@ pub fn performAction(
         },
         .mouse_shape => {
             const window = self.focused_window orelse return false;
-            if (window.focused_surface) |s| s.setMouseShape(value) else window.primary_surface.setMouseShape(value);
+            if (window.getFocusedSurface()) |s| s.setMouseShape(value);
             return true;
         },
         .mouse_visibility => {
             const window = self.focused_window orelse return false;
-            if (window.focused_surface) |s| s.setMouseVisibility(value == .visible);
+            if (window.getFocusedSurface()) |s| s.setMouseVisibility(value == .visible);
             return true;
         },
         .open_url => {
@@ -517,7 +543,18 @@ pub fn performAction(
         },
         .quit_timer => return true,
         .mouse_over_link => return true,
-        .inspector => return false,
+        .inspector => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            switch (value) {
+                .show => core.activateInspector() catch return false,
+                .hide => core.deactivateInspector(),
+                .toggle => if (core.inspector != null) core.deactivateInspector() else core.activateInspector() catch return false,
+            }
+            return true;
+        },
         .reload_config => {
             if (!value.soft) {
                 var new_config = Config.load(self.alloc) catch |err| {
@@ -536,6 +573,7 @@ pub fn performAction(
         },
         .config_change => return true,
         .show_child_exited => {
+            if (value.exit_code == 0) return true;
             const surface = switch (target) {
                 .app => return false,
                 .surface => |core| core.rt_surface,
@@ -718,8 +756,29 @@ pub fn performAction(
             return true;
         },
         .prompt_title => {
-            // No native input dialog - fall back to a fixed default title.
-            // A proper implementation would create a small dialog with an edit.
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const rt_surface = core.rt_surface;
+            const window = rt_surface.window orelse return false;
+            if (!self.prompt_dialog_initialized) {
+                self.prompt_dialog = PromptDialog.init(self.alloc, self);
+                self.prompt_dialog_initialized = true;
+            }
+            const initial = switch (value) {
+                .surface => rt_surface.getTitle() orelse "",
+                .tab => window.getActiveTabTitle() orelse "",
+            };
+            self.prompt_dialog.open(
+                window,
+                core,
+                switch (value) {
+                    .surface => .surface_title,
+                    .tab => .tab_title,
+                },
+                initial,
+            ) catch return false;
             return true;
         },
         .command_finished => {
@@ -786,22 +845,79 @@ pub fn performAction(
             }
             return true;
         },
-        .new_tab,
-        .close_tab,
-        .toggle_tab_overview,
+        .new_tab => {
+            const window = self.focused_window orelse return false;
+            window.newTab(.none) catch return false;
+            return true;
+        },
+        .close_tab => {
+            const window = self.focused_window orelse return false;
+            window.closeTab(value);
+            return true;
+        },
+        .toggle_tab_overview => {
+            const window = self.focused_window orelse return false;
+            if (window.tab_hwnd) |hwnd| _ = sys.SetFocus(hwnd);
+            return true;
+        },
         .toggle_quick_terminal,
-        .move_tab,
-        .goto_tab,
-        .show_gtk_inspector,
-        .render_inspector,
-        .set_tab_title,
+        => return true,
+        .move_tab => {
+            const window = self.focused_window orelse return false;
+            _ = window.moveTab(value.amount);
+            return true;
+        },
+        .goto_tab => {
+            const window = self.focused_window orelse return false;
+            return window.gotoTab(value);
+        },
+        .show_gtk_inspector => return false,
+        .render_inspector => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            redrawInspector(self, core.rt_surface);
+            return true;
+        },
+        .set_tab_title => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const window = core.rt_surface.window orelse return false;
+            window.setActiveTabTitle(value.title) catch return false;
+            return true;
+        },
         .undo,
         .redo,
-        .start_search,
-        .end_search,
-        .search_total,
-        .search_selected,
         => return true,
+        .start_search => {
+            const core = switch (target) {
+                .app => return false,
+                .surface => |core| core,
+            };
+            const rt_surface = core.rt_surface;
+            const window = rt_surface.window orelse return false;
+            if (!self.search_panel_initialized) {
+                self.search_panel = SearchPanel.init(self.alloc, self);
+                self.search_panel_initialized = true;
+            }
+            self.search_panel.open(window, core, value.needle) catch return false;
+            return true;
+        },
+        .end_search => {
+            if (self.search_panel_initialized and self.search_panel.hwnd != null) self.search_panel.close(false);
+            return true;
+        },
+        .search_total => {
+            if (self.search_panel_initialized) self.search_panel.setSearchTotal(value.total);
+            return true;
+        },
+        .search_selected => {
+            if (self.search_panel_initialized) self.search_panel.setSearchSelected(value.selected);
+            return true;
+        },
     }
 }
 
@@ -870,7 +986,9 @@ pub fn performIpc(
     }
 }
 
-pub fn redrawInspector(_: *App, _: *Surface) void {}
+pub fn redrawInspector(_: *App, surface: *Surface) void {
+    surface.redrawInspector();
+}
 
 /// Detect the Windows light/dark theme from the registry.
 pub fn detectColorScheme(_: *App) apprt.ColorScheme {
@@ -995,6 +1113,9 @@ fn getWindow(hwnd: HWND) ?*Window {
 }
 
 pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    if (getWindow(hwnd)) |window| {
+        if (window.handleTopLevelMessage(msg, wparam, lparam)) |result| return result;
+    }
     switch (msg) {
         WM_COPYDATA => {
             const window = getWindow(hwnd) orelse return 0;
@@ -1027,7 +1148,7 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
             if (getWindow(hwnd)) |window| {
                 // Close the focused surface's core, which will trigger
                 // Surface.close -> Window.closeSurface -> App.closeWindow
-                if (window.focused_surface) |s| {
+                if (window.getFocusedSurface()) |s| {
                     if (s.core_surface) |core| {
                         core.close();
                         return 0;
@@ -1062,7 +1183,7 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
                 window.app.core_app.focusEvent(focused);
                 if (focused) {
                     window.app.focused_window = window;
-                    if (window.focused_surface) |s| _ = sys.SetFocus(s.hwnd);
+                    if (window.getFocusedSurface()) |s| _ = sys.SetFocus(s.hwnd);
                 }
             }
             return 0;
@@ -1217,9 +1338,8 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 _ = core.mouseButtonCallback(.press, button, getModifiers()) catch false;
                 _ = SetCapture(hwnd);
                 _ = sys.SetFocus(hwnd);
-                // Update focused surface in the window
                 if (surface.window) |w| {
-                    w.focused_surface = surface;
+                    w.focusSurface(surface);
                     app.focused_window = w;
                 }
             }
@@ -1292,7 +1412,7 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 core.focusCallback(focused) catch {};
                 if (focused) {
                     if (surface.window) |w| {
-                        w.focused_surface = surface;
+                        w.focusSurface(surface);
                         app.focused_window = w;
                     }
                 }

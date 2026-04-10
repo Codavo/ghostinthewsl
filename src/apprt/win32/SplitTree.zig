@@ -51,14 +51,14 @@ const FindResult = struct {
     parent: ?*Node,
 };
 
-pub fn findLeaf(self: *SplitTree, surface: *Surface) ?FindResult {
+pub fn findLeaf(self: *const SplitTree, surface: *Surface) ?FindResult {
     return findLeafIn(&self.root, null, surface);
 }
 
-fn findLeafIn(slot: **Node, parent: ?*Node, surface: *Surface) ?FindResult {
+fn findLeafIn(slot: *const *Node, parent: ?*Node, surface: *Surface) ?FindResult {
     const node = slot.*;
     switch (node.*) {
-        .leaf => |s| if (s == surface) return .{ .slot = slot, .parent = parent } else return null,
+        .leaf => |s| if (s == surface) return .{ .slot = @constCast(slot), .parent = parent } else return null,
         .split => |*sp| {
             if (findLeafIn(&sp.children[0], node, surface)) |r| return r;
             if (findLeafIn(&sp.children[1], node, surface)) |r| return r;
