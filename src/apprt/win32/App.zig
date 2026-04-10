@@ -356,6 +356,19 @@ pub fn performAction(
             // TODO: implement via Shell_NotifyIconW balloon or WinRT Toast
             return false;
         },
+        .quit_timer => {
+            // Single-window app: we quit immediately when the only
+            // surface closes. No delayed quit timer needed.
+            return true;
+        },
+        .mouse_over_link => {
+            // TODO: could display in a status bar or tooltip
+            return true;
+        },
+        .inspector => {
+            // TODO: inspector UI not implemented yet
+            return false;
+        },
         .reload_config => {
             // Load new config from disk (unless soft reload)
             if (!value.soft) {
