@@ -85,6 +85,9 @@ hwnd: HWND,
 /// Pointer back to the App.
 app: ?*App = null,
 
+/// Pointer back to the Window that contains this Surface.
+window: ?*Window = null,
+
 /// GDI device context.
 hdc: HDC = null,
 
@@ -99,6 +102,7 @@ width: u32 = 800,
 height: u32 = 600,
 
 const App = @import("App.zig");
+const Window = @import("Window.zig");
 
 pub fn core(self: *Self) *CoreSurface {
     return self.core_surface.?;
@@ -367,10 +371,11 @@ pub fn getTitle(_: *Self) ?[:0]const u8 {
 
 pub fn close(self: *Self, process_active: bool) void {
     _ = process_active; // Core already gated on needsConfirmQuit
-    // Ask the app to remove this surface from the tree, destroying the
-    // child window. If this is the last surface, the app will quit.
-    if (self.app) |app| {
-        app.closeSurface(self);
+    // Ask the window to remove this surface from the tree, destroying the
+    // child window. If this is the last surface in the last window, the
+    // app will quit.
+    if (self.window) |window| {
+        window.closeSurface(self);
     } else {
         PostQuitMessage(0);
     }

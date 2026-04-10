@@ -1,5 +1,7 @@
 /// Win32 application runtime for Ghostty. This is a minimal native Windows
 /// application using the Win32 API with OpenGL rendering.
+///
+/// An App owns a list of Windows, each with its own HWND and split tree.
 const App = @This();
 
 const std = @import("std");
@@ -11,191 +13,58 @@ const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
 const Surface = @import("Surface.zig");
-const renderer = @import("../../renderer.zig");
+const Window = @import("Window.zig");
+const SplitTree = @import("SplitTree.zig");
+const sys = @import("sys.zig");
 
 const log = std.log.scoped(.win32);
 
-// Win32 type definitions
-const BOOL = i32;
-const UINT = u32;
-const DWORD = u32;
-const WPARAM = usize;
-const LPARAM = isize;
-const LRESULT = isize;
-const HWND = std.os.windows.HWND;
-const HINSTANCE = std.os.windows.HINSTANCE;
-const HICON = ?*anyopaque;
-const HCURSOR = ?*anyopaque;
-const HBRUSH = ?*anyopaque;
-const HDC = ?*anyopaque;
-const HMENU = ?*anyopaque;
-const ATOM = u16;
-const LONG_PTR = isize;
+// Re-exported types for convenience
+const HWND = sys.HWND;
+const HINSTANCE = sys.HINSTANCE;
+const BOOL = sys.BOOL;
+const UINT = sys.UINT;
+const DWORD = sys.DWORD;
+const WPARAM = sys.WPARAM;
+const LPARAM = sys.LPARAM;
+const LRESULT = sys.LRESULT;
+const RECT = sys.RECT;
+const MSG = sys.MSG;
+const PAINTSTRUCT = sys.PAINTSTRUCT;
+const WM_CLOSE = sys.WM_CLOSE;
+const WM_SIZE = sys.WM_SIZE;
+const WM_PAINT = sys.WM_PAINT;
+const WM_KEYDOWN = sys.WM_KEYDOWN;
+const WM_CHAR = sys.WM_CHAR;
+const WM_WAKEUP = sys.WM_WAKEUP;
 
-const POINT = extern struct {
-    x: i32,
-    y: i32,
-};
-
-const MSG = extern struct {
-    hwnd: ?HWND,
-    message: UINT,
-    wParam: WPARAM,
-    lParam: LPARAM,
-    time: DWORD,
-    pt: POINT,
-};
-
-const RECT = extern struct {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-};
-
-const PAINTSTRUCT = extern struct {
-    hdc: HDC,
-    fErase: BOOL,
-    rcPaint: RECT,
-    fRestore: BOOL,
-    fIncUpdate: BOOL,
-    rgbReserved: [32]u8,
-};
-
-const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
-
-const WNDCLASSEXW = extern struct {
-    cbSize: UINT,
-    style: UINT,
-    lpfnWndProc: WNDPROC,
-    cbClsExtra: c_int,
-    cbWndExtra: c_int,
-    hInstance: ?HINSTANCE,
-    hIcon: HICON,
-    hCursor: HCURSOR,
-    hbrBackground: HBRUSH,
-    lpszMenuName: ?[*:0]const u16,
-    lpszClassName: [*:0]const u16,
-    hIconSm: HICON,
-};
-
-// Win32 constants
-const WM_CLOSE = 0x0010;
-const WM_DESTROY = 0x0002;
-const WM_PAINT = 0x000F;
-const WM_SIZE = 0x0005;
-const WM_KEYDOWN = 0x0100;
-const WM_CHAR = 0x0102;
-const WM_USER = 0x0400;
-const WM_WAKEUP = WM_USER + 1;
-const CS_HREDRAW = 0x0002;
-const CS_VREDRAW = 0x0001;
-const CS_OWNDC = 0x0020;
-const WS_OVERLAPPEDWINDOW = 0x00CF0000;
-const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
-const SW_SHOWNORMAL = 1;
-const IDC_ARROW: ?[*:0]align(1) const u16 = @ptrFromInt(32512);
-const GWLP_USERDATA: c_int = -21;
-
-// Win32 API extern declarations
-extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) ATOM;
-extern "user32" fn CreateWindowExW(dwExStyle: DWORD, lpClassName: ?[*:0]const u16, lpWindowName: ?[*:0]const u16, dwStyle: DWORD, x: i32, y: i32, nWidth: i32, nHeight: i32, hWndParent: ?HWND, hMenu: HMENU, hInstance: ?HINSTANCE, lpParam: ?*anyopaque) callconv(.winapi) ?HWND;
-extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: c_int) callconv(.winapi) BOOL;
-extern "user32" fn UpdateWindow(hWnd: HWND) callconv(.winapi) BOOL;
-extern "user32" fn DestroyWindow(hWnd: HWND) callconv(.winapi) BOOL;
-extern "user32" fn DefWindowProcW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
-extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT) callconv(.winapi) BOOL;
-extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
-extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
-extern "user32" fn PostMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
-extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
-extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) HDC;
-extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
-extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: ?[*:0]align(1) const u16) callconv(.winapi) HCURSOR;
-extern "user32" fn LoadIconW(hInstance: ?HINSTANCE, lpIconName: ?[*:0]align(1) const u16) callconv(.winapi) HICON;
-extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
-extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) LONG_PTR;
-extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
-extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.winapi) BOOL;
-extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
-extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16;
-extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: [*:0]const u16) callconv(.winapi) BOOL;
-extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.winapi) BOOL;
-extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, x: i32, y: i32, cx: i32, cy: i32, uFlags: UINT) callconv(.winapi) BOOL;
-extern "user32" fn IsZoomed(hWnd: HWND) callconv(.winapi) BOOL;
-extern "user32" fn GetWindowLongW(hWnd: HWND, nIndex: c_int) callconv(.winapi) i32;
-extern "user32" fn SetWindowLongW(hWnd: HWND, nIndex: c_int, dwNewLong: i32) callconv(.winapi) i32;
-extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
-extern "user32" fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) callconv(.winapi) ?*anyopaque;
-extern "user32" fn GetMonitorInfoW(hMonitor: ?*anyopaque, lpmi: *MONITORINFO) callconv(.winapi) BOOL;
-extern "shell32" fn ShellExecuteW(hwnd: ?HWND, lpOperation: ?[*:0]const u16, lpFile: [*:0]const u16, lpParameters: ?[*:0]const u16, lpDirectory: ?[*:0]const u16, nShowCmd: c_int) callconv(.winapi) ?*anyopaque;
-extern "shell32" fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *NOTIFYICONDATAW) callconv(.winapi) BOOL;
-
-const NIM_ADD: DWORD = 0x00000000;
-const NIM_MODIFY: DWORD = 0x00000001;
-const NIM_DELETE: DWORD = 0x00000002;
-const NIF_MESSAGE: DWORD = 0x00000001;
-const NIF_ICON: DWORD = 0x00000002;
-const NIF_TIP: DWORD = 0x00000004;
-const NIF_INFO: DWORD = 0x00000010;
-const NIIF_INFO: DWORD = 0x00000001;
-
-const NOTIFYICONDATAW = extern struct {
-    cbSize: DWORD,
-    hWnd: HWND,
-    uID: UINT,
-    uFlags: UINT,
-    uCallbackMessage: UINT = 0,
-    hIcon: HICON,
-    szTip: [128]u16 = [_]u16{0} ** 128,
-    dwState: DWORD = 0,
-    dwStateMask: DWORD = 0,
-    szInfo: [256]u16 = [_]u16{0} ** 256,
-    uTimeoutOrVersion: UINT = 0,
-    szInfoTitle: [64]u16 = [_]u16{0} ** 64,
-    dwInfoFlags: DWORD = 0,
-    guidItem: extern struct { a: u32 = 0, b: u16 = 0, c: u16 = 0, d: [8]u8 = [_]u8{0} ** 8 } = .{},
-    hBalloonIcon: ?*anyopaque = null,
-};
+// Additional externs not in sys.zig
+extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
+extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
 extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
+extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
+extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
 extern "advapi32" fn RegOpenKeyExW(hKey: ?*anyopaque, lpSubKey: [*:0]const u16, ulOptions: DWORD, samDesired: DWORD, phkResult: *?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegCloseKey(hKey: ?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegQueryValueExW(hKey: ?*anyopaque, lpValueName: [*:0]const u16, lpReserved: ?*DWORD, lpType: ?*DWORD, lpData: ?[*]u8, lpcbData: ?*DWORD) callconv(.winapi) i32;
-const HKEY_CURRENT_USER: ?*anyopaque = @ptrFromInt(0x80000001);
-const KEY_READ: DWORD = 0x20019;
-
-const MONITORINFO = extern struct {
-    cbSize: DWORD,
-    rcMonitor: RECT,
-    rcWork: RECT,
-    dwFlags: DWORD,
-};
-
-const SW_MAXIMIZE: c_int = 3;
-const SW_RESTORE: c_int = 9;
-const GWL_STYLE: c_int = -16;
-const GWL_EXSTYLE: c_int = -20;
-extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
-extern "user32" fn SetFocus(hWnd: HWND) callconv(.winapi) ?HWND;
-extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
-extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
-extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
-const WS_CAPTION_BIT: u32 = 0x00C00000;
-const WS_EX_TOPMOST: i32 = 0x00000008;
-extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
-const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
-
-const COMPOSITIONFORM = extern struct {
-    dwStyle: DWORD,
-    ptCurrentPos: POINT,
-    rcArea: RECT,
-};
-
 extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.winapi) ?*anyopaque;
 extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: ?*anyopaque) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCompositionWindow(hIMC: ?*anyopaque, lpCompForm: *COMPOSITIONFORM) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCompositionFontW(hIMC: ?*anyopaque, lplf: *LOGFONTW) callconv(.winapi) BOOL;
+extern "shell32" fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *NOTIFYICONDATAW) callconv(.winapi) BOOL;
+
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+const HKEY_CURRENT_USER: ?*anyopaque = @ptrFromInt(0x80000001);
+const KEY_READ: DWORD = 0x20019;
+
+const COMPOSITIONFORM = extern struct {
+    dwStyle: DWORD,
+    ptCurrentPos: sys.POINT,
+    rcArea: RECT,
+};
 
 const LOGFONTW = extern struct {
     lfHeight: i32,
@@ -213,8 +82,36 @@ const LOGFONTW = extern struct {
     lfPitchAndFamily: u8 = 0,
     lfFaceName: [32]u16 = [_]u16{0} ** 32,
 };
-extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
-extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+
+const NIM_ADD: DWORD = 0x00000000;
+const NIM_MODIFY: DWORD = 0x00000001;
+const NIM_DELETE: DWORD = 0x00000002;
+const NIF_ICON: DWORD = 0x00000002;
+const NIF_TIP: DWORD = 0x00000004;
+const NIF_INFO: DWORD = 0x00000010;
+const NIIF_INFO: DWORD = 0x00000001;
+
+const NOTIFYICONDATAW = extern struct {
+    cbSize: DWORD,
+    hWnd: HWND,
+    uID: UINT,
+    uFlags: UINT,
+    uCallbackMessage: UINT = 0,
+    hIcon: sys.HICON,
+    szTip: [128]u16 = [_]u16{0} ** 128,
+    dwState: DWORD = 0,
+    dwStateMask: DWORD = 0,
+    szInfo: [256]u16 = [_]u16{0} ** 256,
+    uTimeoutOrVersion: UINT = 0,
+    szInfoTitle: [64]u16 = [_]u16{0} ** 64,
+    dwInfoFlags: DWORD = 0,
+    guidItem: extern struct { a: u32 = 0, b: u16 = 0, c: u16 = 0, d: [8]u8 = [_]u8{0} ** 8 } = .{},
+    hBalloonIcon: ?*anyopaque = null,
+};
+
+// ============================================================================
+// App state
+// ============================================================================
 
 /// The core app instance.
 core_app: *CoreApp,
@@ -228,26 +125,14 @@ alloc: Allocator,
 /// Whether the app is running.
 running: bool = true,
 
-/// The main window handle.
-hwnd: ?HWND = null,
+/// All top-level windows owned by this app.
+windows: std.ArrayListUnmanaged(*Window) = .{},
 
-/// The first (primary) surface, always valid after init.
-/// Kept for backward-compat code paths; use `tree` for the full set.
-surface: Surface = undefined,
-
-/// Split tree managing multiple surfaces within the window.
-tree: ?SplitTree = null,
-
-/// The surface that currently has focus.
-focused_surface: ?*Surface = null,
+/// The window that currently has focus.
+focused_window: ?*Window = null,
 
 /// Whether the tray icon is registered (for notifications).
 tray_registered: bool = false,
-
-/// Whether the surface has been initialized yet.
-surface_initialized: bool = false,
-
-const SplitTree = @import("SplitTree.zig");
 
 pub fn init(
     self: *App,
@@ -258,7 +143,6 @@ pub fn init(
 
     const alloc = core_app.alloc;
 
-    // Load configuration
     var config = try Config.load(alloc);
     errdefer config.deinit();
 
@@ -271,324 +155,12 @@ pub fn init(
         .alloc = alloc,
     };
 
-    // Enable Per-Monitor DPI awareness
     _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // Create the main window
-    try self.createWindow();
-
-    // Initialize the surface (creates a child HWND with its own WGL context)
-    try self.surface.init(self.hwnd.?, self);
-    self.surface_initialized = true;
-
-    // Store self pointer in window for use in wndProc
-    _ = SetWindowLongPtrW(self.hwnd.?, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
-
-    // Initialize the split tree with the primary surface as the only leaf.
-    // Must be done before initCoreSurface because applyConfiguredWindowSize
-    // triggers a WM_SIZE which calls relayout (which needs the tree).
-    self.tree = try SplitTree.initLeaf(alloc, &self.surface);
-    self.focused_surface = &self.surface;
-
-    // Initialize the core surface (terminal emulation + rendering)
-    try self.initCoreSurface();
-
-    // Force a relayout so the child window fills the client area.
-    self.relayout();
-
-    // Focus the initial surface so keyboard input works without clicking.
-    _ = SetFocus(self.surface.hwnd);
-
-    // Apply initial system color scheme
-    if (self.surface.core_surface) |core| {
-        const scheme = detectColorScheme();
-        core.colorSchemeCallback(scheme) catch {};
-    }
-}
-
-/// Remove a surface from the split tree and destroy its child window.
-/// If the tree becomes empty, post a quit message.
-pub fn closeSurface(self: *App, surface: *Surface) void {
-    const tree = &(self.tree orelse return);
-
-    // Remove from CoreApp's surface list
-    self.core_app.deleteSurface(surface);
-
-    // Deinit the CoreSurface
-    if (surface.core_surface) |core| {
-        core.deinit();
-        self.alloc.destroy(core);
-        surface.core_surface = null;
-    }
-
-    // Destroy the child window and release WGL context
-    surface.deinit();
-
-    const is_primary = surface == &self.surface;
-
-    // Remove from the split tree
-    const result = tree.removeLeaf(self.alloc, surface);
-
-    if (result.empty) {
-        // Last surface closed - quit the app.
-        // Clear the tree pointer since its root has been freed; otherwise
-        // terminate() would walk freed memory.
-        self.tree = null;
-        if (is_primary) self.surface_initialized = false;
-        PostQuitMessage(0);
-        return;
-    }
-
-    // Free heap-allocated (non-primary) surface
-    if (!is_primary) {
-        self.alloc.destroy(surface);
-    } else {
-        // Primary was closed but other surfaces still exist.
-        // Mark it as no longer valid so terminate() doesn't double-deinit.
-        self.surface_initialized = false;
-    }
-
-    // Focus the sibling of the removed surface.
-    if (result.focus) |new_focus| {
-        self.focused_surface = new_focus;
-        _ = SetFocus(new_focus.hwnd);
-    } else {
-        self.focused_surface = null;
-    }
-
-    // Re-layout remaining surfaces
-    self.relayout();
-}
-
-/// Perform a layout pass, resizing each surface's child window.
-pub fn relayout(self: *App) void {
-    const tree = &(self.tree orelse return);
-    const hwnd = self.hwnd orelse return;
-    var rect: RECT = std.mem.zeroes(RECT);
-    if (GetClientRect(hwnd, &rect) == 0) return;
-    const bounds = SplitTree.Rect{
-        .x = 0,
-        .y = 0,
-        .w = rect.right - rect.left,
-        .h = rect.bottom - rect.top,
-    };
-    tree.layout(bounds, relayoutCb);
-}
-
-fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
-    _ = SetWindowPos(surface.hwnd, null, rect.x, rect.y, rect.w, rect.h, 0x0004); // SWP_NOZORDER
-}
-
-/// Switch focus to another split in the given direction.
-fn gotoSplit(self: *App, target: apprt.action.GotoSplit) void {
-    const tree = &(self.tree orelse return);
-    const current = self.focused_surface orelse return;
-
-    // Collect all leaves with their rects
-    var buf: [32]SplitTree.LeafRect = undefined;
-    const hwnd = self.hwnd orelse return;
-    var cr: RECT = std.mem.zeroes(RECT);
-    if (GetClientRect(hwnd, &cr) == 0) return;
-    const bounds: SplitTree.Rect = .{
-        .x = 0,
-        .y = 0,
-        .w = cr.right - cr.left,
-        .h = cr.bottom - cr.top,
-    };
-    const count = tree.collectLeafRects(bounds, &buf);
-    if (count == 0) return;
-
-    // Find current index
-    var current_idx: usize = 0;
-    for (buf[0..count], 0..) |lr, i| {
-        if (lr.surface == current) {
-            current_idx = i;
-            break;
-        }
-    }
-
-    const next_idx: usize = switch (target) {
-        .next => (current_idx + 1) % count,
-        .previous => (current_idx + count - 1) % count,
-        .up, .down, .left, .right => blk: {
-            // Find the closest leaf in the given direction based on center distance.
-            const cur = buf[current_idx].rect;
-            const cx = cur.x + @divTrunc(cur.w, 2);
-            const cy = cur.y + @divTrunc(cur.h, 2);
-            var best: ?usize = null;
-            var best_dist: i64 = std.math.maxInt(i64);
-            for (buf[0..count], 0..) |lr, i| {
-                if (i == current_idx) continue;
-                const lx = lr.rect.x + @divTrunc(lr.rect.w, 2);
-                const ly = lr.rect.y + @divTrunc(lr.rect.h, 2);
-                const in_direction = switch (target) {
-                    .up => ly < cy,
-                    .down => ly > cy,
-                    .left => lx < cx,
-                    .right => lx > cx,
-                    else => false,
-                };
-                if (!in_direction) continue;
-                const dx: i64 = @as(i64, lx) - @as(i64, cx);
-                const dy: i64 = @as(i64, ly) - @as(i64, cy);
-                const dist = dx * dx + dy * dy;
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best = i;
-                }
-            }
-            break :blk best orelse return;
-        },
-    };
-
-    const new_focus = buf[next_idx].surface;
-    self.focused_surface = new_focus;
-    _ = SetFocus(new_focus.hwnd);
-}
-
-/// Reset all splits in the tree to a 50/50 ratio.
-fn equalizeSplits(self: *App) void {
-    const tree = &(self.tree orelse return);
-    equalizeNode(tree.root);
-    self.relayout();
-}
-
-fn equalizeNode(node: *SplitTree.Node) void {
-    switch (node.*) {
-        .leaf => {},
-        .split => |*sp| {
-            sp.ratio = 0.5;
-            equalizeNode(sp.children[0]);
-            equalizeNode(sp.children[1]);
-        },
-    }
-}
-
-/// Resize the current split by the given amount.
-fn resizeSplit(self: *App, req: apprt.action.ResizeSplit) void {
-    const tree = &(self.tree orelse return);
-    const current = self.focused_surface orelse return;
-
-    // Find the nearest ancestor split node that matches the requested direction.
-    const want_horizontal = req.direction == .left or req.direction == .right;
-    const grow = req.direction == .right or req.direction == .down;
-
-    // Walk the tree looking for the leaf; track the path so we can find the ancestor.
-    var path: [32]*SplitTree.Node = undefined;
-    var path_len: usize = 0;
-    if (!findPath(tree.root, current, &path, &path_len)) return;
-
-    // Walk path from the leaf toward root to find the first matching split.
-    var i = path_len;
-    while (i > 0) {
-        i -= 1;
-        const node = path[i];
-        const sp = switch (node.*) {
-            .split => |*v| v,
-            .leaf => continue,
-        };
-        const matches = switch (sp.direction) {
-            .horizontal => want_horizontal,
-            .vertical => !want_horizontal,
-        };
-        if (!matches) continue;
-
-        // Determine which side of the split our current surface is on.
-        const first_contains = containsLeaf(sp.children[0], current);
-        const delta: f32 = @as(f32, @floatFromInt(req.amount)) / 400.0;
-        var new_ratio = sp.ratio;
-        if (first_contains) {
-            new_ratio += if (grow) delta else -delta;
-        } else {
-            new_ratio += if (grow) -delta else delta;
-        }
-        sp.ratio = std.math.clamp(new_ratio, 0.1, 0.9);
-        self.relayout();
-        return;
-    }
-}
-
-fn findPath(node: *SplitTree.Node, target: *Surface, path: []*SplitTree.Node, len: *usize) bool {
-    if (len.* >= path.len) return false;
-    path[len.*] = node;
-    len.* += 1;
-    switch (node.*) {
-        .leaf => |s| {
-            if (s == target) return true;
-        },
-        .split => |sp| {
-            if (findPath(sp.children[0], target, path, len)) return true;
-            if (findPath(sp.children[1], target, path, len)) return true;
-        },
-    }
-    len.* -= 1;
-    return false;
-}
-
-fn containsLeaf(node: *SplitTree.Node, target: *Surface) bool {
-    return switch (node.*) {
-        .leaf => |s| s == target,
-        .split => |sp| containsLeaf(sp.children[0], target) or containsLeaf(sp.children[1], target),
-    };
-}
-
-/// Create a new surface as a split of the given existing surface.
-pub fn newSplit(self: *App, existing: *Surface, dir: apprt.action.SplitDirection) !void {
-    const tree = &(self.tree orelse return error.NoTree);
-
-    // Allocate a new Surface
-    const new_surface = try self.alloc.create(Surface);
-    errdefer self.alloc.destroy(new_surface);
-
-    // Create the child window for the new surface
-    try new_surface.init(self.hwnd.?, self);
-    errdefer new_surface.deinit();
-
-    // Create a CoreSurface for the new surface
-    const new_core = try self.alloc.create(CoreSurface);
-    errdefer self.alloc.destroy(new_core);
-
-    try self.core_app.addSurface(new_surface);
-    errdefer self.core_app.deleteSurface(new_surface);
-
-    var config = try apprt.surface.newConfig(self.core_app, self.config, .split);
-    defer config.deinit();
-
-    try new_core.init(self.alloc, &config, self.core_app, self, new_surface);
-    errdefer new_core.deinit();
-    new_surface.core_surface = new_core;
-
-    // Insert into the tree
-    const split_dir: SplitTree.Direction = switch (dir) {
-        .right, .left => .horizontal,
-        .down, .up => .vertical,
-    };
-    const after = dir == .right or dir == .down;
-    try tree.split(self.alloc, existing, new_surface, split_dir, after);
-
-    // Focus the new surface
-    self.focused_surface = new_surface;
-    _ = SetFocus(new_surface.hwnd);
-
-    // Apply layout
-    self.relayout();
-}
-
-fn detectColorScheme() apprt.ColorScheme {
-    // Read HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
-    // AppsUseLightTheme (DWORD): 0 = dark, 1 = light
-    var hkey: ?*anyopaque = null;
-    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
-        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-    );
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &hkey) != 0) return .light;
-    defer _ = RegCloseKey(hkey);
-
-    var value: u32 = 1;
-    var value_size: u32 = @sizeOf(u32);
-    const value_name = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
-    if (RegQueryValueExW(hkey, value_name, null, null, @ptrCast(&value), &value_size) != 0) return .light;
-    return if (value == 0) .dark else .light;
+    // Create the first window
+    const window = try Window.create(alloc, self);
+    try self.windows.append(alloc, window);
+    self.focused_window = window;
 }
 
 pub fn run(self: *App) !void {
@@ -596,9 +168,8 @@ pub fn run(self: *App) !void {
 
     while (self.running) {
         var msg: MSG = std.mem.zeroes(MSG);
-        const ret = GetMessageW(&msg, null, 0, 0);
+        const ret = sys.GetMessageW(&msg, null, 0, 0);
         if (ret == 0) {
-            // WM_QUIT
             self.running = false;
             break;
         }
@@ -606,45 +177,73 @@ pub fn run(self: *App) !void {
             log.err("GetMessage failed", .{});
             return error.Win32Error;
         }
-        _ = TranslateMessage(&msg);
-        _ = DispatchMessageW(&msg);
+        _ = sys.TranslateMessage(&msg);
+        _ = sys.DispatchMessageW(&msg);
     }
 }
 
 pub fn terminate(self: *App) void {
-    // Remove tray icon if registered
     if (self.tray_registered) {
-        if (self.hwnd) |hwnd| {
-            var nid: NOTIFYICONDATAW = std.mem.zeroes(NOTIFYICONDATAW);
-            nid.cbSize = @sizeOf(NOTIFYICONDATAW);
-            nid.hWnd = hwnd;
-            nid.uID = 1;
-            _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+        if (self.windows.items.len > 0) {
+            if (self.windows.items[0].hwnd) |hwnd| {
+                var nid: NOTIFYICONDATAW = std.mem.zeroes(NOTIFYICONDATAW);
+                nid.cbSize = @sizeOf(NOTIFYICONDATAW);
+                nid.hWnd = hwnd;
+                nid.uID = 1;
+                _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+            }
         }
     }
-    // Deinit any remaining surfaces in the tree.
-    if (self.tree) |*tree| {
-        var buf: [32]*Surface = undefined;
-        const count = tree.collectLeaves(&buf);
-        for (buf[0..count]) |s| {
-            s.deinit();
-            if (s != &self.surface) self.alloc.destroy(s);
-        }
-        tree.deinit(self.alloc);
-    } else if (self.surface_initialized) {
-        self.surface.deinit();
+    for (self.windows.items) |w| {
+        w.deinit();
+        self.alloc.destroy(w);
     }
-    if (self.hwnd) |hwnd| {
-        _ = DestroyWindow(hwnd);
-        self.hwnd = null;
-    }
+    self.windows.deinit(self.alloc);
     self.config.deinit();
     self.alloc.destroy(self.config);
 }
 
 pub fn wakeup(self: *App) void {
-    if (self.hwnd) |hwnd| {
-        _ = PostMessageW(hwnd, WM_WAKEUP, 0, 0);
+    // Wake up all windows
+    for (self.windows.items) |w| {
+        if (w.hwnd) |hwnd| {
+            _ = sys.PostMessageW(hwnd, WM_WAKEUP, 0, 0);
+        }
+    }
+}
+
+/// Create a new top-level window.
+pub fn newWindow(self: *App) !void {
+    const window = try Window.create(self.alloc, self);
+    try self.windows.append(self.alloc, window);
+    self.focused_window = window;
+}
+
+/// Close a window. If it's the last window, quit the app.
+pub fn closeWindow(self: *App, window: *Window) void {
+    // Find and remove from list
+    for (self.windows.items, 0..) |w, i| {
+        if (w == window) {
+            _ = self.windows.orderedRemove(i);
+            break;
+        }
+    }
+
+    // Destroy the Window's HWND if still alive (normally done already)
+    window.deinit();
+    self.alloc.destroy(window);
+
+    // Update focused_window
+    if (self.focused_window == window) {
+        self.focused_window = if (self.windows.items.len > 0)
+            self.windows.items[self.windows.items.len - 1]
+        else
+            null;
+    }
+
+    // If no more windows, quit the app
+    if (self.windows.items.len == 0) {
+        sys.PostQuitMessage(0);
     }
 }
 
@@ -658,70 +257,93 @@ pub fn performAction(
 
     switch (action) {
         .quit => {
-            PostQuitMessage(0);
+            sys.PostQuitMessage(0);
+            return true;
+        },
+        .new_window => {
+            self.newWindow() catch |err| {
+                log.err("new_window failed: {}", .{err});
+                return false;
+            };
             return true;
         },
         .set_title => {
-            if (self.hwnd) |hwnd| {
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
                 const utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, value.title) catch return false;
                 defer self.alloc.free(utf16);
-                _ = SetWindowTextW(hwnd, utf16.ptr);
+                _ = sys.SetWindowTextW(hwnd, utf16.ptr);
             }
             return true;
         },
         .toggle_maximize => {
-            if (self.hwnd) |hwnd| {
-                const maximized = IsZoomed(hwnd) != 0;
-                _ = ShowWindow(hwnd, if (maximized) SW_RESTORE else SW_MAXIMIZE);
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
+                const maximized = sys.IsZoomed(hwnd) != 0;
+                _ = sys.ShowWindow(hwnd, if (maximized) sys.SW_RESTORE else sys.SW_MAXIMIZE);
             }
             return true;
         },
         .toggle_fullscreen => {
-            if (self.hwnd) |hwnd| self.toggleFullscreen(hwnd);
+            const window = self.focused_window orelse return false;
+            window.toggleFullscreen();
+            return true;
+        },
+        .new_split => {
+            const window = self.focused_window orelse return false;
+            const existing = window.focused_surface orelse window.primary_surface;
+            window.newSplit(existing, value) catch |err| {
+                log.err("new_split failed: {}", .{err});
+                return false;
+            };
+            return true;
+        },
+        .goto_split => {
+            const window = self.focused_window orelse return false;
+            window.gotoSplit(value);
+            return true;
+        },
+        .equalize_splits => {
+            const window = self.focused_window orelse return false;
+            window.equalizeSplits();
+            return true;
+        },
+        .resize_split => {
+            const window = self.focused_window orelse return false;
+            window.resizeSplit(value);
             return true;
         },
         .mouse_shape => {
-            self.surface.setMouseShape(value);
+            const window = self.focused_window orelse return false;
+            if (window.focused_surface) |s| s.setMouseShape(value) else window.primary_surface.setMouseShape(value);
             return true;
         },
         .mouse_visibility => {
-            self.surface.setMouseVisibility(value == .visible);
+            const window = self.focused_window orelse return false;
+            if (window.focused_surface) |s| s.setMouseVisibility(value == .visible);
             return true;
         },
         .open_url => {
             const url_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, value.url) catch return false;
             defer self.alloc.free(url_utf16);
             const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
-            _ = ShellExecuteW(null, verb, url_utf16.ptr, null, null, SW_SHOWNORMAL);
+            _ = sys.ShellExecuteW(null, verb, url_utf16.ptr, null, null, sys.SW_SHOWNORMAL);
             return true;
         },
         .ring_bell => {
-            _ = MessageBeep(0xFFFFFFFF); // MB_OK
+            _ = MessageBeep(0xFFFFFFFF);
             return true;
         },
-        .progress_report => {
-            // TODO: implement via ITaskbarList3 COM interface
-            return false;
-        },
+        .progress_report => return false,
         .desktop_notification => {
-            if (self.hwnd) |hwnd| self.showNotification(hwnd, value.title, value.body);
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| self.showNotification(hwnd, value.title, value.body);
             return true;
         },
-        .quit_timer => {
-            // Single-window app: we quit immediately when the only
-            // surface closes. No delayed quit timer needed.
-            return true;
-        },
-        .mouse_over_link => {
-            // TODO: could display in a status bar or tooltip
-            return true;
-        },
-        .inspector => {
-            // TODO: inspector UI not implemented yet
-            return false;
-        },
+        .quit_timer => return true,
+        .mouse_over_link => return true,
+        .inspector => return false,
         .reload_config => {
-            // Load new config from disk (unless soft reload)
             if (!value.soft) {
                 var new_config = Config.load(self.alloc) catch |err| {
                     log.err("failed to reload config: {}", .{err});
@@ -729,172 +351,127 @@ pub fn performAction(
                 };
                 self.config.deinit();
                 self.config.* = new_config;
-                _ = &new_config; // consumed by self.config
+                _ = &new_config;
             }
-            // Propagate to all surfaces
             self.core_app.updateConfig(self, self.config) catch |err| {
                 log.err("failed to update config: {}", .{err});
                 return false;
             };
             return true;
         },
-        .config_change => {
-            // Nothing apprt-specific to do for win32 on config change
-            return true;
-        },
-        .show_child_exited => {
-            // Return false to let the terminal show its own inline message
-            // ("Process exited. Press any key to close the terminal.")
-            // instead of a blocking native dialog.
-            return false;
-        },
-        .new_split => {
-            const existing = self.focused_surface orelse &self.surface;
-            self.newSplit(existing, value) catch |err| {
-                log.err("new_split failed: {}", .{err});
-                return false;
-            };
-            return true;
-        },
+        .config_change => return true,
+        .show_child_exited => return false,
         .open_config => {
-            // Open the config file in the default text editor
             const path = configpkg.edit.openPath(self.alloc) catch return false;
             defer self.alloc.free(path);
             const path_w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, path) catch return false;
             defer self.alloc.free(path_w);
-            _ = ShellExecuteW(null, null, path_w.ptr, null, null, SW_SHOWNORMAL);
+            _ = sys.ShellExecuteW(null, null, path_w.ptr, null, null, sys.SW_SHOWNORMAL);
             return true;
         },
         .close_window => {
-            if (self.hwnd) |hwnd| {
-                _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
-            }
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| _ = sys.PostMessageW(hwnd, WM_CLOSE, 0, 0);
             return true;
         },
         .reset_window_size => {
-            self.applyConfiguredWindowSize();
+            const window = self.focused_window orelse return false;
+            window.applyConfiguredWindowSize();
             return true;
         },
         .copy_title_to_clipboard => {
-            // Get current window title and copy to clipboard
-            if (self.hwnd) |hwnd| {
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
                 var title_buf: [512]u16 = undefined;
                 const len = GetWindowTextW(hwnd, &title_buf, title_buf.len);
                 if (len > 0) {
-                    self.surface.setClipboard(.standard, &.{.{
-                        .mime = "text/plain",
-                        .data = std.unicode.utf16LeToUtf8AllocZ(
-                            self.alloc,
-                            title_buf[0..@intCast(len)],
-                        ) catch return false,
-                    }}, false) catch return false;
+                    if (window.focused_surface) |s| {
+                        s.setClipboard(.standard, &.{.{
+                            .mime = "text/plain",
+                            .data = std.unicode.utf16LeToUtf8AllocZ(
+                                self.alloc,
+                                title_buf[0..@intCast(len)],
+                            ) catch return false,
+                        }}, false) catch return false;
+                    }
                 }
             }
             return true;
         },
         .toggle_split_zoom => {
-            // TODO: implement full zoom; for now re-layout all surfaces
-            self.relayout();
+            const window = self.focused_window orelse return false;
+            window.relayout();
             return true;
         },
         .render => {
-            // Request a redraw of the focused surface (via InvalidateRect)
-            if (self.focused_surface) |s| {
-                _ = InvalidateRect(s.hwnd, null, 0);
-            }
+            const window = self.focused_window orelse return false;
+            if (window.focused_surface) |s| _ = sys.InvalidateRect(s.hwnd, null, 0);
             return true;
         },
         .present_terminal => {
-            // Bring the window to the foreground
-            if (self.hwnd) |hwnd| {
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
                 _ = SetForegroundWindow(hwnd);
-                _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+                _ = sys.ShowWindow(hwnd, sys.SW_SHOWNORMAL);
             }
             return true;
         },
-        .renderer_health => {
-            // Windows has no dedicated UI for renderer health; log it.
-            log.info("renderer health: {}", .{value});
-            return true;
-        },
-        .color_change => {
-            // Forward to all surfaces so they can react to programmatic
-            // terminal color changes.
-            return true;
-        },
-        .pwd => {
-            // Windows has no status bar to display PWD.
-            return true;
-        },
-        .secure_input => {
-            // No special secure input handling on Windows.
-            return true;
-        },
-        .initial_size, .cell_size, .size_limit => {
-            // Size hints from the terminal; layout uses actual metrics.
-            return true;
-        },
-        .scrollbar => {
-            // Ghostty's scrollbar is rendered inside the GL surface, not native.
-            return true;
-        },
+        .renderer_health => return true,
+        .color_change => return true,
+        .pwd => return true,
+        .secure_input => return true,
+        .initial_size, .cell_size, .size_limit => return true,
+        .scrollbar => return true,
         .close_all_windows => {
-            if (self.hwnd) |hwnd| _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            // Close all windows
+            var i = self.windows.items.len;
+            while (i > 0) {
+                i -= 1;
+                const w = self.windows.items[i];
+                if (w.hwnd) |hwnd| _ = sys.PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
             return true;
         },
         .toggle_window_decorations => {
-            if (self.hwnd) |hwnd| {
-                const style = GetWindowLongW(hwnd, GWL_STYLE);
-                const has_caption = (style & WS_CAPTION_BIT) != 0;
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
+                const style = sys.GetWindowLongW(hwnd, sys.GWL_STYLE);
+                const has_caption = (style & sys.WS_CAPTION_BIT) != 0;
                 const new_style = if (has_caption)
-                    style & ~@as(i32, @bitCast(WS_CAPTION_BIT))
+                    style & ~@as(i32, @bitCast(sys.WS_CAPTION_BIT))
                 else
-                    style | @as(i32, @bitCast(WS_CAPTION_BIT));
-                _ = SetWindowLongW(hwnd, GWL_STYLE, new_style);
-                _ = SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x0020 | 0x0001 | 0x0002 | 0x0004); // SWP_FRAMECHANGED | SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER
+                    style | @as(i32, @bitCast(sys.WS_CAPTION_BIT));
+                _ = sys.SetWindowLongW(hwnd, sys.GWL_STYLE, new_style);
+                _ = sys.SetWindowPos(hwnd, null, 0, 0, 0, 0, 0x0020 | 0x0001 | 0x0002 | 0x0004);
             }
             return true;
         },
         .toggle_visibility => {
-            if (self.hwnd) |hwnd| {
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
                 const visible = IsWindowVisible(hwnd) != 0;
-                _ = ShowWindow(hwnd, if (visible) 0 else SW_SHOWNORMAL); // SW_HIDE=0
+                _ = sys.ShowWindow(hwnd, if (visible) 0 else sys.SW_SHOWNORMAL);
             }
             return true;
         },
         .float_window => {
-            if (self.hwnd) |hwnd| {
+            const window = self.focused_window orelse return false;
+            if (window.hwnd) |hwnd| {
                 const topmost: ?HWND = switch (value) {
-                    .on => @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))), // HWND_TOPMOST
-                    .off => @ptrFromInt(@as(usize, @bitCast(@as(isize, -2)))), // HWND_NOTOPMOST
+                    .on => @ptrFromInt(@as(usize, @bitCast(@as(isize, -1)))),
+                    .off => @ptrFromInt(@as(usize, @bitCast(@as(isize, -2)))),
                     .toggle => blk: {
-                        const ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                        break :blk if ((ex & WS_EX_TOPMOST) != 0)
+                        const ex = sys.GetWindowLongW(hwnd, sys.GWL_EXSTYLE);
+                        break :blk if ((ex & sys.WS_EX_TOPMOST) != 0)
                             @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))))
                         else
                             @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
                     },
                 };
-                _ = SetWindowPos(hwnd, topmost, 0, 0, 0, 0, 0x0001 | 0x0002); // SWP_NOSIZE | SWP_NOMOVE
+                _ = sys.SetWindowPos(hwnd, topmost, 0, 0, 0, 0, 0x0001 | 0x0002);
             }
             return true;
         },
-        .goto_split => {
-            self.gotoSplit(value);
-            return true;
-        },
-        .equalize_splits => {
-            self.equalizeSplits();
-            return true;
-        },
-        .resize_split => {
-            self.resizeSplit(value);
-            return true;
-        },
-        // --- Actions intentionally unsupported on Win32 ---
-        // These return true to indicate the action was "handled" (as a no-op)
-        // so that callers do not treat them as errors.
-        .new_window,
         .new_tab,
         .close_tab,
         .toggle_tab_overview,
@@ -924,15 +501,32 @@ pub fn performAction(
     }
 }
 
-/// Cached window state for restoring from fullscreen.
-const FullscreenState = struct {
-    is_fullscreen: bool = false,
-    style: i32 = 0,
-    ex_style: i32 = 0,
-    rect: RECT = undefined,
-};
+pub fn performIpc(
+    _: Allocator,
+    _: apprt.ipc.Target,
+    comptime action: apprt.ipc.Action.Key,
+    _: apprt.ipc.Action.Value(action),
+) !bool {
+    return false;
+}
 
-var fullscreen_state: FullscreenState = .{};
+pub fn redrawInspector(_: *App, _: *Surface) void {}
+
+/// Detect the Windows light/dark theme from the registry.
+pub fn detectColorScheme(_: *App) apprt.ColorScheme {
+    var hkey: ?*anyopaque = null;
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+    );
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &hkey) != 0) return .light;
+    defer _ = RegCloseKey(hkey);
+
+    var value: u32 = 1;
+    var value_size: u32 = @sizeOf(u32);
+    const value_name = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
+    if (RegQueryValueExW(hkey, value_name, null, null, @ptrCast(&value), &value_size) != 0) return .light;
+    return if (value == 0) .dark else .light;
+}
 
 fn showNotification(self: *App, hwnd: HWND, title: [:0]const u8, body: [:0]const u8) void {
     var nid: NOTIFYICONDATAW = std.mem.zeroes(NOTIFYICONDATAW);
@@ -941,9 +535,8 @@ fn showNotification(self: *App, hwnd: HWND, title: [:0]const u8, body: [:0]const
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_INFO | NIF_TIP;
     nid.dwInfoFlags = NIIF_INFO;
-    nid.hIcon = LoadIconW(GetModuleHandleW(null), @ptrFromInt(1));
+    nid.hIcon = sys.LoadIconW(sys.GetModuleHandleW(null), @ptrFromInt(1));
 
-    // Convert title/body to UTF-16
     const title_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, title) catch return;
     defer self.alloc.free(title_utf16);
     const body_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, body) catch return;
@@ -960,7 +553,6 @@ fn showNotification(self: *App, hwnd: HWND, title: [:0]const u8, body: [:0]const
     const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
     @memcpy(nid.szTip[0..tip.len], tip);
 
-    // Add the tray icon (first time), then modify to show the balloon
     if (!self.tray_registered) {
         _ = Shell_NotifyIconW(NIM_ADD, &nid);
         self.tray_registered = true;
@@ -969,202 +561,24 @@ fn showNotification(self: *App, hwnd: HWND, title: [:0]const u8, body: [:0]const
     }
 }
 
-fn toggleFullscreen(self: *App, hwnd: HWND) void {
-    _ = self;
-    if (fullscreen_state.is_fullscreen) {
-        // Restore
-        _ = SetWindowLongW(hwnd, GWL_STYLE, fullscreen_state.style);
-        _ = SetWindowLongW(hwnd, GWL_EXSTYLE, fullscreen_state.ex_style);
-        _ = SetWindowPos(
-            hwnd,
-            null,
-            fullscreen_state.rect.left,
-            fullscreen_state.rect.top,
-            fullscreen_state.rect.right - fullscreen_state.rect.left,
-            fullscreen_state.rect.bottom - fullscreen_state.rect.top,
-            0x0020 | 0x0004, // SWP_FRAMECHANGED | SWP_NOZORDER
-        );
-        fullscreen_state.is_fullscreen = false;
-    } else {
-        // Save current state
-        fullscreen_state.style = @intCast(GetWindowLongW(hwnd, GWL_STYLE));
-        fullscreen_state.ex_style = @intCast(GetWindowLongW(hwnd, GWL_EXSTYLE));
-        _ = GetWindowRect(hwnd, &fullscreen_state.rect);
+// ============================================================================
+// Input helpers
+// ============================================================================
 
-        // Get the monitor the window is on
-        var mi: MONITORINFO = std.mem.zeroes(MONITORINFO);
-        mi.cbSize = @sizeOf(MONITORINFO);
-        const monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
-        if (GetMonitorInfoW(monitor, &mi) == 0) return;
-
-        // Remove window decorations
-        const new_style = fullscreen_state.style & ~@as(i32, @bitCast(@as(u32, WS_OVERLAPPEDWINDOW)));
-        _ = SetWindowLongW(hwnd, GWL_STYLE, new_style);
-        _ = SetWindowPos(
-            hwnd,
-            null,
-            mi.rcMonitor.left,
-            mi.rcMonitor.top,
-            mi.rcMonitor.right - mi.rcMonitor.left,
-            mi.rcMonitor.bottom - mi.rcMonitor.top,
-            0x0020 | 0x0004, // SWP_FRAMECHANGED | SWP_NOZORDER
-        );
-        fullscreen_state.is_fullscreen = true;
-    }
-}
-
-pub fn performIpc(
-    _: Allocator,
-    _: apprt.ipc.Target,
-    comptime action: apprt.ipc.Action.Key,
-    _: apprt.ipc.Action.Value(action),
-) !bool {
-    return false;
-}
-
-pub fn redrawInspector(_: *App, surface: *Surface) void {
-    surface.redrawInspector();
-}
-
-fn initCoreSurface(self: *App) !void {
-    const alloc = self.alloc;
-
-    // Set the app pointer on the surface
-    self.surface.app = self;
-
-    // Create the core surface
-    const core_surface = try alloc.create(CoreSurface);
-    errdefer alloc.destroy(core_surface);
-
-    // Register with the core app
-    try self.core_app.addSurface(&self.surface);
-    errdefer self.core_app.deleteSurface(&self.surface);
-
-    // Create a surface config
-    var config = try apprt.surface.newConfig(
-        self.core_app,
-        self.config,
-        .window,
-    );
-    defer config.deinit();
-
-    // Initialize the core surface
-    core_surface.init(
-        alloc,
-        &config,
-        self.core_app,
-        self,
-        &self.surface,
-    ) catch |err| {
-        log.err("failed to initialize core surface: {}", .{err});
-        return err;
-    };
-
-    self.surface.core_surface = core_surface;
-    log.info("core surface initialized successfully", .{});
-
-    // Resize window to match configured grid size using actual font metrics.
-    // Like GTK, only resize when both window-width and window-height are set.
-    self.applyConfiguredWindowSize();
-}
-
-fn applyConfiguredWindowSize(self: *App) void {
-    // Default to 80x24 when not configured
-    const cfg_w = if (self.config.@"window-width" > 0) self.config.@"window-width" else 80;
-    const cfg_h = if (self.config.@"window-height" > 0) self.config.@"window-height" else 24;
-    const hwnd = self.hwnd orelse return;
-    const core = self.surface.core_surface orelse return;
-
-    const cell_width = core.size.cell.width;
-    const cell_height = core.size.cell.height;
-    if (cell_width == 0 or cell_height == 0) return;
-
-    const w: i32 = @intCast(@max(10, cfg_w) * cell_width);
-    const h: i32 = @intCast(@max(4, cfg_h) * cell_height);
-
-    // AdjustWindowRect to account for title bar and borders
-    var rect: RECT = .{ .left = 0, .top = 0, .right = w, .bottom = h };
-    _ = AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, 0, 0);
-    _ = SetWindowPos(hwnd, null, 0, 0, rect.right - rect.left, rect.bottom - rect.top, 0x0002 | 0x0004); // SWP_NOMOVE | SWP_NOZORDER
-}
-
-fn createWindow(self: *App) !void {
-    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
-    const hinstance = GetModuleHandleW(null);
-
-    const wc: WNDCLASSEXW = .{
-        .cbSize = @sizeOf(WNDCLASSEXW),
-        .style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC,
-        .lpfnWndProc = wndProc,
-        .cbClsExtra = 0,
-        .cbWndExtra = 0,
-        .hInstance = hinstance,
-        .hIcon = LoadIconW(hinstance, @ptrFromInt(1)), // ID_ICON_GHOSTTY
-        .hCursor = LoadCursorW(null, IDC_ARROW),
-        .hbrBackground = null,
-        .lpszMenuName = null,
-        .lpszClassName = class_name,
-        .hIconSm = LoadIconW(hinstance, @ptrFromInt(1)),
-    };
-
-    if (RegisterClassExW(&wc) == 0) {
-        log.err("RegisterClassEx failed", .{});
-        return error.Win32Error;
-    }
-
-    const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-
-    self.hwnd = CreateWindowExW(
-        0,
-        class_name,
-        title,
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        800,
-        600,
-        null,
-        null,
-        hinstance,
-        null,
-    );
-
-    if (self.hwnd == null) {
-        log.err("CreateWindowEx failed", .{});
-        return error.Win32Error;
-    }
-
-    _ = ShowWindow(self.hwnd.?, SW_SHOWNORMAL);
-    _ = UpdateWindow(self.hwnd.?);
-
-    // Get the actual client area size (excludes title bar and borders)
-    var client_rect: RECT = std.mem.zeroes(RECT);
-    if (GetClientRect(self.hwnd.?, &client_rect) != 0) {
-        self.surface.width = @intCast(client_rect.right - client_rect.left);
-        self.surface.height = @intCast(client_rect.bottom - client_rect.top);
-    }
-}
-
-fn getApp(hwnd: HWND) ?*App {
-    const ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (ptr == 0) return null;
-    return @ptrFromInt(@as(usize, @bitCast(ptr)));
-}
+extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16;
 
 fn getModifiers() @import("../../input.zig").Mods {
     const input = @import("../../input.zig");
     var mods: input.Mods = .{};
-    // High bit of GetKeyState return value indicates key is down
-    if (GetKeyState(0x10) < 0) mods.shift = true; // VK_SHIFT
-    if (GetKeyState(0x11) < 0) mods.ctrl = true; // VK_CONTROL
-    if (GetKeyState(0x12) < 0) mods.alt = true; // VK_MENU
-    if (GetKeyState(0x5B) < 0 or GetKeyState(0x5C) < 0) mods.super = true; // VK_LWIN/VK_RWIN
+    if (GetKeyState(0x10) < 0) mods.shift = true;
+    if (GetKeyState(0x11) < 0) mods.ctrl = true;
+    if (GetKeyState(0x12) < 0) mods.alt = true;
+    if (GetKeyState(0x5B) < 0 or GetKeyState(0x5C) < 0) mods.super = true;
     return mods;
 }
 
 fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
     return switch (vk) {
-        // Letters A-Z (VK_A .. VK_Z)
         0x41 => .key_a, 0x42 => .key_b, 0x43 => .key_c, 0x44 => .key_d,
         0x45 => .key_e, 0x46 => .key_f, 0x47 => .key_g, 0x48 => .key_h,
         0x49 => .key_i, 0x4A => .key_j, 0x4B => .key_k, 0x4C => .key_l,
@@ -1172,43 +586,37 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
         0x51 => .key_q, 0x52 => .key_r, 0x53 => .key_s, 0x54 => .key_t,
         0x55 => .key_u, 0x56 => .key_v, 0x57 => .key_w, 0x58 => .key_x,
         0x59 => .key_y, 0x5A => .key_z,
-        // Digits 0-9
         0x30 => .digit_0, 0x31 => .digit_1, 0x32 => .digit_2, 0x33 => .digit_3,
         0x34 => .digit_4, 0x35 => .digit_5, 0x36 => .digit_6, 0x37 => .digit_7,
         0x38 => .digit_8, 0x39 => .digit_9,
-        // Special keys
-        0x08 => .backspace, // VK_BACK
-        0x09 => .tab, // VK_TAB
-        0x0D => .enter, // VK_RETURN
-        0x1B => .escape, // VK_ESCAPE
-        0x20 => .space, // VK_SPACE
-        0x25 => .arrow_left, // VK_LEFT
-        0x26 => .arrow_up, // VK_UP
-        0x27 => .arrow_right, // VK_RIGHT
-        0x28 => .arrow_down, // VK_DOWN
-        0x2E => .delete, // VK_DELETE
-        0x24 => .home, // VK_HOME
-        0x23 => .end, // VK_END
-        0x21 => .page_up, // VK_PRIOR
-        0x22 => .page_down, // VK_NEXT
-        0x2D => .insert, // VK_INSERT
-        // Modifier keys
-        0x10 => .shift_left, // VK_SHIFT
-        0x11 => .control_left, // VK_CONTROL
-        0x12 => .alt_left, // VK_MENU
-        // Punctuation
-        0xBD => .minus, // VK_OEM_MINUS
-        0xBB => .equal, // VK_OEM_PLUS (= key)
-        0xDB => .bracket_left, // VK_OEM_4
-        0xDD => .bracket_right, // VK_OEM_6
-        0xDC => .backslash, // VK_OEM_5
-        0xBA => .semicolon, // VK_OEM_1
-        0xDE => .quote, // VK_OEM_7
-        0xBC => .comma, // VK_OEM_COMMA
-        0xBE => .period, // VK_OEM_PERIOD
-        0xBF => .slash, // VK_OEM_2
-        // 0xC0 => grave/backtick not in Key enum
-        // Function keys
+        0x08 => .backspace,
+        0x09 => .tab,
+        0x0D => .enter,
+        0x1B => .escape,
+        0x20 => .space,
+        0x25 => .arrow_left,
+        0x26 => .arrow_up,
+        0x27 => .arrow_right,
+        0x28 => .arrow_down,
+        0x2E => .delete,
+        0x24 => .home,
+        0x23 => .end,
+        0x21 => .page_up,
+        0x22 => .page_down,
+        0x2D => .insert,
+        0x10 => .shift_left,
+        0x11 => .control_left,
+        0x12 => .alt_left,
+        0xBD => .minus,
+        0xBB => .equal,
+        0xDB => .bracket_left,
+        0xDD => .bracket_right,
+        0xDC => .backslash,
+        0xBA => .semicolon,
+        0xDE => .quote,
+        0xBC => .comma,
+        0xBE => .period,
+        0xBF => .slash,
         0x70 => .f1, 0x71 => .f2, 0x72 => .f3, 0x73 => .f4,
         0x74 => .f5, 0x75 => .f6, 0x76 => .f7, 0x77 => .f8,
         0x78 => .f9, 0x79 => .f10, 0x7A => .f11, 0x7B => .f12,
@@ -1216,67 +624,84 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
     };
 }
 
-/// Main window procedure (top-level window, container for surface children).
-fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+// ============================================================================
+// Main window procedure (for top-level windows)
+// ============================================================================
+
+fn getWindow(hwnd: HWND) ?*Window {
+    const ptr = sys.GetWindowLongPtrW(hwnd, sys.GWLP_USERDATA);
+    if (ptr == 0) return null;
+    return @ptrFromInt(@as(usize, @bitCast(ptr)));
+}
+
+pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
         WM_CLOSE => {
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    core.close();
-                    return 0;
+            if (getWindow(hwnd)) |window| {
+                // Close the focused surface's core, which will trigger
+                // Surface.close -> Window.closeSurface -> App.closeWindow
+                if (window.focused_surface) |s| {
+                    if (s.core_surface) |core| {
+                        core.close();
+                        return 0;
+                    }
                 }
+                // Fallback: close the window directly
+                window.app.closeWindow(window);
             }
-            PostQuitMessage(0);
             return 0;
         },
         WM_SIZE => {
-            if (getApp(hwnd)) |app| {
-                if (app.surface_initialized and app.tree != null) {
-                    // Re-layout all child surfaces based on the split tree.
-                    app.relayout();
+            if (getWindow(hwnd)) |window| {
+                if (window.surface_initialized and window.tree != null) {
+                    window.relayout();
                 }
             }
             return 0;
         },
         0x001A => { // WM_SETTINGCHANGE
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const scheme = detectColorScheme();
-                    core.colorSchemeCallback(scheme) catch {};
+            if (getWindow(hwnd)) |window| {
+                if (window.focused_surface) |s| {
+                    if (s.core_surface) |core| {
+                        core.colorSchemeCallback(window.app.detectColorScheme()) catch {};
+                    }
                 }
             }
             return 0;
         },
         0x0007, 0x0008 => { // WM_SETFOCUS, WM_KILLFOCUS
-            if (getApp(hwnd)) |app| {
+            if (getWindow(hwnd)) |window| {
                 const focused = msg == 0x0007;
-                app.core_app.focusEvent(focused);
-                // Forward focus to the surface child
-                if (focused and app.surface_initialized) {
-                    _ = SetFocus(app.surface.hwnd);
+                window.app.core_app.focusEvent(focused);
+                if (focused) {
+                    window.app.focused_window = window;
+                    if (window.focused_surface) |s| _ = sys.SetFocus(s.hwnd);
                 }
             }
             return 0;
         },
         WM_WAKEUP => {
-            if (getApp(hwnd)) |app| {
-                app.core_app.tick(app) catch |err| {
+            if (getWindow(hwnd)) |window| {
+                window.app.core_app.tick(window.app) catch |err| {
                     log.err("core app tick failed: {}", .{err});
                 };
             }
             return 0;
         },
-        else => return DefWindowProcW(hwnd, msg, wparam, lparam),
+        else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
-/// Message dispatch for child surface windows. Handles input, IME, paint.
+// ============================================================================
+// Surface child window message dispatch
+// ============================================================================
+
 pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) LRESULT {
     switch (msg) {
         WM_PAINT => {
             var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
-            _ = BeginPaint(hwnd, &ps);
-            _ = EndPaint(hwnd, &ps);
+            _ = sys.BeginPaint(hwnd, &ps);
+            _ = sys.EndPaint(hwnd, &ps);
             return 0;
         },
         WM_SIZE => {
@@ -1323,11 +748,9 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 const key = mapVirtualKey(wparam);
                 if (key != .unidentified) {
                     const input = @import("../../input.zig");
-                    // Provide unshifted_codepoint for letter/digit/punct keys
-                    // so that keybindings defined with .unicode = 'x' match.
                     const unshifted: u21 = switch (wparam) {
-                        0x41...0x5A => @intCast(wparam + 32), // A-Z -> a-z
-                        0x30...0x39 => @intCast(wparam), // 0-9
+                        0x41...0x5A => @intCast(wparam + 32),
+                        0x30...0x39 => @intCast(wparam),
                         0x20 => ' ',
                         0xBD => '-',
                         0xBB => '=',
@@ -1355,7 +778,7 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                     if (effect == .consumed or effect == .closed) return 0;
                 }
             }
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
+            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         0x0101, 0x0105 => {
             if (surface.core_surface) |core| {
@@ -1392,7 +815,12 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 };
                 _ = core.mouseButtonCallback(.press, button, getModifiers()) catch false;
                 _ = SetCapture(hwnd);
-                _ = SetFocus(hwnd);
+                _ = sys.SetFocus(hwnd);
+                // Update focused surface in the window
+                if (surface.window) |w| {
+                    w.focused_surface = surface;
+                    app.focused_window = w;
+                }
             }
             return 0;
         },
@@ -1437,7 +865,7 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                     };
                     _ = ImmSetCompositionWindow(ctx, &cf);
 
-                    const dpi = GetDpiForWindow(hwnd);
+                    const dpi = sys.GetDpiForWindow(hwnd);
                     const dpi_f: f32 = if (dpi > 0) @floatFromInt(dpi) else 96.0;
                     const font_px: i32 = @intFromFloat(app.config.@"font-size" * dpi_f / 72.0);
                     var lf: LOGFONTW = std.mem.zeroes(LOGFONTW);
@@ -1447,15 +875,21 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                     _ = ImmSetCompositionFontW(ctx, &lf);
                 }
             }
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
+            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         0x0007, 0x0008 => {
             if (surface.core_surface) |core| {
                 const focused = msg == 0x0007;
                 core.focusCallback(focused) catch {};
+                if (focused) {
+                    if (surface.window) |w| {
+                        w.focused_surface = surface;
+                        app.focused_window = w;
+                    }
+                }
             }
             return 0;
         },
-        else => return DefWindowProcW(hwnd, msg, wparam, lparam),
+        else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
