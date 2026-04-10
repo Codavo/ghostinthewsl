@@ -279,12 +279,20 @@ pub fn init(
     // Store self pointer in window for use in wndProc
     _ = SetWindowLongPtrW(self.hwnd.?, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
+    // Initialize the split tree with the primary surface as the only leaf.
+    // Must be done before initCoreSurface because applyConfiguredWindowSize
+    // triggers a WM_SIZE which calls relayout (which needs the tree).
+    self.tree = try SplitTree.initLeaf(alloc, &self.surface);
+    self.focused_surface = &self.surface;
+
     // Initialize the core surface (terminal emulation + rendering)
     try self.initCoreSurface();
 
-    // Initialize the split tree with the primary surface as the only leaf
-    self.tree = try SplitTree.initLeaf(alloc, &self.surface);
-    self.focused_surface = &self.surface;
+    // Force a relayout so the child window fills the client area.
+    self.relayout();
+
+    // Focus the initial surface so keyboard input works without clicking.
+    _ = SetFocus(self.surface.hwnd);
 
     // Apply initial system color scheme
     if (self.surface.core_surface) |core| {
