@@ -49,7 +49,21 @@ extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [
 extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn SetLayeredWindowAttributes(hWnd: HWND, crKey: u32, bAlpha: u8, dwFlags: u32) callconv(.winapi) BOOL;
+extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
+extern "user32" fn FlashWindowEx(pfwi: *FLASHWINFO) callconv(.winapi) BOOL;
 const WS_EX_LAYERED: u32 = 0x00080000;
+
+const FLASHWINFO = extern struct {
+    cbSize: UINT,
+    hwnd: HWND,
+    dwFlags: DWORD,
+    uCount: UINT,
+    dwTimeout: DWORD,
+};
+const FLASHW_CAPTION: DWORD = 0x00000001;
+const FLASHW_TRAY: DWORD = 0x00000002;
+const FLASHW_ALL: DWORD = FLASHW_CAPTION | FLASHW_TRAY;
+const FLASHW_TIMERNOFG: DWORD = 0x0000000C;
 extern "advapi32" fn RegOpenKeyExW(hKey: ?*anyopaque, lpSubKey: [*:0]const u16, ulOptions: DWORD, samDesired: DWORD, phkResult: *?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegCloseKey(hKey: ?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegQueryValueExW(hKey: ?*anyopaque, lpValueName: [*:0]const u16, lpReserved: ?*DWORD, lpType: ?*DWORD, lpData: ?[*]u8, lpcbData: ?*DWORD) callconv(.winapi) i32;
@@ -591,6 +605,38 @@ pub fn performAction(
             // A proper implementation would create a small dialog with an edit.
             return true;
         },
+        .command_finished => {
+            // Flash the taskbar button if the window is not focused. This
+            // matches the GTK apprt's "attention" behavior for long-running
+            // commands that finished in the background.
+            const window = self.focused_window orelse return true;
+            if (window.hwnd) |hwnd| {
+                // Only flash if not currently the foreground window
+                if (GetForegroundWindow() != hwnd) {
+                    var fw = FLASHWINFO{
+                        .cbSize = @sizeOf(FLASHWINFO),
+                        .hwnd = hwnd,
+                        .dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG,
+                        .uCount = 3,
+                        .dwTimeout = 0,
+                    };
+                    _ = FlashWindowEx(&fw);
+                }
+            }
+            return true;
+        },
+        .readonly => {
+            // Update the window title to indicate readonly state.
+            const window = self.focused_window orelse return true;
+            if (window.hwnd) |hwnd| {
+                const title = switch (value) {
+                    .on => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty (read-only)"),
+                    .off => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                };
+                _ = sys.SetWindowTextW(hwnd, title);
+            }
+            return true;
+        },
         .new_tab,
         .close_tab,
         .toggle_tab_overview,
@@ -604,12 +650,10 @@ pub fn performAction(
         .key_table,
         .undo,
         .redo,
-        .command_finished,
         .start_search,
         .end_search,
         .search_total,
         .search_selected,
-        .readonly,
         => return true,
     }
 }
