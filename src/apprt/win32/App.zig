@@ -374,6 +374,159 @@ fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
     _ = SetWindowPos(surface.hwnd, null, rect.x, rect.y, rect.w, rect.h, 0x0004); // SWP_NOZORDER
 }
 
+/// Switch focus to another split in the given direction.
+fn gotoSplit(self: *App, target: apprt.action.GotoSplit) void {
+    const tree = &(self.tree orelse return);
+    const current = self.focused_surface orelse return;
+
+    // Collect all leaves with their rects
+    var buf: [32]SplitTree.LeafRect = undefined;
+    const hwnd = self.hwnd orelse return;
+    var cr: RECT = std.mem.zeroes(RECT);
+    if (GetClientRect(hwnd, &cr) == 0) return;
+    const bounds: SplitTree.Rect = .{
+        .x = 0,
+        .y = 0,
+        .w = cr.right - cr.left,
+        .h = cr.bottom - cr.top,
+    };
+    const count = tree.collectLeafRects(bounds, &buf);
+    if (count == 0) return;
+
+    // Find current index
+    var current_idx: usize = 0;
+    for (buf[0..count], 0..) |lr, i| {
+        if (lr.surface == current) {
+            current_idx = i;
+            break;
+        }
+    }
+
+    const next_idx: usize = switch (target) {
+        .next => (current_idx + 1) % count,
+        .previous => (current_idx + count - 1) % count,
+        .up, .down, .left, .right => blk: {
+            // Find the closest leaf in the given direction based on center distance.
+            const cur = buf[current_idx].rect;
+            const cx = cur.x + @divTrunc(cur.w, 2);
+            const cy = cur.y + @divTrunc(cur.h, 2);
+            var best: ?usize = null;
+            var best_dist: i64 = std.math.maxInt(i64);
+            for (buf[0..count], 0..) |lr, i| {
+                if (i == current_idx) continue;
+                const lx = lr.rect.x + @divTrunc(lr.rect.w, 2);
+                const ly = lr.rect.y + @divTrunc(lr.rect.h, 2);
+                const in_direction = switch (target) {
+                    .up => ly < cy,
+                    .down => ly > cy,
+                    .left => lx < cx,
+                    .right => lx > cx,
+                    else => false,
+                };
+                if (!in_direction) continue;
+                const dx: i64 = @as(i64, lx) - @as(i64, cx);
+                const dy: i64 = @as(i64, ly) - @as(i64, cy);
+                const dist = dx * dx + dy * dy;
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best = i;
+                }
+            }
+            break :blk best orelse return;
+        },
+    };
+
+    const new_focus = buf[next_idx].surface;
+    self.focused_surface = new_focus;
+    _ = SetFocus(new_focus.hwnd);
+}
+
+/// Reset all splits in the tree to a 50/50 ratio.
+fn equalizeSplits(self: *App) void {
+    const tree = &(self.tree orelse return);
+    equalizeNode(tree.root);
+    self.relayout();
+}
+
+fn equalizeNode(node: *SplitTree.Node) void {
+    switch (node.*) {
+        .leaf => {},
+        .split => |*sp| {
+            sp.ratio = 0.5;
+            equalizeNode(sp.children[0]);
+            equalizeNode(sp.children[1]);
+        },
+    }
+}
+
+/// Resize the current split by the given amount.
+fn resizeSplit(self: *App, req: apprt.action.ResizeSplit) void {
+    const tree = &(self.tree orelse return);
+    const current = self.focused_surface orelse return;
+
+    // Find the nearest ancestor split node that matches the requested direction.
+    const want_horizontal = req.direction == .left or req.direction == .right;
+    const grow = req.direction == .right or req.direction == .down;
+
+    // Walk the tree looking for the leaf; track the path so we can find the ancestor.
+    var path: [32]*SplitTree.Node = undefined;
+    var path_len: usize = 0;
+    if (!findPath(tree.root, current, &path, &path_len)) return;
+
+    // Walk path from the leaf toward root to find the first matching split.
+    var i = path_len;
+    while (i > 0) {
+        i -= 1;
+        const node = path[i];
+        const sp = switch (node.*) {
+            .split => |*v| v,
+            .leaf => continue,
+        };
+        const matches = switch (sp.direction) {
+            .horizontal => want_horizontal,
+            .vertical => !want_horizontal,
+        };
+        if (!matches) continue;
+
+        // Determine which side of the split our current surface is on.
+        const first_contains = containsLeaf(sp.children[0], current);
+        const delta: f32 = @as(f32, @floatFromInt(req.amount)) / 400.0;
+        var new_ratio = sp.ratio;
+        if (first_contains) {
+            new_ratio += if (grow) delta else -delta;
+        } else {
+            new_ratio += if (grow) -delta else delta;
+        }
+        sp.ratio = std.math.clamp(new_ratio, 0.1, 0.9);
+        self.relayout();
+        return;
+    }
+}
+
+fn findPath(node: *SplitTree.Node, target: *Surface, path: []*SplitTree.Node, len: *usize) bool {
+    if (len.* >= path.len) return false;
+    path[len.*] = node;
+    len.* += 1;
+    switch (node.*) {
+        .leaf => |s| {
+            if (s == target) return true;
+        },
+        .split => |sp| {
+            if (findPath(sp.children[0], target, path, len)) return true;
+            if (findPath(sp.children[1], target, path, len)) return true;
+        },
+    }
+    len.* -= 1;
+    return false;
+}
+
+fn containsLeaf(node: *SplitTree.Node, target: *Surface) bool {
+    return switch (node.*) {
+        .leaf => |s| s == target,
+        .split => |sp| containsLeaf(sp.children[0], target) or containsLeaf(sp.children[1], target),
+    };
+}
+
 /// Create a new surface as a split of the given existing surface.
 pub fn newSplit(self: *App, existing: *Surface, dir: apprt.action.SplitDirection) !void {
     const tree = &(self.tree orelse return error.NoTree);
@@ -598,6 +751,18 @@ pub fn performAction(
             };
             return true;
         },
+        .goto_split => {
+            self.gotoSplit(value);
+            return true;
+        },
+        .equalize_splits => {
+            self.equalizeSplits();
+            return true;
+        },
+        .resize_split => {
+            self.resizeSplit(value);
+            return true;
+        },
         // --- Actions intentionally unsupported on Win32 ---
         // These return true to indicate the action was "handled" (as a no-op)
         // so that callers do not treat them as errors.
@@ -613,10 +778,7 @@ pub fn performAction(
         .toggle_background_opacity,
         .move_tab,
         .goto_tab,
-        .goto_split,
         .goto_window,
-        .resize_split,
-        .equalize_splits,
         .toggle_split_zoom,
         .present_terminal,
         .size_limit,

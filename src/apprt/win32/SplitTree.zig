@@ -197,3 +197,40 @@ fn collectLeavesIn(node: *Node, buf: []*Surface, i: *usize) void {
         },
     }
 }
+
+pub const LeafRect = struct { surface: *Surface, rect: Rect };
+
+/// Collect all leaves along with their computed rectangles for the given bounds.
+pub fn collectLeafRects(self: *SplitTree, bounds: Rect, buf: []LeafRect) usize {
+    var i: usize = 0;
+    collectLeafRectsIn(self.root, bounds, buf, &i);
+    return i;
+}
+
+fn collectLeafRectsIn(node: *Node, bounds: Rect, buf: []LeafRect, i: *usize) void {
+    switch (node.*) {
+        .leaf => |s| {
+            if (i.* < buf.len) {
+                buf[i.*] = .{ .surface = s, .rect = bounds };
+                i.* += 1;
+            }
+        },
+        .split => |sp| {
+            const ratio = sp.ratio;
+            switch (sp.direction) {
+                .horizontal => {
+                    const w1: i32 = @intFromFloat(@as(f32, @floatFromInt(bounds.w)) * ratio);
+                    const w2 = bounds.w - w1;
+                    collectLeafRectsIn(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = w1, .h = bounds.h }, buf, i);
+                    collectLeafRectsIn(sp.children[1], .{ .x = bounds.x + w1, .y = bounds.y, .w = w2, .h = bounds.h }, buf, i);
+                },
+                .vertical => {
+                    const h1: i32 = @intFromFloat(@as(f32, @floatFromInt(bounds.h)) * ratio);
+                    const h2 = bounds.h - h1;
+                    collectLeafRectsIn(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = h1 }, buf, i);
+                    collectLeafRectsIn(sp.children[1], .{ .x = bounds.x, .y = bounds.y + h1, .w = bounds.w, .h = h2 }, buf, i);
+                },
+            }
+        },
+    }
+}
