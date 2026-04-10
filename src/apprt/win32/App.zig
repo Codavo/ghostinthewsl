@@ -15,6 +15,7 @@ const CoreSurface = @import("../../Surface.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("SplitTree.zig");
+const CommandPalette = @import("CommandPalette.zig");
 const sys = @import("sys.zig");
 
 const log = std.log.scoped(.win32);
@@ -134,6 +135,10 @@ focused_window: ?*Window = null,
 /// Whether the tray icon is registered (for notifications).
 tray_registered: bool = false,
 
+/// The command palette (created lazily).
+command_palette: CommandPalette = undefined,
+command_palette_initialized: bool = false,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -183,6 +188,9 @@ pub fn run(self: *App) !void {
 }
 
 pub fn terminate(self: *App) void {
+    if (self.command_palette_initialized) {
+        self.command_palette.deinit();
+    }
     if (self.tray_registered) {
         if (self.windows.items.len > 0) {
             if (self.windows.items[0].hwnd) |hwnd| {
@@ -265,6 +273,15 @@ pub fn performAction(
                 log.err("new_window failed: {}", .{err});
                 return false;
             };
+            return true;
+        },
+        .toggle_command_palette => {
+            const window = self.focused_window orelse return false;
+            if (!self.command_palette_initialized) {
+                self.command_palette = CommandPalette.init(self.alloc, self);
+                self.command_palette_initialized = true;
+            }
+            self.command_palette.toggle(window);
             return true;
         },
         .set_title => {
@@ -476,7 +493,6 @@ pub fn performAction(
         .close_tab,
         .toggle_tab_overview,
         .toggle_quick_terminal,
-        .toggle_command_palette,
         .toggle_background_opacity,
         .move_tab,
         .goto_tab,
