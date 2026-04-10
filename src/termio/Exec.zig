@@ -1560,26 +1560,22 @@ fn execCommand(
                 // registry value (init.cmd) work properly. Wrapping in
                 // `cmd.exe /C ...` disables AutoRun on the wrapped shell.
                 if (std.mem.indexOfAny(u8, v, " \t") == null) {
-                    try args.append(alloc, try alloc.dupeZ(u8, v));
+                    // If `v` is exactly "cmd.exe" (no path), use %COMSPEC%
+                    // which contains the absolute path to the command processor.
+                    const path = if (std.mem.eql(u8, v, "cmd.exe"))
+                        std.process.getEnvVarOwned(alloc, "COMSPEC") catch
+                            try alloc.dupe(u8, "C:\\Windows\\System32\\cmd.exe")
+                    else
+                        try alloc.dupe(u8, v);
+                    try args.append(alloc, try alloc.dupeZ(u8, path));
                     break :shell try args.toOwnedSlice(alloc);
                 }
 
                 // Otherwise (shell contains arguments), wrap in cmd.exe /C
                 // so we don't have to parse the command line ourselves.
-                const windir = std.process.getEnvVarOwned(
-                    alloc,
-                    "WINDIR",
-                ) catch |err| {
-                    log.warn("failed to get WINDIR, cannot run shell command err={}", .{err});
-                    return error.SystemError;
-                };
-                const cmd = try std.fs.path.joinZ(alloc, &[_][]const u8{
-                    windir,
-                    "System32",
-                    "cmd.exe",
-                });
-
-                try args.append(alloc, cmd);
+                const comspec = std.process.getEnvVarOwned(alloc, "COMSPEC") catch
+                    try alloc.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
+                try args.append(alloc, try alloc.dupeZ(u8, comspec));
                 try args.append(alloc, "/C");
             } else {
                 // We run our shell wrapped in `/bin/sh` so that we don't have
