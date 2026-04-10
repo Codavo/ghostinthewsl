@@ -470,7 +470,30 @@ fn findWindowsFont(
     _ = desc;
     if (comptime builtin.os.tag != .windows) return null;
 
-    const fonts_dir = std.fs.openDirAbsoluteZ("C:\\Windows\\Fonts", .{ .iterate = true }) catch return null;
+    // System fonts directory
+    if (self.findInDir("C:\\Windows\\Fonts", family, load_options)) |face| return face;
+
+    // User-installed fonts directory (%LOCALAPPDATA%\Microsoft\Windows\Fonts)
+    var user_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const user_path = buildUserFontsPath(&user_path_buf) orelse return null;
+    if (self.findInDir(user_path, family, load_options)) |face| return face;
+
+    return null;
+}
+
+fn buildUserFontsPath(buf: []u8) ?[:0]u8 {
+    const local_appdata = std.process.getEnvVarOwned(std.heap.page_allocator, "LOCALAPPDATA") catch return null;
+    defer std.heap.page_allocator.free(local_appdata);
+    return std.fmt.bufPrintZ(buf, "{s}\\Microsoft\\Windows\\Fonts", .{local_appdata}) catch null;
+}
+
+fn findInDir(
+    self: *SharedGridSet,
+    dir_path: [:0]const u8,
+    family: [:0]const u8,
+    load_options: Collection.LoadOptions,
+) ?Face {
+    const fonts_dir = std.fs.openDirAbsoluteZ(dir_path, .{ .iterate = true }) catch return null;
     var dir = fonts_dir;
     defer dir.close();
 
@@ -478,7 +501,6 @@ fn findWindowsFont(
     while (iter.next() catch null) |entry| {
         if (entry.kind != .file) continue;
 
-        // Only consider font files
         const name = entry.name;
         const is_font = std.mem.endsWith(u8, name, ".ttf") or
             std.mem.endsWith(u8, name, ".ttc") or
@@ -488,11 +510,9 @@ fn findWindowsFont(
             std.mem.endsWith(u8, name, ".OTF");
         if (!is_font) continue;
 
-        // Build the full path
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const full_path = std.fmt.bufPrintZ(&path_buf, "C:/Windows/Fonts/{s}", .{name}) catch continue;
+        const full_path = std.fmt.bufPrintZ(&path_buf, "{s}\\{s}", .{ dir_path, name }) catch continue;
 
-        // Try loading with FreeType (try multiple face indices for .ttc)
         var face_index: i32 = 0;
         while (face_index < 16) : (face_index += 1) {
             var face = Face.initFile(
@@ -502,8 +522,6 @@ fn findWindowsFont(
                 load_options.faceOptions(),
             ) catch break;
 
-            // Check the family name using both FreeType's family_name
-            // field and the SFNT name table for better matching.
             const ft_family: ?[*:0]const u8 = face.face.handle.*.family_name;
             const matches = if (ft_family) |fam|
                 std.ascii.eqlIgnoreCase(std.mem.span(fam), family)
@@ -512,7 +530,6 @@ fn findWindowsFont(
 
             if (matches) return face;
 
-            // Also try the SFNT name table
             var name_buf2: [256]u8 = undefined;
             const sfnt_name = face.name(&name_buf2) catch "";
             if (sfnt_name.len > 0 and std.ascii.eqlIgnoreCase(sfnt_name, family)) {
@@ -521,7 +538,6 @@ fn findWindowsFont(
 
             face.deinit();
 
-            // Only try multiple indices for .ttc files
             if (!std.mem.endsWith(u8, name, ".ttc") and !std.mem.endsWith(u8, name, ".TTC")) break;
         }
     }
