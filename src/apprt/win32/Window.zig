@@ -28,6 +28,12 @@ const WS_TABSTOP: u32 = 0x00010000;
 const TCS_FIXEDWIDTH: u32 = 0x0400;
 const WM_NOTIFY: UINT = 0x004E;
 const WM_SETFONT: UINT = 0x0030;
+const WM_PAINT: UINT = 0x000F;
+const WM_LBUTTONDOWN: UINT = 0x0201;
+const WM_LBUTTONUP: UINT = 0x0202;
+const WM_MOUSEMOVE: UINT = 0x0200;
+const WM_CAPTURECHANGED: UINT = 0x0215;
+const WM_SETCURSOR: UINT = 0x0020;
 const SW_HIDE: c_int = 0;
 const TCM_FIRST: UINT = 0x1300;
 const TCM_GETCURSEL: UINT = TCM_FIRST + 11;
@@ -42,6 +48,9 @@ const TCN_FIRST: i32 = -550;
 const TCN_SELCHANGE: i32 = TCN_FIRST - 1;
 const ICC_TAB_CLASSES: DWORD = 0x00000008;
 const TAB_HEIGHT: i32 = 30;
+const DIVIDER_THICKNESS: i32 = 10;
+const IDC_SIZEWE = @as(?[*:0]align(1) const u16, @ptrFromInt(32644));
+const IDC_SIZENS = @as(?[*:0]align(1) const u16, @ptrFromInt(32645));
 
 const NMHDR = extern struct {
     hwndFrom: HWND,
@@ -66,8 +75,29 @@ const TCITEMW = extern struct {
 
 extern "comctl32" fn InitCommonControlsEx(lpInitCtrls: *const INITCOMMONCONTROLSEX) callconv(.winapi) BOOL;
 extern "gdi32" fn CreateFontW(cHeight: c_int, cWidth: c_int, cEscapement: c_int, cOrientation: c_int, cWeight: c_int, bItalic: DWORD, bUnderline: DWORD, bStrikeOut: DWORD, iCharSet: DWORD, iOutPrecision: DWORD, iClipPrecision: DWORD, iQuality: DWORD, iPitchAndFamily: DWORD, pszFaceName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.winapi) BOOL;
+extern "user32" fn FillRect(hDC: ?*anyopaque, lprc: *const RECT, hbr: ?*anyopaque) callconv(.winapi) c_int;
+extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+extern "user32" fn SetCursor(hCursor: sys.HCURSOR) callconv(.winapi) sys.HCURSOR;
 
 var ui_font: ?*anyopaque = null;
+var divider_class_registered: bool = false;
+
+const DividerState = struct {
+    hwnd: HWND,
+    window: *Window,
+    node: *SplitTree.Node,
+    direction: SplitTree.Direction,
+    rect: SplitTree.Rect,
+    bounds: SplitTree.Rect,
+    active: bool = false,
+};
+
+const DividerDrag = struct {
+    divider: *DividerState,
+};
 
 pub const CreateOptions = struct {
     command: ?configpkg.Command = null,
@@ -106,6 +136,8 @@ tabs: std.ArrayListUnmanaged(TabState) = .{},
 current_tab: usize = 0,
 fullscreen: FullscreenState = .{},
 quick_terminal: bool = false,
+dividers: std.ArrayListUnmanaged(*DividerState) = .{},
+drag: ?DividerDrag = null,
 
 const FullscreenState = struct {
     active: bool = false,
@@ -147,6 +179,7 @@ pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
 }
 
 pub fn deinit(self: *Window) void {
+    self.destroyDividers();
     self.syncActiveTabFromWindow();
     for (self.tabs.items) |*tab| self.deinitTab(tab);
     self.tabs.deinit(self.app.alloc);
@@ -246,6 +279,206 @@ fn createTabControl(self: *Window) !void {
     }
     if (ui_font) |font| {
         _ = sys.SendMessageW(self.tab_hwnd.?, WM_SETFONT, @intFromPtr(font), 1);
+    }
+}
+
+fn registerDividerClass() !void {
+    if (divider_class_registered) return;
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyDivider");
+    const hinstance = sys.GetModuleHandleW(null);
+    const wc: sys.WNDCLASSEXW = .{
+        .cbSize = @sizeOf(sys.WNDCLASSEXW),
+        .style = sys.CS_HREDRAW | sys.CS_VREDRAW,
+        .lpfnWndProc = dividerWndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = null,
+        .hCursor = sys.LoadCursorW(null, sys.IDC_ARROW),
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = class_name,
+        .hIconSm = null,
+    };
+    if (sys.RegisterClassExW(&wc) == 0) return error.Win32Error;
+    divider_class_registered = true;
+}
+
+fn dividerWndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    const ptr = sys.GetWindowLongPtrW(hwnd, sys.GWLP_USERDATA);
+    if (ptr == 0) return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const divider: *DividerState = @ptrFromInt(@as(usize, @bitCast(ptr)));
+    return divider.window.handleDividerMessage(divider, hwnd, msg, wparam, lparam);
+}
+
+fn destroyDividers(self: *Window) void {
+    if (self.drag != null) {
+        _ = ReleaseCapture();
+        self.drag = null;
+    }
+    for (self.dividers.items) |divider| {
+        _ = sys.DestroyWindow(divider.hwnd);
+        self.app.alloc.destroy(divider);
+    }
+    self.dividers.deinit(self.app.alloc);
+}
+
+fn ensureDividerCount(self: *Window, count: usize) !void {
+    try registerDividerClass();
+    while (self.dividers.items.len < count) {
+        const divider = try self.app.alloc.create(DividerState);
+        errdefer self.app.alloc.destroy(divider);
+        const hwnd = sys.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("GhosttyDivider"),
+            null,
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            0,
+            0,
+            self.hwnd,
+            null,
+            sys.GetModuleHandleW(null),
+            null,
+        ) orelse return error.Win32Error;
+        divider.* = .{
+            .hwnd = hwnd,
+            .window = self,
+            .node = undefined,
+            .direction = .horizontal,
+            .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+            .bounds = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+        };
+        _ = sys.SetWindowLongPtrW(hwnd, sys.GWLP_USERDATA, @bitCast(@intFromPtr(divider)));
+        try self.dividers.append(self.app.alloc, divider);
+    }
+}
+
+fn updateDividers(self: *Window, bounds: SplitTree.Rect) void {
+    const tree = &(self.tree orelse {
+        self.hideAllDividers();
+        return;
+    });
+    var buf: [64]SplitTree.DividerRect = undefined;
+    const count = tree.collectDividerRects(bounds, &buf);
+    self.ensureDividerCount(count) catch return;
+
+    for (self.dividers.items, 0..) |divider, i| {
+        if (i >= count) {
+            divider.active = false;
+            _ = sys.ShowWindow(divider.hwnd, SW_HIDE);
+            continue;
+        }
+        const info = buf[i];
+        divider.node = info.node;
+        divider.direction = info.direction;
+        divider.rect = info.rect;
+        divider.bounds = info.bounds;
+        divider.active = true;
+        _ = sys.SetWindowPos(
+            divider.hwnd,
+            null,
+            info.rect.x,
+            info.rect.y,
+            info.rect.w,
+            info.rect.h,
+            0x0004,
+        );
+        _ = sys.ShowWindow(divider.hwnd, sys.SW_SHOWNORMAL);
+        _ = sys.InvalidateRect(divider.hwnd, null, 1);
+    }
+}
+
+fn hideAllDividers(self: *Window) void {
+    for (self.dividers.items) |divider| {
+        divider.active = false;
+        _ = sys.ShowWindow(divider.hwnd, SW_HIDE);
+    }
+}
+
+fn adjustDividerRatio(self: *Window, divider: *DividerState, lparam: LPARAM) void {
+    const sp = switch (divider.node.*) {
+        .split => |*sp| sp,
+        else => return,
+    };
+    const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
+    const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+    const new_ratio: f32 = switch (divider.direction) {
+        .horizontal => blk: {
+            if (divider.bounds.w <= DIVIDER_THICKNESS) break :blk sp.ratio;
+            const absolute_x = divider.rect.x + x;
+            const offset = std.math.clamp(absolute_x - divider.bounds.x, 0, divider.bounds.w);
+            break :blk @as(f32, @floatFromInt(offset)) / @as(f32, @floatFromInt(divider.bounds.w));
+        },
+        .vertical => blk: {
+            if (divider.bounds.h <= DIVIDER_THICKNESS) break :blk sp.ratio;
+            const absolute_y = divider.rect.y + y;
+            const offset = std.math.clamp(absolute_y - divider.bounds.y, 0, divider.bounds.h);
+            break :blk @as(f32, @floatFromInt(offset)) / @as(f32, @floatFromInt(divider.bounds.h));
+        },
+    };
+    sp.ratio = std.math.clamp(new_ratio, 0.1, 0.9);
+    self.relayout();
+}
+
+fn handleDividerMessage(self: *Window, divider: *DividerState, hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) LRESULT {
+    switch (msg) {
+        WM_PAINT => {
+            var ps: sys.PAINTSTRUCT = std.mem.zeroes(sys.PAINTSTRUCT);
+            const hdc = sys.BeginPaint(hwnd, &ps);
+            var rect: RECT = std.mem.zeroes(RECT);
+            _ = sys.GetClientRect(hwnd, &rect);
+            const bg_brush = CreateSolidBrush(0x00E4E4E4);
+            if (bg_brush != null) {
+                _ = FillRect(hdc, &rect, bg_brush);
+                _ = DeleteObject(bg_brush);
+            }
+            var line_rect = rect;
+            if (divider.direction == .horizontal) {
+                line_rect.left = @divTrunc(rect.right - rect.left - 2, 2);
+                line_rect.right = line_rect.left + 2;
+            } else {
+                line_rect.top = @divTrunc(rect.bottom - rect.top - 2, 2);
+                line_rect.bottom = line_rect.top + 2;
+            }
+            const line_brush = CreateSolidBrush(0x00858585);
+            if (line_brush != null) {
+                _ = FillRect(hdc, &line_rect, line_brush);
+                _ = DeleteObject(line_brush);
+            }
+            _ = sys.EndPaint(hwnd, &ps);
+            return 0;
+        },
+        WM_SETCURSOR => {
+            _ = SetCursor(sys.LoadCursorW(
+                null,
+                if (divider.direction == .horizontal) IDC_SIZEWE else IDC_SIZENS,
+            ));
+            return 1;
+        },
+        WM_LBUTTONDOWN => {
+            self.drag = .{ .divider = divider };
+            _ = SetCapture(hwnd);
+            self.adjustDividerRatio(divider, lparam);
+            return 0;
+        },
+        WM_MOUSEMOVE => {
+            if (self.drag) |drag| {
+                if (drag.divider == divider) self.adjustDividerRatio(divider, lparam);
+            }
+            return 0;
+        },
+        WM_LBUTTONUP, WM_CAPTURECHANGED => {
+            if (self.drag) |drag| {
+                if (drag.divider == divider) {
+                    self.drag = null;
+                    _ = ReleaseCapture();
+                }
+            }
+            return 0;
+        },
+        else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
@@ -679,6 +912,7 @@ pub fn relayout(self: *Window) void {
         .h = rect.bottom - rect.top - tab_h,
     };
     tree.layout(bounds, relayoutCb);
+    self.updateDividers(bounds);
 }
 
 fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {

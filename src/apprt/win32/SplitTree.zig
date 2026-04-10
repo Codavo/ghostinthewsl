@@ -114,16 +114,28 @@ fn layoutNode(node: *Node, bounds: Rect, cb: *const fn (surface: *Surface, rect:
             const ratio = sp.ratio;
             switch (sp.direction) {
                 .horizontal => {
-                    const w1: i32 = @intFromFloat(@as(f32, @floatFromInt(bounds.w)) * ratio);
-                    const w2 = bounds.w - w1;
+                    const available = @max(0, bounds.w - divider_thickness);
+                    const w1: i32 = @intFromFloat(@as(f32, @floatFromInt(available)) * ratio);
+                    const w2 = available - w1;
                     layoutNode(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = w1, .h = bounds.h }, cb);
-                    layoutNode(sp.children[1], .{ .x = bounds.x + w1, .y = bounds.y, .w = w2, .h = bounds.h }, cb);
+                    layoutNode(sp.children[1], .{
+                        .x = bounds.x + w1 + divider_thickness,
+                        .y = bounds.y,
+                        .w = w2,
+                        .h = bounds.h,
+                    }, cb);
                 },
                 .vertical => {
-                    const h1: i32 = @intFromFloat(@as(f32, @floatFromInt(bounds.h)) * ratio);
-                    const h2 = bounds.h - h1;
+                    const available = @max(0, bounds.h - divider_thickness);
+                    const h1: i32 = @intFromFloat(@as(f32, @floatFromInt(available)) * ratio);
+                    const h2 = available - h1;
                     layoutNode(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = h1 }, cb);
-                    layoutNode(sp.children[1], .{ .x = bounds.x, .y = bounds.y + h1, .w = bounds.w, .h = h2 }, cb);
+                    layoutNode(sp.children[1], .{
+                        .x = bounds.x,
+                        .y = bounds.y + h1 + divider_thickness,
+                        .w = bounds.w,
+                        .h = h2,
+                    }, cb);
                 },
             }
         },
@@ -199,6 +211,14 @@ fn collectLeavesIn(node: *Node, buf: []*Surface, i: *usize) void {
 }
 
 pub const LeafRect = struct { surface: *Surface, rect: Rect };
+pub const DividerRect = struct {
+    node: *Node,
+    direction: Direction,
+    rect: Rect,
+    bounds: Rect,
+};
+
+const divider_thickness: i32 = 10;
 
 /// Collect all leaves along with their computed rectangles for the given bounds.
 pub fn collectLeafRects(self: *SplitTree, bounds: Rect, buf: []LeafRect) usize {
@@ -219,16 +239,100 @@ fn collectLeafRectsIn(node: *Node, bounds: Rect, buf: []LeafRect, i: *usize) voi
             const ratio = sp.ratio;
             switch (sp.direction) {
                 .horizontal => {
-                    const w1: i32 = @intFromFloat(@as(f32, @floatFromInt(bounds.w)) * ratio);
-                    const w2 = bounds.w - w1;
+                    const available = @max(0, bounds.w - divider_thickness);
+                    const w1: i32 = @intFromFloat(@as(f32, @floatFromInt(available)) * ratio);
+                    const w2 = available - w1;
                     collectLeafRectsIn(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = w1, .h = bounds.h }, buf, i);
-                    collectLeafRectsIn(sp.children[1], .{ .x = bounds.x + w1, .y = bounds.y, .w = w2, .h = bounds.h }, buf, i);
+                    collectLeafRectsIn(sp.children[1], .{
+                        .x = bounds.x + w1 + divider_thickness,
+                        .y = bounds.y,
+                        .w = w2,
+                        .h = bounds.h,
+                    }, buf, i);
                 },
                 .vertical => {
-                    const h1: i32 = @intFromFloat(@as(f32, @floatFromInt(bounds.h)) * ratio);
-                    const h2 = bounds.h - h1;
+                    const available = @max(0, bounds.h - divider_thickness);
+                    const h1: i32 = @intFromFloat(@as(f32, @floatFromInt(available)) * ratio);
+                    const h2 = available - h1;
                     collectLeafRectsIn(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = h1 }, buf, i);
-                    collectLeafRectsIn(sp.children[1], .{ .x = bounds.x, .y = bounds.y + h1, .w = bounds.w, .h = h2 }, buf, i);
+                    collectLeafRectsIn(sp.children[1], .{
+                        .x = bounds.x,
+                        .y = bounds.y + h1 + divider_thickness,
+                        .w = bounds.w,
+                        .h = h2,
+                    }, buf, i);
+                },
+            }
+        },
+    }
+}
+
+/// Collect all split divider handles along with their split bounds.
+pub fn collectDividerRects(self: *SplitTree, bounds: Rect, buf: []DividerRect) usize {
+    var i: usize = 0;
+    collectDividerRectsIn(self.root, bounds, buf, &i);
+    return i;
+}
+
+fn collectDividerRectsIn(node: *Node, bounds: Rect, buf: []DividerRect, i: *usize) void {
+    switch (node.*) {
+        .leaf => {},
+        .split => |sp| {
+            const ratio = sp.ratio;
+            switch (sp.direction) {
+                .horizontal => {
+                    const available = @max(0, bounds.w - divider_thickness);
+                    const w1: i32 = @intFromFloat(@as(f32, @floatFromInt(available)) * ratio);
+                    const w2 = available - w1;
+                    const divider_x = bounds.x + w1;
+                    if (i.* < buf.len) {
+                        buf[i.*] = .{
+                            .node = node,
+                            .direction = .horizontal,
+                            .rect = .{
+                                .x = divider_x,
+                                .y = bounds.y,
+                                .w = divider_thickness,
+                                .h = bounds.h,
+                            },
+                            .bounds = bounds,
+                        };
+                        i.* += 1;
+                    }
+                    collectDividerRectsIn(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = w1, .h = bounds.h }, buf, i);
+                    collectDividerRectsIn(sp.children[1], .{
+                        .x = bounds.x + w1 + divider_thickness,
+                        .y = bounds.y,
+                        .w = w2,
+                        .h = bounds.h,
+                    }, buf, i);
+                },
+                .vertical => {
+                    const available = @max(0, bounds.h - divider_thickness);
+                    const h1: i32 = @intFromFloat(@as(f32, @floatFromInt(available)) * ratio);
+                    const h2 = available - h1;
+                    const divider_y = bounds.y + h1;
+                    if (i.* < buf.len) {
+                        buf[i.*] = .{
+                            .node = node,
+                            .direction = .vertical,
+                            .rect = .{
+                                .x = bounds.x,
+                                .y = divider_y,
+                                .w = bounds.w,
+                                .h = divider_thickness,
+                            },
+                            .bounds = bounds,
+                        };
+                        i.* += 1;
+                    }
+                    collectDividerRectsIn(sp.children[0], .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = h1 }, buf, i);
+                    collectDividerRectsIn(sp.children[1], .{
+                        .x = bounds.x,
+                        .y = bounds.y + h1 + divider_thickness,
+                        .w = bounds.w,
+                        .h = h2,
+                    }, buf, i);
                 },
             }
         },
