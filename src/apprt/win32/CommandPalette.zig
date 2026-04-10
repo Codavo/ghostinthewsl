@@ -37,6 +37,7 @@ const WM_COMMAND: UINT = 0x0111;
 const WM_CLOSE: UINT = 0x0010;
 const WM_DESTROY: UINT = 0x0002;
 const WM_KEYDOWN: UINT = 0x0100;
+const WM_CHAR: UINT = 0x0102;
 const WM_ACTIVATE: UINT = 0x0006;
 const WM_SETFONT: UINT = 0x0030;
 
@@ -160,6 +161,16 @@ fn open(self: *CommandPalette, window: *Window) !void {
         null,
     );
 
+    // Subclass the edit control so we can intercept arrow/enter/escape keys
+    if (self.edit_hwnd) |eh| {
+        const GWLP_WNDPROC: c_int = -4;
+        const old = GetWindowLongPtrW(eh, GWLP_WNDPROC);
+        original_edit_proc = @ptrFromInt(@as(usize, @bitCast(old)));
+        _ = SetWindowLongPtrW(eh, GWLP_WNDPROC, @bitCast(@intFromPtr(&editSubclassProc)));
+        // Store palette pointer in edit's userdata
+        _ = SetWindowLongPtrW(eh, sys.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+    }
+
     // Create list box
     const listbox_class = std.unicode.utf8ToUtf16LeStringLiteral("LISTBOX");
     self.list_hwnd = CreateWindowExW(
@@ -249,18 +260,85 @@ fn executeSelected(self: *CommandPalette) void {
     }
 }
 
+var original_edit_proc: ?*const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT = null;
+
+fn editSubclassProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
+    const ptr = GetWindowLongPtrW(hwnd, sys.GWLP_USERDATA);
+    const self: ?*CommandPalette = if (ptr != 0)
+        @ptrFromInt(@as(usize, @bitCast(ptr)))
+    else
+        null;
+
+    switch (msg) {
+        WM_KEYDOWN => {
+            if (self) |s| {
+                switch (wparam) {
+                    VK_ESCAPE => {
+                        s.close();
+                        return 0;
+                    },
+                    VK_RETURN => {
+                        s.executeSelected();
+                        return 0;
+                    },
+                    VK_UP, VK_DOWN => {
+                        const lb = s.list_hwnd orelse return 0;
+                        const count: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCOUNT, 0, 0))));
+                        if (count <= 0) return 0;
+                        var sel: isize = @bitCast(@as(usize, @intCast(SendMessageW(lb, LB_GETCURSEL, 0, 0))));
+                        if (wparam == VK_UP and sel > 0) sel -= 1;
+                        if (wparam == VK_DOWN and sel < count - 1) sel += 1;
+                        _ = SendMessageW(lb, LB_SETCURSEL, @bitCast(sel), 0);
+                        return 0;
+                    },
+                    else => {},
+                }
+            }
+        },
+        WM_CHAR => {
+            // Let the edit control process the character first, then re-filter
+            const proc = original_edit_proc orelse return 0;
+            const result = proc(hwnd, msg, wparam, lparam);
+            if (self) |s| {
+                var buf: [256]u16 = undefined;
+                const len_raw = GetWindowTextW(hwnd, &buf, buf.len);
+                const len: usize = if (len_raw > 0) @intCast(len_raw) else 0;
+                var u8_buf: [1024]u8 = undefined;
+                const u8_len = std.unicode.utf16LeToUtf8(&u8_buf, buf[0..len]) catch 0;
+                s.filter(u8_buf[0..u8_len]) catch {};
+            }
+            return result;
+        },
+        else => {},
+    }
+    const proc = original_edit_proc orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+    return proc(hwnd, msg, wparam, lparam);
+}
+
+extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
+extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn DeleteObject(hObject: ?*anyopaque) callconv(.winapi) sys.BOOL;
+extern "gdi32" fn SetTextColor(hdc: ?*anyopaque, color: u32) callconv(.winapi) u32;
+extern "gdi32" fn SetBkColor(hdc: ?*anyopaque, color: u32) callconv(.winapi) u32;
+
+// Dark theme colors (BGR format for Win32 COLORREF)
+const BG_COLOR: u32 = 0x001E1E1E; // #1E1E1E
+const FG_COLOR: u32 = 0x00E0E0E0; // #E0E0E0
+var dark_brush: ?*anyopaque = null;
+
 var class_registered: bool = false;
 
 fn registerClass() !void {
     if (class_registered) return;
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyCommandPalette");
     const hinstance = sys.GetModuleHandleW(null);
+    if (dark_brush == null) dark_brush = CreateSolidBrush(BG_COLOR);
     var wc: sys.WNDCLASSEXW = std.mem.zeroes(sys.WNDCLASSEXW);
     wc.cbSize = @sizeOf(sys.WNDCLASSEXW);
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hinstance;
     wc.hCursor = sys.LoadCursorW(null, sys.IDC_ARROW);
-    wc.hbrBackground = @ptrFromInt(6); // COLOR_WINDOW + 1
+    wc.hbrBackground = dark_brush;
     wc.lpszClassName = class_name;
     if (sys.RegisterClassExW(&wc) == 0) return error.Win32Error;
     class_registered = true;
@@ -272,8 +350,19 @@ fn getPalette(hwnd: HWND) ?*CommandPalette {
     return @ptrFromInt(@as(usize, @bitCast(ptr)));
 }
 
+const WM_CTLCOLOREDIT: UINT = 0x0133;
+const WM_CTLCOLORLISTBOX: UINT = 0x0134;
+const WM_CTLCOLORSTATIC: UINT = 0x0138;
+
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
+        WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC => {
+            // Return our dark brush and set text colors to make children dark
+            const hdc: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, @intCast(wparam)))));
+            _ = SetTextColor(hdc, FG_COLOR);
+            _ = SetBkColor(hdc, BG_COLOR);
+            return @bitCast(@intFromPtr(dark_brush orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam)));
+        },
         WM_COMMAND => {
             const self = getPalette(hwnd) orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
             const ctl_id: u16 = @truncate(wparam & 0xFFFF);
