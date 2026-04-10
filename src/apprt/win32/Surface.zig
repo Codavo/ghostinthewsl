@@ -194,6 +194,36 @@ pub fn disableVSync(_: *Self) void {
     }
 }
 
+/// Set the mouse cursor shape. Called from performAction.
+pub fn setMouseShape(self: *Self, shape: @import("../../terminal/main.zig").MouseShape) void {
+    _ = self;
+    const cursor_name: ?[*:0]align(1) const u16 = switch (shape) {
+        .text, .vertical_text, .cell => @ptrFromInt(32513), // IDC_IBEAM
+        .pointer => @ptrFromInt(32649), // IDC_HAND
+        .wait, .progress => @ptrFromInt(32514), // IDC_WAIT
+        .crosshair => @ptrFromInt(32515), // IDC_CROSS
+        .not_allowed, .no_drop => @ptrFromInt(32648), // IDC_NO
+        .move, .all_scroll => @ptrFromInt(32646), // IDC_SIZEALL
+        .ns_resize, .n_resize, .s_resize, .row_resize => @ptrFromInt(32645), // IDC_SIZENS
+        .ew_resize, .e_resize, .w_resize, .col_resize => @ptrFromInt(32644), // IDC_SIZEWE
+        .nesw_resize, .ne_resize, .sw_resize => @ptrFromInt(32643), // IDC_SIZENESW
+        .nwse_resize, .nw_resize, .se_resize => @ptrFromInt(32642), // IDC_SIZENWSE
+        .help => @ptrFromInt(32651), // IDC_HELP
+        else => @ptrFromInt(32512), // IDC_ARROW
+    };
+    const cursor = LoadCursorW(null, cursor_name);
+    _ = SetCursor(cursor);
+}
+
+pub fn setMouseVisibility(self: *Self, visible: bool) void {
+    _ = self;
+    _ = ShowCursor(if (visible) 1 else 0);
+}
+
+extern "user32" fn LoadCursorW(hInstance: ?*anyopaque, lpCursorName: ?[*:0]align(1) const u16) callconv(.winapi) ?*anyopaque;
+extern "user32" fn SetCursor(hCursor: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn ShowCursor(bShow: i32) callconv(.winapi) i32;
+
 /// Update the OpenGL viewport to match the current window size.
 /// Called from the renderer thread before each frame.
 pub fn updateViewport(self: *Self) void {

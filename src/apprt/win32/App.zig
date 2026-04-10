@@ -121,6 +121,31 @@ extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16;
 extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: [*:0]const u16) callconv(.winapi) BOOL;
 extern "user32" fn AdjustWindowRectEx(lpRect: *RECT, dwStyle: DWORD, bMenu: BOOL, dwExStyle: DWORD) callconv(.winapi) BOOL;
 extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, x: i32, y: i32, cx: i32, cy: i32, uFlags: UINT) callconv(.winapi) BOOL;
+extern "user32" fn IsZoomed(hWnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn GetWindowLongW(hWnd: HWND, nIndex: c_int) callconv(.winapi) i32;
+extern "user32" fn SetWindowLongW(hWnd: HWND, nIndex: c_int, dwNewLong: i32) callconv(.winapi) i32;
+extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) callconv(.winapi) ?*anyopaque;
+extern "user32" fn GetMonitorInfoW(hMonitor: ?*anyopaque, lpmi: *MONITORINFO) callconv(.winapi) BOOL;
+extern "shell32" fn ShellExecuteW(hwnd: ?HWND, lpOperation: ?[*:0]const u16, lpFile: [*:0]const u16, lpParameters: ?[*:0]const u16, lpDirectory: ?[*:0]const u16, nShowCmd: c_int) callconv(.winapi) ?*anyopaque;
+extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
+extern "advapi32" fn RegOpenKeyExW(hKey: ?*anyopaque, lpSubKey: [*:0]const u16, ulOptions: DWORD, samDesired: DWORD, phkResult: *?*anyopaque) callconv(.winapi) i32;
+extern "advapi32" fn RegCloseKey(hKey: ?*anyopaque) callconv(.winapi) i32;
+extern "advapi32" fn RegQueryValueExW(hKey: ?*anyopaque, lpValueName: [*:0]const u16, lpReserved: ?*DWORD, lpType: ?*DWORD, lpData: ?[*]u8, lpcbData: ?*DWORD) callconv(.winapi) i32;
+const HKEY_CURRENT_USER: ?*anyopaque = @ptrFromInt(0x80000001);
+const KEY_READ: DWORD = 0x20019;
+
+const MONITORINFO = extern struct {
+    cbSize: DWORD,
+    rcMonitor: RECT,
+    rcWork: RECT,
+    dwFlags: DWORD,
+};
+
+const SW_MAXIMIZE: c_int = 3;
+const SW_RESTORE: c_int = 9;
+const GWL_STYLE: c_int = -16;
+const GWL_EXSTYLE: c_int = -20;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
 extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
@@ -209,6 +234,29 @@ pub fn init(
 
     // Initialize the core surface (terminal emulation + rendering)
     try self.initCoreSurface();
+
+    // Apply initial system color scheme
+    if (self.surface.core_surface) |core| {
+        const scheme = detectColorScheme();
+        core.colorSchemeCallback(scheme) catch {};
+    }
+}
+
+fn detectColorScheme() apprt.ColorScheme {
+    // Read HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize
+    // AppsUseLightTheme (DWORD): 0 = dark, 1 = light
+    var hkey: ?*anyopaque = null;
+    const subkey = std.unicode.utf8ToUtf16LeStringLiteral(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+    );
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &hkey) != 0) return .light;
+    defer _ = RegCloseKey(hkey);
+
+    var value: u32 = 1;
+    var value_size: u32 = @sizeOf(u32);
+    const value_name = std.unicode.utf8ToUtf16LeStringLiteral("AppsUseLightTheme");
+    if (RegQueryValueExW(hkey, value_name, null, null, @ptrCast(&value), &value_size) != 0) return .light;
+    return if (value == 0) .dark else .light;
 }
 
 pub fn run(self: *App) !void {
@@ -268,10 +316,94 @@ pub fn performAction(
             }
             return true;
         },
+        .toggle_maximize => {
+            if (self.hwnd) |hwnd| {
+                const maximized = IsZoomed(hwnd) != 0;
+                _ = ShowWindow(hwnd, if (maximized) SW_RESTORE else SW_MAXIMIZE);
+            }
+            return true;
+        },
+        .toggle_fullscreen => {
+            if (self.hwnd) |hwnd| self.toggleFullscreen(hwnd);
+            return true;
+        },
+        .mouse_shape => {
+            self.surface.setMouseShape(value);
+            return true;
+        },
+        .mouse_visibility => {
+            self.surface.setMouseVisibility(value == .visible);
+            return true;
+        },
+        .open_url => {
+            const url_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, value.url) catch return false;
+            defer self.alloc.free(url_utf16);
+            const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+            _ = ShellExecuteW(null, verb, url_utf16.ptr, null, null, SW_SHOWNORMAL);
+            return true;
+        },
+        .ring_bell => {
+            _ = MessageBeep(0xFFFFFFFF); // MB_OK
+            return true;
+        },
         .new_window => {
             return false;
         },
         else => return false,
+    }
+}
+
+/// Cached window state for restoring from fullscreen.
+const FullscreenState = struct {
+    is_fullscreen: bool = false,
+    style: i32 = 0,
+    ex_style: i32 = 0,
+    rect: RECT = undefined,
+};
+
+var fullscreen_state: FullscreenState = .{};
+
+fn toggleFullscreen(self: *App, hwnd: HWND) void {
+    _ = self;
+    if (fullscreen_state.is_fullscreen) {
+        // Restore
+        _ = SetWindowLongW(hwnd, GWL_STYLE, fullscreen_state.style);
+        _ = SetWindowLongW(hwnd, GWL_EXSTYLE, fullscreen_state.ex_style);
+        _ = SetWindowPos(
+            hwnd,
+            null,
+            fullscreen_state.rect.left,
+            fullscreen_state.rect.top,
+            fullscreen_state.rect.right - fullscreen_state.rect.left,
+            fullscreen_state.rect.bottom - fullscreen_state.rect.top,
+            0x0020 | 0x0004, // SWP_FRAMECHANGED | SWP_NOZORDER
+        );
+        fullscreen_state.is_fullscreen = false;
+    } else {
+        // Save current state
+        fullscreen_state.style = @intCast(GetWindowLongW(hwnd, GWL_STYLE));
+        fullscreen_state.ex_style = @intCast(GetWindowLongW(hwnd, GWL_EXSTYLE));
+        _ = GetWindowRect(hwnd, &fullscreen_state.rect);
+
+        // Get the monitor the window is on
+        var mi: MONITORINFO = std.mem.zeroes(MONITORINFO);
+        mi.cbSize = @sizeOf(MONITORINFO);
+        const monitor = MonitorFromWindow(hwnd, 2); // MONITOR_DEFAULTTONEAREST
+        if (GetMonitorInfoW(monitor, &mi) == 0) return;
+
+        // Remove window decorations
+        const new_style = fullscreen_state.style & ~@as(i32, @bitCast(@as(u32, WS_OVERLAPPEDWINDOW)));
+        _ = SetWindowLongW(hwnd, GWL_STYLE, new_style);
+        _ = SetWindowPos(
+            hwnd,
+            null,
+            mi.rcMonitor.left,
+            mi.rcMonitor.top,
+            mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top,
+            0x0020 | 0x0004, // SWP_FRAMECHANGED | SWP_NOZORDER
+        );
+        fullscreen_state.is_fullscreen = true;
     }
 }
 
@@ -559,6 +691,24 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             // Fall through to DefWindowProc so TranslateMessage generates WM_CHAR
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         },
+        0x0101, 0x0105 => { // WM_KEYUP, WM_SYSKEYUP
+            if (getApp(hwnd)) |app| {
+                if (app.surface.core_surface) |core| {
+                    const mods = getModifiers();
+                    const key = mapVirtualKey(wparam);
+                    if (key != .unidentified) {
+                        const input = @import("../../input.zig");
+                        const event = input.KeyEvent{
+                            .action = .release,
+                            .key = key,
+                            .mods = mods,
+                        };
+                        _ = core.keyCallback(event) catch {};
+                    }
+                }
+            }
+            return 0;
+        },
         0x0200 => { // WM_MOUSEMOVE
             if (getApp(hwnd)) |app| {
                 if (app.surface.core_surface) |core| {
@@ -645,6 +795,15 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 }
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        0x001A => { // WM_SETTINGCHANGE
+            if (getApp(hwnd)) |app| {
+                if (app.surface.core_surface) |core| {
+                    const scheme = detectColorScheme();
+                    core.colorSchemeCallback(scheme) catch {};
+                }
+            }
+            return 0;
         },
         0x0007, 0x0008 => { // WM_SETFOCUS, WM_KILLFOCUS
             if (getApp(hwnd)) |app| {
