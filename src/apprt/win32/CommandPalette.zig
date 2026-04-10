@@ -194,6 +194,25 @@ fn open(self: *CommandPalette, window: *Window) !void {
         null,
     ) orelse return error.Win32Error;
 
+    // Create a nicer UI font (Segoe UI) and apply to child controls
+    if (ui_font == null) {
+        const face_name = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
+        ui_font = CreateFontW(
+            -18, // height in pixels (negative = em height)
+            0, 0, 0,
+            400, // FW_NORMAL
+            0, 0, 0,
+            1, // DEFAULT_CHARSET
+            0, 0, 0,
+            0,
+            face_name,
+        );
+    }
+    if (ui_font) |font| {
+        if (self.edit_hwnd) |eh| _ = SendMessageW(eh, WM_SETFONT, @intFromPtr(font), 1);
+        if (self.list_hwnd) |lb| _ = SendMessageW(lb, WM_SETFONT, @intFromPtr(font), 1);
+    }
+
     // Populate with all commands initially
     self.filter("") catch {};
 
@@ -316,11 +335,28 @@ pub fn refilter(self: *CommandPalette) void {
 extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn SetTextColor(hdc: ?*anyopaque, color: u32) callconv(.winapi) u32;
 extern "gdi32" fn SetBkColor(hdc: ?*anyopaque, color: u32) callconv(.winapi) u32;
+extern "gdi32" fn CreateFontW(
+    cHeight: i32,
+    cWidth: i32,
+    cEscapement: i32,
+    cOrientation: i32,
+    cWeight: i32,
+    bItalic: u32,
+    bUnderline: u32,
+    bStrikeOut: u32,
+    iCharSet: u32,
+    iOutPrecision: u32,
+    iClipPrecision: u32,
+    iQuality: u32,
+    iPitchAndFamily: u32,
+    pszFaceName: [*:0]const u16,
+) callconv(.winapi) ?*anyopaque;
 
 // Dark theme colors (COLORREF: 0x00BBGGRR)
 const BG_COLOR: u32 = 0x001E1E1E;
 const FG_COLOR: u32 = 0x00E0E0E0;
 var dark_brush: ?*anyopaque = null;
+var ui_font: ?*anyopaque = null;
 
 var class_registered: bool = false;
 
