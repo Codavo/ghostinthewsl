@@ -584,17 +584,10 @@ pub fn performAction(
             return true;
         },
         .show_child_exited => {
-            if (self.hwnd) |hwnd| {
-                const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-                var buf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "Process exited with code {}", .{value.exit_code}) catch return false;
-                const msg_w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, msg) catch return false;
-                defer self.alloc.free(msg_w);
-                const MB_OK: u32 = 0x00000000;
-                const MB_ICONINFORMATION: u32 = 0x00000040;
-                _ = MessageBoxW(hwnd, msg_w.ptr, title, MB_OK | MB_ICONINFORMATION);
-            }
-            return true;
+            // Return false to let the terminal show its own inline message
+            // ("Process exited. Press any key to close the terminal.")
+            // instead of a blocking native dialog.
+            return false;
         },
         .new_split => {
             const existing = self.focused_surface orelse &self.surface;
