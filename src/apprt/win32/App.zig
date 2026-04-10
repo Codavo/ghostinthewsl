@@ -226,14 +226,23 @@ running: bool = true,
 /// The main window handle.
 hwnd: ?HWND = null,
 
-/// The surface for the main window.
+/// The first (primary) surface, always valid after init.
+/// Kept for backward-compat code paths; use `tree` for the full set.
 surface: Surface = undefined,
+
+/// Split tree managing multiple surfaces within the window.
+tree: ?SplitTree = null,
+
+/// The surface that currently has focus.
+focused_surface: ?*Surface = null,
 
 /// Whether the tray icon is registered (for notifications).
 tray_registered: bool = false,
 
 /// Whether the surface has been initialized yet.
 surface_initialized: bool = false,
+
+const SplitTree = @import("SplitTree.zig");
 
 pub fn init(
     self: *App,
@@ -273,11 +282,76 @@ pub fn init(
     // Initialize the core surface (terminal emulation + rendering)
     try self.initCoreSurface();
 
+    // Initialize the split tree with the primary surface as the only leaf
+    self.tree = try SplitTree.initLeaf(alloc, &self.surface);
+    self.focused_surface = &self.surface;
+
     // Apply initial system color scheme
     if (self.surface.core_surface) |core| {
         const scheme = detectColorScheme();
         core.colorSchemeCallback(scheme) catch {};
     }
+}
+
+/// Perform a layout pass, resizing each surface's child window.
+pub fn relayout(self: *App) void {
+    const tree = &(self.tree orelse return);
+    const hwnd = self.hwnd orelse return;
+    var rect: RECT = std.mem.zeroes(RECT);
+    if (GetClientRect(hwnd, &rect) == 0) return;
+    const bounds = SplitTree.Rect{
+        .x = 0,
+        .y = 0,
+        .w = rect.right - rect.left,
+        .h = rect.bottom - rect.top,
+    };
+    tree.layout(bounds, relayoutCb);
+}
+
+fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
+    _ = SetWindowPos(surface.hwnd, null, rect.x, rect.y, rect.w, rect.h, 0x0004); // SWP_NOZORDER
+}
+
+/// Create a new surface as a split of the given existing surface.
+pub fn newSplit(self: *App, existing: *Surface, dir: apprt.action.SplitDirection) !void {
+    const tree = &(self.tree orelse return error.NoTree);
+
+    // Allocate a new Surface
+    const new_surface = try self.alloc.create(Surface);
+    errdefer self.alloc.destroy(new_surface);
+
+    // Create the child window for the new surface
+    try new_surface.init(self.hwnd.?, self);
+    errdefer new_surface.deinit();
+
+    // Create a CoreSurface for the new surface
+    const new_core = try self.alloc.create(CoreSurface);
+    errdefer self.alloc.destroy(new_core);
+
+    try self.core_app.addSurface(new_surface);
+    errdefer self.core_app.deleteSurface(new_surface);
+
+    var config = try apprt.surface.newConfig(self.core_app, self.config, .split);
+    defer config.deinit();
+
+    try new_core.init(self.alloc, &config, self.core_app, self, new_surface);
+    errdefer new_core.deinit();
+    new_surface.core_surface = new_core;
+
+    // Insert into the tree
+    const split_dir: SplitTree.Direction = switch (dir) {
+        .right, .left => .horizontal,
+        .down, .up => .vertical,
+    };
+    const after = dir == .right or dir == .down;
+    try tree.split(self.alloc, existing, new_surface, split_dir, after);
+
+    // Focus the new surface
+    self.focused_surface = new_surface;
+    _ = SetFocus(new_surface.hwnd);
+
+    // Apply layout
+    self.relayout();
 }
 
 fn detectColorScheme() apprt.ColorScheme {
@@ -450,13 +524,20 @@ pub fn performAction(
             }
             return true;
         },
+        .new_split => {
+            const existing = self.focused_surface orelse &self.surface;
+            self.newSplit(existing, value) catch |err| {
+                log.err("new_split failed: {}", .{err});
+                return false;
+            };
+            return true;
+        },
         // --- Actions intentionally unsupported on Win32 ---
         // These return true to indicate the action was "handled" (as a no-op)
         // so that callers do not treat them as errors.
         .new_window,
         .new_tab,
         .close_tab,
-        .new_split,
         .close_all_windows,
         .toggle_tab_overview,
         .toggle_window_decorations,
@@ -813,21 +894,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
         },
         WM_SIZE => {
             if (getApp(hwnd)) |app| {
-                const width: u32 = @intCast(lparam & 0xFFFF);
-                const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
-                if (width > 0 and height > 0 and app.surface_initialized) {
-                    // Resize the child surface to fill the client area.
-                    _ = SetWindowPos(app.surface.hwnd, null, 0, 0, @intCast(width), @intCast(height), 0x0004); // SWP_NOZORDER
-                    app.surface.width = width;
-                    app.surface.height = height;
-                    if (app.surface.core_surface) |core| {
-                        core.sizeCallback(.{
-                            .width = width,
-                            .height = height,
-                        }) catch |err| {
-                            log.err("size callback error: {}", .{err});
-                        };
-                    }
+                if (app.surface_initialized and app.tree != null) {
+                    // Re-layout all child surfaces based on the split tree.
+                    app.relayout();
                 }
             }
             return 0;
