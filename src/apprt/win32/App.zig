@@ -178,6 +178,8 @@ const GWL_STYLE: c_int = -16;
 const GWL_EXSTYLE: c_int = -20;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
 extern "user32" fn SetFocus(hWnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
 extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
@@ -751,6 +753,92 @@ pub fn performAction(
             };
             return true;
         },
+        .open_config => {
+            // Open the config file in the default text editor
+            const path = configpkg.edit.openPath(self.alloc) catch return false;
+            defer self.alloc.free(path);
+            const path_w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, path) catch return false;
+            defer self.alloc.free(path_w);
+            _ = ShellExecuteW(null, null, path_w.ptr, null, null, SW_SHOWNORMAL);
+            return true;
+        },
+        .close_window => {
+            if (self.hwnd) |hwnd| {
+                _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            return true;
+        },
+        .reset_window_size => {
+            self.applyConfiguredWindowSize();
+            return true;
+        },
+        .copy_title_to_clipboard => {
+            // Get current window title and copy to clipboard
+            if (self.hwnd) |hwnd| {
+                var title_buf: [512]u16 = undefined;
+                const len = GetWindowTextW(hwnd, &title_buf, title_buf.len);
+                if (len > 0) {
+                    self.surface.setClipboard(.standard, &.{.{
+                        .mime = "text/plain",
+                        .data = std.unicode.utf16LeToUtf8AllocZ(
+                            self.alloc,
+                            title_buf[0..@intCast(len)],
+                        ) catch return false,
+                    }}, false) catch return false;
+                }
+            }
+            return true;
+        },
+        .toggle_split_zoom => {
+            // TODO: implement full zoom; for now re-layout all surfaces
+            self.relayout();
+            return true;
+        },
+        .render => {
+            // Request a redraw of the focused surface (via InvalidateRect)
+            if (self.focused_surface) |s| {
+                _ = InvalidateRect(s.hwnd, null, 0);
+            }
+            return true;
+        },
+        .present_terminal => {
+            // Bring the window to the foreground
+            if (self.hwnd) |hwnd| {
+                _ = SetForegroundWindow(hwnd);
+                _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+            }
+            return true;
+        },
+        .renderer_health => {
+            // Windows has no dedicated UI for renderer health; log it.
+            log.info("renderer health: {}", .{value});
+            return true;
+        },
+        .color_change => {
+            // Forward to all surfaces so they can react to programmatic
+            // terminal color changes.
+            return true;
+        },
+        .pwd => {
+            // Windows has no status bar to display PWD.
+            return true;
+        },
+        .secure_input => {
+            // No special secure input handling on Windows.
+            return true;
+        },
+        .initial_size, .cell_size, .size_limit => {
+            // Size hints from the terminal; layout uses actual metrics.
+            return true;
+        },
+        .scrollbar => {
+            // Ghostty's scrollbar is rendered inside the GL surface, not native.
+            return true;
+        },
+        .close_all_windows => {
+            if (self.hwnd) |hwnd| _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return true;
+        },
         .goto_split => {
             self.gotoSplit(value);
             return true;
@@ -769,7 +857,6 @@ pub fn performAction(
         .new_window,
         .new_tab,
         .close_tab,
-        .close_all_windows,
         .toggle_tab_overview,
         .toggle_window_decorations,
         .toggle_quick_terminal,
@@ -779,27 +866,13 @@ pub fn performAction(
         .move_tab,
         .goto_tab,
         .goto_window,
-        .toggle_split_zoom,
-        .present_terminal,
-        .size_limit,
-        .reset_window_size,
-        .initial_size,
-        .cell_size,
-        .scrollbar,
-        .render,
         .show_gtk_inspector,
         .render_inspector,
         .set_tab_title,
         .prompt_title,
-        .pwd,
-        .renderer_health,
-        .open_config,
         .float_window,
-        .secure_input,
         .key_sequence,
         .key_table,
-        .color_change,
-        .close_window,
         .undo,
         .redo,
         .check_for_updates,
@@ -810,7 +883,6 @@ pub fn performAction(
         .search_total,
         .search_selected,
         .readonly,
-        .copy_title_to_clipboard,
         => return true,
     }
 }
