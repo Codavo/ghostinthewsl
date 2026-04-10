@@ -366,18 +366,7 @@ pub fn getTitle(_: *Self) ?[:0]const u8 {
 }
 
 pub fn close(self: *Self, process_active: bool) void {
-    if (process_active) {
-        const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
-        const msg = std.unicode.utf8ToUtf16LeStringLiteral(
-            "Close this terminal? There are still running processes.",
-        );
-        const MB_OKCANCEL: u32 = 0x00000001;
-        const MB_ICONWARNING: u32 = 0x00000030;
-        const IDOK: c_int = 1;
-        if (MessageBoxW(self.hwnd, msg, title, MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
-            return;
-        }
-    }
+    _ = process_active; // Core already gated on needsConfirmQuit
     // Ask the app to remove this surface from the tree, destroying the
     // child window. If this is the last surface, the app will quit.
     if (self.app) |app| {
