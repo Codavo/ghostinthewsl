@@ -139,6 +139,9 @@ tray_registered: bool = false,
 command_palette: CommandPalette = undefined,
 command_palette_initialized: bool = false,
 
+/// Single-instance mutex handle.
+instance_mutex: ?*anyopaque = null,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -161,6 +164,22 @@ pub fn init(
     };
 
     _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Single-instance check: if another Ghostty is already running,
+    // signal it to open a new window and exit this process.
+    const mutex_name = std.unicode.utf8ToUtf16LeStringLiteral("Global\\GhosttyWin32Mutex");
+    self.instance_mutex = sys.CreateMutexW(null, 0, mutex_name);
+    if (sys.GetLastError() == sys.ERROR_ALREADY_EXISTS) {
+        // Another instance owns the mutex. Find its window and request a new one.
+        const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
+        if (sys.FindWindowW(class_name, null)) |other| {
+            _ = sys.PostMessageW(other, sys.WM_APP_NEW_WINDOW, 0, 0);
+        }
+        // Clean up this mutex handle (doesn't release ownership since we don't own it)
+        if (self.instance_mutex) |h| _ = sys.CloseHandle(h);
+        self.instance_mutex = null;
+        return error.AlreadyRunning;
+    }
 
     // Create the first window
     const window = try Window.create(alloc, self);
@@ -230,6 +249,11 @@ pub fn terminate(self: *App) void {
     self.windows.deinit(self.alloc);
     self.config.deinit();
     self.alloc.destroy(self.config);
+    if (self.instance_mutex) |h| {
+        _ = sys.ReleaseMutex(h);
+        _ = sys.CloseHandle(h);
+        self.instance_mutex = null;
+    }
 }
 
 pub fn wakeup(self: *App) void {
@@ -721,6 +745,15 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
             if (getWindow(hwnd)) |window| {
                 window.app.core_app.tick(window.app) catch |err| {
                     log.err("core app tick failed: {}", .{err});
+                };
+            }
+            return 0;
+        },
+        sys.WM_APP_NEW_WINDOW => {
+            // Another instance requested that we open a new window.
+            if (getWindow(hwnd)) |window| {
+                window.app.newWindow() catch |err| {
+                    log.err("new_window from IPC failed: {}", .{err});
                 };
             }
             return 0;

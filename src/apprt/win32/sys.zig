@@ -131,3 +131,12 @@ pub extern "user32" fn GetMonitorInfoW(hMonitor: ?*anyopaque, lpmi: *MONITORINFO
 pub extern "user32" fn SetFocus(hWnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
 pub extern "shell32" fn ShellExecuteW(hwnd: ?HWND, lpOperation: ?[*:0]const u16, lpFile: [*:0]const u16, lpParameters: ?[*:0]const u16, lpDirectory: ?[*:0]const u16, nShowCmd: c_int) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn CreateMutexW(lpMutexAttributes: ?*anyopaque, bInitialOwner: BOOL, lpName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+pub extern "kernel32" fn ReleaseMutex(hMutex: ?*anyopaque) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
+pub extern "user32" fn FindWindowW(lpClassName: ?[*:0]const u16, lpWindowName: ?[*:0]const u16) callconv(.winapi) ?HWND;
+
+pub const ERROR_ALREADY_EXISTS: DWORD = 183;
+/// Custom app message used for single-instance "open new window" notification.
+pub const WM_APP_NEW_WINDOW: UINT = 0x8000 + 1; // WM_APP + 1
