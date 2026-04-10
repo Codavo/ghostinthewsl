@@ -177,6 +177,7 @@ const SW_RESTORE: c_int = 9;
 const GWL_STYLE: c_int = -16;
 const GWL_EXSTYLE: c_int = -20;
 extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
+extern "user32" fn SetFocus(hWnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
@@ -231,6 +232,9 @@ surface: Surface = undefined,
 /// Whether the tray icon is registered (for notifications).
 tray_registered: bool = false,
 
+/// Whether the surface has been initialized yet.
+surface_initialized: bool = false,
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -259,8 +263,9 @@ pub fn init(
     // Create the main window
     try self.createWindow();
 
-    // Initialize the surface with OpenGL
-    try self.surface.init(self.hwnd.?);
+    // Initialize the surface (creates a child HWND with its own WGL context)
+    try self.surface.init(self.hwnd.?, self);
+    self.surface_initialized = true;
 
     // Store self pointer in window for use in wndProc
     _ = SetWindowLongPtrW(self.hwnd.?, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -793,6 +798,7 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
     };
 }
 
+/// Main window procedure (top-level window, container for surface children).
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
         WM_CLOSE => {
@@ -809,7 +815,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             if (getApp(hwnd)) |app| {
                 const width: u32 = @intCast(lparam & 0xFFFF);
                 const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
-                if (width > 0 and height > 0) {
+                if (width > 0 and height > 0 and app.surface_initialized) {
+                    // Resize the child surface to fill the client area.
+                    _ = SetWindowPos(app.surface.hwnd, null, 0, 0, @intCast(width), @intCast(height), 0x0004); // SWP_NOZORDER
                     app.surface.width = width;
                     app.surface.height = height;
                     if (app.surface.core_surface) |core| {
@@ -824,167 +832,6 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             }
             return 0;
         },
-        WM_PAINT => {
-            // Validate the window to prevent continuous WM_PAINT messages.
-            // Actual rendering is done by the renderer thread via SwapBuffers.
-            var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
-            _ = BeginPaint(hwnd, &ps);
-            _ = EndPaint(hwnd, &ps);
-            return 0;
-        },
-        WM_CHAR => {
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const mods = getModifiers();
-                    const codepoint: u21 = @intCast(wparam);
-                    // Skip control characters — they are already handled
-                    // via WM_KEYDOWN (backspace, tab, enter, escape, Ctrl+letter).
-                    if (codepoint < 0x20 or codepoint == 0x7f) return 0;
-                    var utf8_buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
-                    if (len > 0) {
-                        const input = @import("../../input.zig");
-                        const event = input.KeyEvent{
-                            .action = .press,
-                            .mods = mods,
-                            .utf8 = utf8_buf[0..len],
-                        };
-                        _ = core.keyCallback(event) catch |err| {
-                            log.err("key callback error: {}", .{err});
-                        };
-                    }
-                }
-            }
-            return 0;
-        },
-        WM_KEYDOWN, 0x0104 => { // WM_KEYDOWN, WM_SYSKEYDOWN
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const mods = getModifiers();
-                    const key = mapVirtualKey(wparam);
-                    if (key != .unidentified) {
-                        const input = @import("../../input.zig");
-                        const event = input.KeyEvent{
-                            .action = .press,
-                            .key = key,
-                            .mods = mods,
-                        };
-                        const effect = core.keyCallback(event) catch |err| {
-                            log.err("key callback error: {}", .{err});
-                            return 0;
-                        };
-                        if (effect == .consumed or effect == .closed) return 0;
-                    }
-                }
-            }
-            // Fall through to DefWindowProc so TranslateMessage generates WM_CHAR
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-        0x0101, 0x0105 => { // WM_KEYUP, WM_SYSKEYUP
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const mods = getModifiers();
-                    const key = mapVirtualKey(wparam);
-                    if (key != .unidentified) {
-                        const input = @import("../../input.zig");
-                        const event = input.KeyEvent{
-                            .action = .release,
-                            .key = key,
-                            .mods = mods,
-                        };
-                        _ = core.keyCallback(event) catch {};
-                    }
-                }
-            }
-            return 0;
-        },
-        0x0200 => { // WM_MOUSEMOVE
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const x: f32 = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF)));
-                    const y: f32 = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
-                    core.cursorPosCallback(.{ .x = x, .y = y }, getModifiers()) catch {};
-                }
-            }
-            return 0;
-        },
-        0x0201, 0x0204, 0x0207 => { // WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const input = @import("../../input.zig");
-                    const button: input.MouseButton = switch (msg) {
-                        0x0201 => .left,
-                        0x0204 => .right,
-                        0x0207 => .middle,
-                        else => .unknown,
-                    };
-                    _ = core.mouseButtonCallback(.press, button, getModifiers()) catch false;
-                    _ = SetCapture(hwnd);
-                }
-            }
-            return 0;
-        },
-        0x0202, 0x0205, 0x0208 => { // WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const input = @import("../../input.zig");
-                    const button: input.MouseButton = switch (msg) {
-                        0x0202 => .left,
-                        0x0205 => .right,
-                        0x0208 => .middle,
-                        else => .unknown,
-                    };
-                    _ = core.mouseButtonCallback(.release, button, getModifiers()) catch false;
-                    _ = ReleaseCapture();
-                }
-            }
-            return 0;
-        },
-        0x020A => { // WM_MOUSEWHEEL
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    const delta: i16 = @truncate(@as(isize, @bitCast(wparam)) >> 16);
-                    const yoff: f64 = @as(f64, @floatFromInt(delta)) / 120.0;
-                    const input = @import("../../input.zig");
-                    core.scrollCallback(0, yoff, input.ScrollMods{}) catch {};
-                }
-            }
-            return 0;
-        },
-        0x010D => { // WM_IME_STARTCOMPOSITION
-            if (getApp(hwnd)) |app| {
-                if (app.surface.core_surface) |core| {
-                    // Get cursor position in raw pixels (no DPI scaling)
-                    core.renderer_state.mutex.lock();
-                    const cursor = core.renderer_state.terminal.screens.active.cursor;
-                    core.renderer_state.mutex.unlock();
-                    const x: i32 = @intCast(cursor.x * core.size.cell.width + core.size.padding.left);
-                    const y: i32 = @intCast(cursor.y * core.size.cell.height + core.size.padding.top);
-
-                    const himc = ImmGetContext(hwnd);
-                    if (himc) |ctx| {
-                        defer _ = ImmReleaseContext(hwnd, ctx);
-                        var cf = COMPOSITIONFORM{
-                            .dwStyle = 0x0002, // CFS_POINT
-                            .ptCurrentPos = .{ .x = x, .y = y },
-                            .rcArea = std.mem.zeroes(RECT),
-                        };
-                        _ = ImmSetCompositionWindow(ctx, &cf);
-
-                        // Set IME font to match terminal font size (points → pixels)
-                        const dpi = GetDpiForWindow(hwnd);
-                        const dpi_f: f32 = if (dpi > 0) @floatFromInt(dpi) else 96.0;
-                        const font_px: i32 = @intFromFloat(app.config.@"font-size" * dpi_f / 72.0);
-                        var lf: LOGFONTW = std.mem.zeroes(LOGFONTW);
-                        lf.lfHeight = -font_px;
-                        lf.lfWidth = 0;
-                        lf.lfCharSet = 1; // DEFAULT_CHARSET
-                        _ = ImmSetCompositionFontW(ctx, &lf);
-                    }
-                }
-            }
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
         0x001A => { // WM_SETTINGCHANGE
             if (getApp(hwnd)) |app| {
                 if (app.surface.core_surface) |core| {
@@ -998,8 +845,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             if (getApp(hwnd)) |app| {
                 const focused = msg == 0x0007;
                 app.core_app.focusEvent(focused);
-                if (app.surface.core_surface) |core| {
-                    core.focusCallback(focused) catch {};
+                // Forward focus to the surface child
+                if (focused and app.surface_initialized) {
+                    _ = SetFocus(app.surface.hwnd);
                 }
             }
             return 0;
@@ -1009,6 +857,176 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 app.core_app.tick(app) catch |err| {
                     log.err("core app tick failed: {}", .{err});
                 };
+            }
+            return 0;
+        },
+        else => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Message dispatch for child surface windows. Handles input, IME, paint.
+pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) LRESULT {
+    switch (msg) {
+        WM_PAINT => {
+            var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
+            _ = BeginPaint(hwnd, &ps);
+            _ = EndPaint(hwnd, &ps);
+            return 0;
+        },
+        WM_SIZE => {
+            const width: u32 = @intCast(lparam & 0xFFFF);
+            const height: u32 = @intCast((lparam >> 16) & 0xFFFF);
+            if (width > 0 and height > 0) {
+                surface.width = width;
+                surface.height = height;
+                if (surface.core_surface) |core| {
+                    core.sizeCallback(.{
+                        .width = width,
+                        .height = height,
+                    }) catch |err| {
+                        log.err("size callback error: {}", .{err});
+                    };
+                }
+            }
+            return 0;
+        },
+        WM_CHAR => {
+            if (surface.core_surface) |core| {
+                const mods = getModifiers();
+                const codepoint: u21 = @intCast(wparam);
+                if (codepoint < 0x20 or codepoint == 0x7f) return 0;
+                var utf8_buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
+                if (len > 0) {
+                    const input = @import("../../input.zig");
+                    const event = input.KeyEvent{
+                        .action = .press,
+                        .mods = mods,
+                        .utf8 = utf8_buf[0..len],
+                    };
+                    _ = core.keyCallback(event) catch |err| {
+                        log.err("key callback error: {}", .{err});
+                    };
+                }
+            }
+            return 0;
+        },
+        WM_KEYDOWN, 0x0104 => {
+            if (surface.core_surface) |core| {
+                const mods = getModifiers();
+                const key = mapVirtualKey(wparam);
+                if (key != .unidentified) {
+                    const input = @import("../../input.zig");
+                    const event = input.KeyEvent{
+                        .action = .press,
+                        .key = key,
+                        .mods = mods,
+                    };
+                    const effect = core.keyCallback(event) catch |err| {
+                        log.err("key callback error: {}", .{err});
+                        return 0;
+                    };
+                    if (effect == .consumed or effect == .closed) return 0;
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        0x0101, 0x0105 => {
+            if (surface.core_surface) |core| {
+                const mods = getModifiers();
+                const key = mapVirtualKey(wparam);
+                if (key != .unidentified) {
+                    const input = @import("../../input.zig");
+                    const event = input.KeyEvent{
+                        .action = .release,
+                        .key = key,
+                        .mods = mods,
+                    };
+                    _ = core.keyCallback(event) catch {};
+                }
+            }
+            return 0;
+        },
+        0x0200 => {
+            if (surface.core_surface) |core| {
+                const x: f32 = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF)));
+                const y: f32 = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
+                core.cursorPosCallback(.{ .x = x, .y = y }, getModifiers()) catch {};
+            }
+            return 0;
+        },
+        0x0201, 0x0204, 0x0207 => {
+            if (surface.core_surface) |core| {
+                const input = @import("../../input.zig");
+                const button: input.MouseButton = switch (msg) {
+                    0x0201 => .left,
+                    0x0204 => .right,
+                    0x0207 => .middle,
+                    else => .unknown,
+                };
+                _ = core.mouseButtonCallback(.press, button, getModifiers()) catch false;
+                _ = SetCapture(hwnd);
+                _ = SetFocus(hwnd);
+            }
+            return 0;
+        },
+        0x0202, 0x0205, 0x0208 => {
+            if (surface.core_surface) |core| {
+                const input = @import("../../input.zig");
+                const button: input.MouseButton = switch (msg) {
+                    0x0202 => .left,
+                    0x0205 => .right,
+                    0x0208 => .middle,
+                    else => .unknown,
+                };
+                _ = core.mouseButtonCallback(.release, button, getModifiers()) catch false;
+                _ = ReleaseCapture();
+            }
+            return 0;
+        },
+        0x020A => {
+            if (surface.core_surface) |core| {
+                const delta: i16 = @truncate(@as(isize, @bitCast(wparam)) >> 16);
+                const yoff: f64 = @as(f64, @floatFromInt(delta)) / 120.0;
+                const input = @import("../../input.zig");
+                core.scrollCallback(0, yoff, input.ScrollMods{}) catch {};
+            }
+            return 0;
+        },
+        0x010D => { // WM_IME_STARTCOMPOSITION
+            if (surface.core_surface) |core| {
+                core.renderer_state.mutex.lock();
+                const cursor = core.renderer_state.terminal.screens.active.cursor;
+                core.renderer_state.mutex.unlock();
+                const x: i32 = @intCast(cursor.x * core.size.cell.width + core.size.padding.left);
+                const y: i32 = @intCast(cursor.y * core.size.cell.height + core.size.padding.top);
+
+                const himc = ImmGetContext(hwnd);
+                if (himc) |ctx| {
+                    defer _ = ImmReleaseContext(hwnd, ctx);
+                    var cf = COMPOSITIONFORM{
+                        .dwStyle = 0x0002,
+                        .ptCurrentPos = .{ .x = x, .y = y },
+                        .rcArea = std.mem.zeroes(RECT),
+                    };
+                    _ = ImmSetCompositionWindow(ctx, &cf);
+
+                    const dpi = GetDpiForWindow(hwnd);
+                    const dpi_f: f32 = if (dpi > 0) @floatFromInt(dpi) else 96.0;
+                    const font_px: i32 = @intFromFloat(app.config.@"font-size" * dpi_f / 72.0);
+                    var lf: LOGFONTW = std.mem.zeroes(LOGFONTW);
+                    lf.lfHeight = -font_px;
+                    lf.lfWidth = 0;
+                    lf.lfCharSet = 1;
+                    _ = ImmSetCompositionFontW(ctx, &lf);
+                }
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        0x0007, 0x0008 => {
+            if (surface.core_surface) |core| {
+                const focused = msg == 0x0007;
+                core.focusCallback(focused) catch {};
             }
             return 0;
         },

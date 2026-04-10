@@ -108,9 +108,75 @@ pub fn rtApp(self: *Self) *App {
     return self.app.?;
 }
 
-pub fn init(self: *Self, hwnd: HWND) !void {
-    self.* = .{ .hwnd = hwnd };
+pub fn init(self: *Self, parent: HWND, app: *App) !void {
+    self.* = .{ .hwnd = undefined, .app = app };
+
+    // Create a child window for this surface.
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttySurface");
+
+    // Ensure the surface window class is registered (idempotent).
+    try registerSurfaceClass();
+
+    var rect: RECT = undefined;
+    _ = GetClientRect(parent, &rect);
+    const cw: i32 = rect.right - rect.left;
+    const ch: i32 = rect.bottom - rect.top;
+
+    const hinstance = GetModuleHandleW(null);
+    const WS_CHILD: u32 = 0x40000000;
+    const WS_VISIBLE: u32 = 0x10000000;
+    const WS_CLIPCHILDREN: u32 = 0x02000000;
+    const child = CreateWindowExW(
+        0,
+        class_name,
+        null,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+        0,
+        0,
+        cw,
+        ch,
+        parent,
+        null,
+        hinstance,
+        null,
+    ) orelse return error.Win32Error;
+
+    self.hwnd = child;
+    self.width = @intCast(@max(1, cw));
+    self.height = @intCast(@max(1, ch));
+
+    // Store self pointer on the child window for message handling
+    _ = SetWindowLongPtrW(child, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+
     try self.initOpenGL();
+}
+
+var surface_class_registered: bool = false;
+
+fn registerSurfaceClass() !void {
+    if (surface_class_registered) return;
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttySurface");
+    const hinstance = GetModuleHandleW(null);
+    const CS_HREDRAW: u32 = 0x0002;
+    const CS_VREDRAW: u32 = 0x0001;
+    const CS_OWNDC: u32 = 0x0020;
+    var wc: WNDCLASSEXW = std.mem.zeroes(WNDCLASSEXW);
+    wc.cbSize = @sizeOf(WNDCLASSEXW);
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+    wc.lpfnWndProc = surfaceWndProc;
+    wc.hInstance = hinstance;
+    wc.hCursor = LoadCursorW(null, @ptrFromInt(32512));
+    wc.lpszClassName = class_name;
+    if (RegisterClassExW(&wc) == 0) return error.Win32Error;
+    surface_class_registered = true;
+}
+
+fn surfaceWndProc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+    const ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (ptr == 0) return DefWindowProcW(hwnd, msg, wparam, lparam);
+    const self: *Self = @ptrFromInt(@as(usize, @bitCast(ptr)));
+    const app = self.app orelse return DefWindowProcW(hwnd, msg, wparam, lparam);
+    return App.surfaceDispatch(app, self, hwnd, msg, wparam, lparam);
 }
 
 pub fn deinit(self: *Self) void {
@@ -179,6 +245,28 @@ fn initOpenGL(self: *Self) !void {
 
 const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
 extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn CreateWindowExW(dwExStyle: u32, lpClassName: ?[*:0]const u16, lpWindowName: ?[*:0]const u16, dwStyle: u32, x: i32, y: i32, nWidth: i32, nHeight: i32, hWndParent: ?HWND, hMenu: ?*anyopaque, hInstance: ?*anyopaque, lpParam: ?*anyopaque) callconv(.winapi) ?HWND;
+extern "user32" fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) callconv(.winapi) u16;
+extern "user32" fn DefWindowProcW(hWnd: HWND, msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize;
+extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) callconv(.winapi) isize;
+extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) callconv(.winapi) isize;
+extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+const GWLP_USERDATA: i32 = -21;
+
+const WNDCLASSEXW = extern struct {
+    cbSize: u32,
+    style: u32,
+    lpfnWndProc: *const fn (HWND, u32, usize, isize) callconv(.winapi) isize,
+    cbClsExtra: i32,
+    cbWndExtra: i32,
+    hInstance: ?*anyopaque,
+    hIcon: ?*anyopaque,
+    hCursor: ?*anyopaque,
+    hbrBackground: ?*anyopaque,
+    lpszMenuName: ?[*:0]const u16,
+    lpszClassName: ?[*:0]const u16,
+    hIconSm: ?*anyopaque,
+};
 
 pub fn swapBuffers(self: *Self) void {
     if (self.hdc != null) {
