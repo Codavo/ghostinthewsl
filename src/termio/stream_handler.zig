@@ -1131,7 +1131,7 @@ pub const StreamHandler = struct {
         }
 
         if (builtin.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
+            try self.reportPwdWindows(url);
             return;
         }
 
@@ -1200,6 +1200,70 @@ pub const StreamHandler = struct {
         }
 
         // If we haven't seen a title, use our pwd as the title.
+        if (!self.seen_title) {
+            try self.windowTitle(path);
+            self.seen_title = false;
+        }
+    }
+
+    fn reportPwdWindows(self: *StreamHandler, url: []const u8) !void {
+        const prefix, const raw_path: []const u8 = if (std.mem.startsWith(u8, url, "file://"))
+            .{ "file://", url["file://".len..] }
+        else if (std.mem.startsWith(u8, url, "kitty-shell-cwd://"))
+            .{ "kitty-shell-cwd://", url["kitty-shell-cwd://".len..] }
+        else {
+            log.warn("OSC 7 scheme must be file or kitty-shell-cwd, got: {s}", .{url});
+            return;
+        };
+        _ = prefix;
+
+        const host_end = std.mem.indexOfScalar(u8, raw_path, '/') orelse {
+            log.warn("OSC 7 uri must contain a path", .{});
+            return;
+        };
+        const host = raw_path[0..host_end];
+        const path_part = raw_path[host_end..];
+
+        if (host.len > 0) {
+            const host_valid = internal_os.hostname.isLocal(host) catch |err| switch (err) {
+                error.PermissionDenied,
+                error.Unexpected,
+                => {
+                    log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
+                    return;
+                },
+            };
+            if (!host_valid) {
+                log.warn("OSC 7 host ({s}) must be local", .{host});
+                return;
+            }
+        }
+
+        var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena_alloc.deinit();
+        const alloc = arena_alloc.allocator();
+
+        var path = try alloc.dupe(u8, path_part);
+        if (!std.mem.startsWith(u8, url, "kitty-shell-cwd://")) {
+            path = std.Uri.percentDecodeInPlace(path);
+        }
+
+        if (path.len >= 3 and path[0] == '/' and std.ascii.isAlphabetic(path[1]) and path[2] == ':') {
+            path = path[1..];
+        }
+        for (path) |*c| {
+            if (c.* == '/') c.* = '\\';
+        }
+
+        log.debug("terminal pwd: {s}", .{path});
+        try self.terminal.setPwd(path);
+
+        if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
+            self.surfaceMessageWriter(.{ .pwd_change = req });
+        } else |err| {
+            log.warn("error notifying surface of pwd change err={}", .{err});
+        }
+
         if (!self.seen_title) {
             try self.windowTitle(path);
             self.seen_title = false;

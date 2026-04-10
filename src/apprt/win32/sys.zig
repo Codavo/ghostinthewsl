@@ -64,8 +64,15 @@ pub const MONITORINFO = extern struct {
     dwFlags: DWORD,
 };
 
+pub const COPYDATASTRUCT = extern struct {
+    dwData: usize,
+    cbData: u32,
+    lpData: ?*const anyopaque,
+};
+
 // Window messages
 pub const WM_CLOSE = 0x0010;
+pub const WM_COPYDATA = 0x004A;
 pub const WM_DESTROY = 0x0002;
 pub const WM_PAINT = 0x000F;
 pub const WM_SIZE = 0x0005;
@@ -108,6 +115,7 @@ pub extern "user32" fn GetMessageW(lpMsg: *MSG, hWnd: ?HWND, wMsgFilterMin: UINT
 pub extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) BOOL;
 pub extern "user32" fn DispatchMessageW(lpMsg: *const MSG) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) BOOL;
+pub extern "user32" fn SendMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostQuitMessage(nExitCode: c_int) callconv(.winapi) void;
 pub extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) HDC;
 pub extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(.winapi) BOOL;

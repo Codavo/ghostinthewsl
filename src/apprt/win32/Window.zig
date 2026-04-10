@@ -26,6 +26,24 @@ const BOOL = sys.BOOL;
 const UINT = sys.UINT;
 const DWORD = sys.DWORD;
 
+pub const CreateOptions = struct {
+    command: ?configpkg.Command = null,
+    working_directory: ?configpkg.WorkingDirectory = null,
+    title: ?[:0]const u8 = null,
+
+    pub const none: @This() = .{};
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.command) |cmd| cmd.deinit(alloc);
+        if (self.working_directory) |wd| switch (wd) {
+            .path => |path| alloc.free(path),
+            else => {},
+        };
+        if (self.title) |title| alloc.free(title);
+        self.* = .{};
+    }
+};
+
 /// Back-pointer to the owning App.
 app: *App,
 
@@ -56,7 +74,7 @@ const FullscreenState = struct {
 };
 
 /// Allocate and initialize a new Window. The caller owns the returned pointer.
-pub fn create(alloc: Allocator, app: *App) !*Window {
+pub fn create(alloc: Allocator, app: *App, opts: CreateOptions) !*Window {
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
 
@@ -70,7 +88,7 @@ pub fn create(alloc: Allocator, app: *App) !*Window {
     };
 
     // Create the top-level window
-    try self.createHwnd();
+    try self.createHwnd(opts.title);
     errdefer {
         if (self.hwnd) |h| {
             _ = sys.DestroyWindow(h);
@@ -90,7 +108,7 @@ pub fn create(alloc: Allocator, app: *App) !*Window {
     self.focused_surface = primary;
 
     // Initialize the CoreSurface for the primary surface
-    try self.initCoreSurface(primary);
+    try self.initCoreSurface(primary, opts);
 
     // Resize window to configured grid size and apply layout
     self.applyConfiguredWindowSize();
@@ -130,7 +148,7 @@ pub fn deinit(self: *Window) void {
     }
 }
 
-fn createHwnd(self: *Window) !void {
+fn createHwnd(self: *Window, title_override: ?[:0]const u8) !void {
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
     const hinstance = sys.GetModuleHandleW(null);
 
@@ -151,11 +169,15 @@ fn createHwnd(self: *Window) !void {
     };
     _ = sys.RegisterClassExW(&wc); // Ignore duplicate registrations
 
-    const title = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    const title = if (title_override) |title_utf8|
+        try std.unicode.utf8ToUtf16LeAllocZ(self.app.alloc, title_utf8)
+    else
+        null;
+    defer if (title) |v| self.app.alloc.free(v);
     self.hwnd = sys.CreateWindowExW(
         0,
         class_name,
-        title,
+        if (title) |v| v.ptr else std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
         sys.WS_OVERLAPPEDWINDOW,
         sys.CW_USEDEFAULT,
         sys.CW_USEDEFAULT,
@@ -172,7 +194,7 @@ fn createHwnd(self: *Window) !void {
     _ = sys.UpdateWindow(self.hwnd.?);
 }
 
-pub fn initCoreSurface(self: *Window, surface: *Surface) !void {
+pub fn initCoreSurface(self: *Window, surface: *Surface, opts: CreateOptions) !void {
     const alloc = self.app.alloc;
     const core = try alloc.create(CoreSurface);
     errdefer alloc.destroy(core);
@@ -182,6 +204,16 @@ pub fn initCoreSurface(self: *Window, surface: *Surface) !void {
 
     var config = try apprt.surface.newConfig(self.app.core_app, self.app.config, .window);
     defer config.deinit();
+
+    if (opts.command) |cmd| {
+        config.command = try cmd.clone(alloc);
+    }
+    if (opts.working_directory) |wd| {
+        config.@"working-directory" = try wd.clone(alloc);
+    }
+    if (opts.title) |title| {
+        config.title = try alloc.dupeZ(u8, title);
+    }
 
     try core.init(alloc, &config, self.app.core_app, self.app, surface);
     errdefer core.deinit();
@@ -237,7 +269,7 @@ pub fn newSplit(self: *Window, existing: *Surface, dir: apprt.action.SplitDirect
     new_surface.window = self;
     errdefer new_surface.deinit();
 
-    try self.initCoreSurface(new_surface);
+    try self.initCoreSurface(new_surface, .none);
     errdefer {
         if (new_surface.core_surface) |core| {
             core.deinit();

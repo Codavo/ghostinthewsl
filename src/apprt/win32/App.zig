@@ -37,7 +37,9 @@ const WM_SIZE = sys.WM_SIZE;
 const WM_PAINT = sys.WM_PAINT;
 const WM_KEYDOWN = sys.WM_KEYDOWN;
 const WM_CHAR = sys.WM_CHAR;
+const WM_COPYDATA = sys.WM_COPYDATA;
 const WM_WAKEUP = sys.WM_WAKEUP;
+const COPYDATASTRUCT = sys.COPYDATASTRUCT;
 
 // Additional externs not in sys.zig
 extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
@@ -107,6 +109,7 @@ const NIF_ICON: DWORD = 0x00000002;
 const NIF_TIP: DWORD = 0x00000004;
 const NIF_INFO: DWORD = 0x00000010;
 const NIIF_INFO: DWORD = 0x00000001;
+const IPC_COPYDATA_NEW_WINDOW_ARGS: usize = 1;
 
 const NOTIFYICONDATAW = extern struct {
     cbSize: DWORD,
@@ -158,6 +161,102 @@ command_palette_initialized: bool = false,
 /// Single-instance mutex handle.
 instance_mutex: ?*anyopaque = null,
 
+const NewWindowOptions = Window.CreateOptions;
+
+fn parseNewWindowArguments(alloc: Allocator, arguments: []const []const u8) !NewWindowOptions {
+    var opts: NewWindowOptions = .{};
+    errdefer opts.deinit(alloc);
+
+    var direct_args: std.ArrayList([:0]const u8) = .empty;
+    errdefer {
+        for (direct_args.items) |arg| alloc.free(arg);
+        direct_args.deinit(alloc);
+    }
+
+    var e_seen = false;
+    for (arguments) |arg| {
+        if (e_seen) {
+            try direct_args.append(alloc, try alloc.dupeZ(u8, arg));
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "-e")) {
+            e_seen = true;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--command=")) {
+            if (opts.command) |cmd| cmd.deinit(alloc);
+            var cmd: configpkg.Command = undefined;
+            try cmd.parseCLI(alloc, arg["--command=".len..]);
+            opts.command = cmd;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--working-directory=")) {
+            if (opts.working_directory) |wd| switch (wd) {
+                .path => |path| alloc.free(path),
+                else => {},
+            };
+            var wd: configpkg.WorkingDirectory = undefined;
+            try wd.parseCLI(alloc, arg["--working-directory=".len..]);
+            opts.working_directory = wd;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, arg, "--title=")) {
+            if (opts.title) |title| alloc.free(title);
+            opts.title = try alloc.dupeZ(u8, std.mem.trim(u8, arg["--title=".len..], &std.ascii.whitespace));
+            continue;
+        }
+    }
+
+    if (direct_args.items.len > 0) {
+        if (opts.command) |cmd| cmd.deinit(alloc);
+        opts.command = .{ .direct = try direct_args.toOwnedSlice(alloc) };
+    } else {
+        direct_args.deinit(alloc);
+    }
+
+    return opts;
+}
+
+fn deserializeNewWindowArguments(alloc: Allocator, payload: []const u8) ![][:0]const u8 {
+    var args: std.ArrayList([:0]const u8) = .empty;
+    errdefer {
+        for (args.items) |arg| alloc.free(arg);
+        args.deinit(alloc);
+    }
+
+    var i: usize = 0;
+    while (i < payload.len) {
+        const end = std.mem.indexOfScalarPos(u8, payload, i, 0) orelse break;
+        if (end == i) break;
+        try args.append(alloc, try alloc.dupeZ(u8, payload[i..end]));
+        i = end + 1;
+    }
+
+    return try args.toOwnedSlice(alloc);
+}
+
+fn serializeNewWindowArguments(alloc: Allocator, arguments: []const [:0]const u8) ![]u8 {
+    var len: usize = 1;
+    for (arguments) |arg| len += arg.len + 1;
+
+    const buf = try alloc.alloc(u8, len);
+    errdefer alloc.free(buf);
+
+    var i: usize = 0;
+    for (arguments) |arg| {
+        @memcpy(buf[i .. i + arg.len], arg);
+        i += arg.len;
+        buf[i] = 0;
+        i += 1;
+    }
+    buf[i] = 0;
+    return buf;
+}
+
 pub fn init(
     self: *App,
     core_app: *CoreApp,
@@ -198,7 +297,7 @@ pub fn init(
     }
 
     // Create the first window
-    const window = try Window.create(alloc, self);
+    const window = try Window.create(alloc, self, .none);
     try self.windows.append(alloc, window);
     self.focused_window = window;
 }
@@ -282,8 +381,8 @@ pub fn wakeup(self: *App) void {
 }
 
 /// Create a new top-level window.
-pub fn newWindow(self: *App) !void {
-    const window = try Window.create(self.alloc, self);
+pub fn newWindow(self: *App, opts: NewWindowOptions) !void {
+    const window = try Window.create(self.alloc, self, opts);
     try self.windows.append(self.alloc, window);
     self.focused_window = window;
 }
@@ -328,7 +427,7 @@ pub fn performAction(
             return true;
         },
         .new_window => {
-            self.newWindow() catch |err| {
+            self.newWindow(.none) catch |err| {
                 log.err("new_window failed: {}", .{err});
                 return false;
             };
@@ -730,15 +829,6 @@ pub fn performIpc(
                 .detect => {},
             }
 
-            if (value.arguments != null) {
-                try stderr.print(
-                    "Win32 IPC does not yet support passing command arguments to +new-window.\n",
-                    .{},
-                );
-                try stderr.flush();
-                return error.IPCFailed;
-            }
-
             const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
             const hwnd = sys.FindWindowW(class_name, null) orelse {
                 try stderr.print("No running Ghostty Win32 instance was found.\n", .{});
@@ -746,13 +836,35 @@ pub fn performIpc(
                 return error.IPCFailed;
             };
 
+            if (value.arguments) |arguments| {
+                const payload = try serializeNewWindowArguments(alloc, arguments);
+                defer alloc.free(payload);
+
+                const cds: COPYDATASTRUCT = .{
+                    .dwData = IPC_COPYDATA_NEW_WINDOW_ARGS,
+                    .cbData = @intCast(payload.len),
+                    .lpData = payload.ptr,
+                };
+
+                if (sys.SendMessageW(
+                    hwnd,
+                    WM_COPYDATA,
+                    0,
+                    @bitCast(@intFromPtr(&cds)),
+                ) == 0) {
+                    try stderr.print("Failed to send a new-window request with arguments to Ghostty.\n", .{});
+                    try stderr.flush();
+                    return error.IPCFailed;
+                }
+
+                return true;
+            }
+
             if (sys.PostMessageW(hwnd, sys.WM_APP_NEW_WINDOW, 0, 0) == 0) {
                 try stderr.print("Failed to send a new-window request to Ghostty.\n", .{});
                 try stderr.flush();
                 return error.IPCFailed;
             }
-
-            _ = alloc;
             return true;
         },
     }
@@ -884,6 +996,33 @@ fn getWindow(hwnd: HWND) ?*Window {
 
 pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
+        WM_COPYDATA => {
+            const window = getWindow(hwnd) orelse return 0;
+            const cds: *const COPYDATASTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (cds.dwData != IPC_COPYDATA_NEW_WINDOW_ARGS or cds.lpData == null) return 0;
+
+            const payload: []const u8 = @as([*]const u8, @ptrCast(cds.lpData.?))[0..cds.cbData];
+            const args = deserializeNewWindowArguments(window.app.alloc, payload) catch |err| {
+                log.err("failed to decode Win32 IPC args: {}", .{err});
+                return 0;
+            };
+            defer {
+                for (args) |arg| window.app.alloc.free(arg);
+                window.app.alloc.free(args);
+            }
+
+            var opts = parseNewWindowArguments(window.app.alloc, args) catch |err| {
+                log.err("failed to parse Win32 IPC args: {}", .{err});
+                return 0;
+            };
+            defer opts.deinit(window.app.alloc);
+
+            window.app.newWindow(opts) catch |err| {
+                log.err("new_window from WM_COPYDATA failed: {}", .{err});
+                return 0;
+            };
+            return 1;
+        },
         WM_CLOSE => {
             if (getWindow(hwnd)) |window| {
                 // Close the focused surface's core, which will trigger
@@ -939,7 +1078,7 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
         sys.WM_APP_NEW_WINDOW => {
             // Another instance requested that we open a new window.
             if (getWindow(hwnd)) |window| {
-                window.app.newWindow() catch |err| {
+                window.app.newWindow(.none) catch |err| {
                     log.err("new_window from IPC failed: {}", .{err});
                 };
             }
