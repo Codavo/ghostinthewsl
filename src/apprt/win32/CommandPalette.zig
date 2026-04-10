@@ -313,18 +313,28 @@ pub fn refilter(self: *CommandPalette) void {
     const u8_len = std.unicode.utf16LeToUtf8(&u8_buf, buf[0..len]) catch 0;
     self.filter(u8_buf[0..u8_len]) catch {};
 }
+extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn SetTextColor(hdc: ?*anyopaque, color: u32) callconv(.winapi) u32;
+extern "gdi32" fn SetBkColor(hdc: ?*anyopaque, color: u32) callconv(.winapi) u32;
+
+// Dark theme colors (COLORREF: 0x00BBGGRR)
+const BG_COLOR: u32 = 0x001E1E1E;
+const FG_COLOR: u32 = 0x00E0E0E0;
+var dark_brush: ?*anyopaque = null;
+
 var class_registered: bool = false;
 
 fn registerClass() !void {
     if (class_registered) return;
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyCommandPalette");
     const hinstance = sys.GetModuleHandleW(null);
+    if (dark_brush == null) dark_brush = CreateSolidBrush(BG_COLOR);
     var wc: sys.WNDCLASSEXW = std.mem.zeroes(sys.WNDCLASSEXW);
     wc.cbSize = @sizeOf(sys.WNDCLASSEXW);
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hinstance;
     wc.hCursor = sys.LoadCursorW(null, sys.IDC_ARROW);
-    wc.hbrBackground = @ptrFromInt(6); // COLOR_WINDOW + 1 (system default)
+    wc.hbrBackground = dark_brush;
     wc.lpszClassName = class_name;
     if (sys.RegisterClassExW(&wc) == 0) return error.Win32Error;
     class_registered = true;
@@ -336,8 +346,20 @@ fn getPalette(hwnd: HWND) ?*CommandPalette {
     return @ptrFromInt(@as(usize, @bitCast(ptr)));
 }
 
+const WM_CTLCOLOREDIT: UINT = 0x0133;
+const WM_CTLCOLORLISTBOX: UINT = 0x0134;
+const WM_CTLCOLORSTATIC: UINT = 0x0138;
+
 fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
     switch (msg) {
+        WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC => {
+            // wparam is the HDC; just reinterpret it as an opaque pointer.
+            const hdc: ?*anyopaque = @ptrFromInt(wparam);
+            _ = SetTextColor(hdc, FG_COLOR);
+            _ = SetBkColor(hdc, BG_COLOR);
+            const brush = dark_brush orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+            return @as(LRESULT, @intCast(@intFromPtr(brush)));
+        },
         WM_COMMAND => {
             const self = getPalette(hwnd) orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
             const ctl_id: u16 = @truncate(wparam & 0xFFFF);
