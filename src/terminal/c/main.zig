@@ -22,6 +22,7 @@ pub const kitty_graphics_placement_pixel_size = kitty_graphics.placement_pixel_s
 pub const kitty_graphics_placement_grid_size = kitty_graphics.placement_grid_size;
 pub const kitty_graphics_placement_viewport_pos = kitty_graphics.placement_viewport_pos;
 pub const kitty_graphics_placement_source_rect = kitty_graphics.placement_source_rect;
+pub const kitty_graphics_placement_render_info = kitty_graphics.placement_render_info;
 pub const types = @import("types.zig");
 pub const modes = @import("modes.zig");
 pub const osc = @import("osc.zig");
@@ -147,6 +148,7 @@ pub const row_get = row.get;
 pub const style_default = style.default_style;
 pub const style_is_default = style.style_is_default;
 
+pub const sys_log_stderr = sys.logStderr;
 pub const sys_set = sys.set;
 
 pub const terminal_new = terminal.new;

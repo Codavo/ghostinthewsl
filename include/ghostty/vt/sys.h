@@ -65,6 +65,45 @@ typedef struct {
 } GhosttySysImage;
 
 /**
+ * Log severity levels for the log callback.
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+    GHOSTTY_SYS_LOG_LEVEL_ERROR = 0,
+    GHOSTTY_SYS_LOG_LEVEL_WARNING = 1,
+    GHOSTTY_SYS_LOG_LEVEL_INFO = 2,
+    GHOSTTY_SYS_LOG_LEVEL_DEBUG = 3,
+    GHOSTTY_SYS_LOG_LEVEL_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttySysLogLevel;
+
+/**
+ * Callback type for logging.
+ *
+ * When installed, internal library log messages are delivered through
+ * this callback instead of being discarded. The embedder is responsible
+ * for formatting and routing log output.
+ *
+ * @p scope is the log scope name as UTF-8 bytes (e.g. "osc", "kitty").
+ * When the log is unscoped (default scope), @p scope_len is 0.
+ *
+ * All pointer arguments are only valid for the duration of the callback.
+ * The callback must be safe to call from any thread.
+ *
+ * @param userdata    The userdata pointer set via GHOSTTY_SYS_OPT_USERDATA
+ * @param level       The severity level of the log message
+ * @param scope       Pointer to the scope name bytes
+ * @param scope_len   Length of the scope name in bytes
+ * @param message     Pointer to the log message bytes
+ * @param message_len Length of the log message in bytes
+ */
+typedef void (*GhosttySysLogFn)(
+    void* userdata,
+    GhosttySysLogLevel level,
+    const uint8_t* scope,
+    size_t scope_len,
+    const uint8_t* message,
+    size_t message_len);
+
+/**
  * Callback type for PNG decoding.
  *
  * Decodes raw PNG data into RGBA pixels. The output pixel data must be
@@ -88,7 +127,7 @@ typedef bool (*GhosttySysDecodePngFn)(
 /**
  * System option identifiers for ghostty_sys_set().
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
     /**
      * Set the userdata pointer passed to all sys callbacks.
      *
@@ -106,6 +145,27 @@ typedef enum {
      * Input type: GhosttySysDecodePngFn (function pointer, or NULL)
      */
     GHOSTTY_SYS_OPT_DECODE_PNG = 1,
+
+    /**
+     * Set the log callback.
+     *
+     * When set, internal library log messages are delivered to this
+     * callback. When cleared (NULL value), log messages are silently
+     * discarded.
+     *
+     * Use ghostty_sys_log_stderr as a convenience callback that
+     * writes formatted messages to stderr.
+     *
+     * Which log levels are emitted depends on the build mode of the
+     * library and is not configurable at runtime. Debug builds emit
+     * all levels (debug and above). Release builds emit info and
+     * above; debug-level messages are compiled out entirely and will
+     * never reach the callback.
+     *
+     * Input type: GhosttySysLogFn (function pointer, or NULL)
+     */
+    GHOSTTY_SYS_OPT_LOG = 2,
+    GHOSTTY_SYS_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttySysOption;
 
 /**
@@ -123,6 +183,23 @@ typedef enum {
  */
 GHOSTTY_API GhosttyResult ghostty_sys_set(GhosttySysOption option,
                                            const void* value);
+
+/**
+ * Built-in log callback that writes to stderr.
+ *
+ * Formats each message as "[level](scope): message\n".
+ * Can be passed directly to ghostty_sys_set():
+ *
+ * @code
+ * ghostty_sys_set(GHOSTTY_SYS_OPT_LOG, &ghostty_sys_log_stderr);
+ * @endcode
+ */
+GHOSTTY_API void ghostty_sys_log_stderr(void* userdata,
+                                         GhosttySysLogLevel level,
+                                         const uint8_t* scope,
+                                         size_t scope_len,
+                                         const uint8_t* message,
+                                         size_t message_len);
 
 #ifdef __cplusplus
 }

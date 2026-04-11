@@ -91,27 +91,36 @@
     });
 
     packages =
-      forAllPlatforms (pkgs: {
-        # Deps are needed for environmental setup on macOS
-        deps = pkgs.callPackage ./build.zig.zon.nix {};
-      })
-      // forBuildablePlatforms (pkgs: rec {
-        ghostty-debug = pkgs.callPackage ./nix/package.nix (mkPkgArgs "Debug");
-        ghostty-releasesafe = pkgs.callPackage ./nix/package.nix (mkPkgArgs "ReleaseSafe");
-        ghostty-releasefast = pkgs.callPackage ./nix/package.nix (mkPkgArgs "ReleaseFast");
+      builtins.foldl'
+      lib.recursiveUpdate
+      {}
+      [
+        (
+          forAllPlatforms (pkgs: rec {
+            # Deps are needed for environmental setup on macOS
+            deps = pkgs.callPackage ./build.zig.zon.nix {};
 
-        ghostty = ghostty-releasefast;
-        default = ghostty;
+            libghostty-vt-debug = pkgs.callPackage ./nix/libghostty-vt.nix (mkPkgArgs "Debug");
+            libghostty-vt-releasesafe = pkgs.callPackage ./nix/libghostty-vt.nix (mkPkgArgs "ReleaseSafe");
+            libghostty-vt-releasefast = pkgs.callPackage ./nix/libghostty-vt.nix (mkPkgArgs "ReleaseFast");
+            libghostty-vt-debug-no-simd = pkgs.callPackage ./nix/libghostty-vt.nix ((mkPkgArgs "Debug") // {simd = false;});
+            libghostty-vt-releasesafe-no-simd = pkgs.callPackage ./nix/libghostty-vt.nix ((mkPkgArgs "ReleaseSafe") // {simd = false;});
+            libghostty-vt-releasefast-no-simd = pkgs.callPackage ./nix/libghostty-vt.nix ((mkPkgArgs "ReleaseFast") // {simd = false;});
 
-        libghostty-vt-debug = pkgs.callPackage ./nix/libghostty-vt.nix (mkPkgArgs "Debug");
-        libghostty-vt-releasesafe = pkgs.callPackage ./nix/libghostty-vt.nix (mkPkgArgs "ReleaseSafe");
-        libghostty-vt-releasefast = pkgs.callPackage ./nix/libghostty-vt.nix (mkPkgArgs "ReleaseFast");
-        libghostty-vt-debug-no-simd = pkgs.callPackage ./nix/libghostty-vt.nix ((mkPkgArgs "Debug") // {simd = false;});
-        libghostty-vt-releasesafe-no-simd = pkgs.callPackage ./nix/libghostty-vt.nix ((mkPkgArgs "ReleaseSafe") // {simd = false;});
-        libghostty-vt-releasefast-no-simd = pkgs.callPackage ./nix/libghostty-vt.nix ((mkPkgArgs "ReleaseFast") // {simd = false;});
+            libghostty-vt = libghostty-vt-releasefast;
+          })
+        )
+        (
+          forBuildablePlatforms (pkgs: rec {
+            ghostty-debug = pkgs.callPackage ./nix/package.nix (mkPkgArgs "Debug");
+            ghostty-releasesafe = pkgs.callPackage ./nix/package.nix (mkPkgArgs "ReleaseSafe");
+            ghostty-releasefast = pkgs.callPackage ./nix/package.nix (mkPkgArgs "ReleaseFast");
 
-        libghostty-vt = libghostty-vt-releasefast;
-      });
+            ghostty = ghostty-releasefast;
+            default = ghostty;
+          })
+        )
+      ];
 
     formatter = forAllPlatforms (pkgs: pkgs.alejandra);
 

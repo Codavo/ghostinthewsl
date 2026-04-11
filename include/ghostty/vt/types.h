@@ -7,6 +7,7 @@
 #ifndef GHOSTTY_VT_TYPES_H
 #define GHOSTTY_VT_TYPES_H
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -33,9 +34,44 @@
 #endif
 
 /**
+ * Enum int-sizing helpers.
+ *
+ * The Zig side backs all C enums with c_int, so the C declarations
+ * must use int as their underlying type to maintain ABI compatibility.
+ *
+ * C23 (detected via __STDC_VERSION__ >= 202311L) supports explicit
+ * enum underlying types with `enum : int { ... }`. For pre-C23
+ * compilers, which are free to choose any type that can represent
+ * all values (C11 §6.7.2.2), we add an INT_MAX sentinel as the last
+ * entry to force the compiler to use int.
+ *
+ * INT_MAX is used rather than a fixed constant like 0xFFFFFFFF
+ * because enum constants must have type int (which is signed).
+ * Values above INT_MAX overflow signed int and are a constraint
+ * violation in standard C; compilers that accept them interpret them
+ * as negative values via two's complement, which can collide with
+ * legitimate negative enum values.
+ *
+ * Usage:
+ * @code
+ * typedef enum GHOSTTY_ENUM_TYPED {
+ *     FOO_A = 0,
+ *     FOO_B = 1,
+ *     FOO_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+ * } Foo;
+ * @endcode
+ */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#define GHOSTTY_ENUM_TYPED : int
+#else
+#define GHOSTTY_ENUM_TYPED
+#endif
+#define GHOSTTY_ENUM_MAX_VALUE INT_MAX
+
+/**
  * Result codes for libghostty-vt operations.
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
     /** Operation completed successfully */
     GHOSTTY_SUCCESS = 0,
     /** Operation failed due to failed allocation */
@@ -46,6 +82,7 @@ typedef enum {
     GHOSTTY_OUT_OF_SPACE = -3,
     /** The requested value has no value */
     GHOSTTY_NO_VALUE = -4,
+    GHOSTTY_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyResult;
 
 /* ---- Opaque handles ---- */

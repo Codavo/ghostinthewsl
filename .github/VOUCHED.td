@@ -116,6 +116,7 @@ jparise
 juniqlim
 justonia
 karesansui-u
+kataokatsuki
 kawarimidoll
 kayleung
 kenvandine
@@ -153,6 +154,7 @@ mischief
 mitchellh
 miupa
 molechowski
+moonmao42
 mrconnorkenway
 mrmage
 mtak
@@ -166,6 +168,7 @@ noib3
 nwehg
 ocean6954
 oshdubh
+otomn
 paaloeye
 pan93412
 pangoraw

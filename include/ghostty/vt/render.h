@@ -86,7 +86,7 @@ extern "C" {
  *
  * @ingroup render
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Not dirty at all; rendering can be skipped. */
   GHOSTTY_RENDER_STATE_DIRTY_FALSE = 0,
 
@@ -95,6 +95,7 @@ typedef enum {
 
   /** Global state changed; renderer should redraw everything. */
   GHOSTTY_RENDER_STATE_DIRTY_FULL = 2,
+  GHOSTTY_RENDER_STATE_DIRTY_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateDirty;
 
 /**
@@ -102,7 +103,7 @@ typedef enum {
  *
  * @ingroup render
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Bar cursor (DECSCUSR 5, 6). */
   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR = 0,
 
@@ -114,6 +115,7 @@ typedef enum {
 
   /** Hollow block cursor. */
   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW = 3,
+  GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateCursorVisualStyle;
 
 /**
@@ -121,7 +123,7 @@ typedef enum {
  *
  * @ingroup render
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid / sentinel value. */
   GHOSTTY_RENDER_STATE_DATA_INVALID = 0,
 
@@ -185,6 +187,7 @@ typedef enum {
   /** Whether the cursor is on the tail of a wide character (bool).
    *  Only valid when CURSOR_VIEWPORT_HAS_VALUE is true. */
   GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_WIDE_TAIL = 17,
+  GHOSTTY_RENDER_STATE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateData;
 
 /**
@@ -192,9 +195,10 @@ typedef enum {
  *
  * @ingroup render
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Set dirty state (GhosttyRenderStateDirty). */
   GHOSTTY_RENDER_STATE_OPTION_DIRTY = 0,
+  GHOSTTY_RENDER_STATE_OPTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateOption;
 
 /**
@@ -202,7 +206,7 @@ typedef enum {
  *
  * @ingroup render
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid / sentinel value. */
   GHOSTTY_RENDER_STATE_ROW_DATA_INVALID = 0,
 
@@ -217,6 +221,7 @@ typedef enum {
    *  valid as long as the underlying render state is not updated. 
    *  It is unsafe to use cell data after updating the render state. */
   GHOSTTY_RENDER_STATE_ROW_DATA_CELLS = 3,
+  GHOSTTY_RENDER_STATE_ROW_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowData;
 
 /**
@@ -224,9 +229,10 @@ typedef enum {
  *
  * @ingroup render
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Set dirty state for the current row (bool). */
   GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY = 0,
+  GHOSTTY_RENDER_STATE_ROW_OPTION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowOption;
 
 /**
@@ -475,7 +481,7 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_new(
  *
  * @ingroup render
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid / sentinel value. */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_INVALID = 0,
 
@@ -509,6 +515,7 @@ typedef enum {
    *  color, in which case the caller should use whatever default foreground
    *  color it wants (e.g. the terminal foreground). */
   GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR = 6,
+  GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRenderStateRowCellsData;
 
 /**

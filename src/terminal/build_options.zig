@@ -75,15 +75,13 @@ pub const Options = struct {
         opts.addOption(bool, "tmux_control_mode", self.oniguruma);
 
         // Version information.
-        var buf: [1024]u8 = undefined;
         opts.addOption(
             []const u8,
             "version_string",
-            std.fmt.bufPrint(
-                &buf,
+            b.fmt(
                 "{f}",
                 .{self.version},
-            ) catch @panic("version string too long"),
+            ),
         );
         opts.addOption(usize, "version_major", self.version.major);
         opts.addOption(usize, "version_minor", self.version.minor);

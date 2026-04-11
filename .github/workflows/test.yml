@@ -99,6 +99,7 @@ jobs:
       - build-linux
       - build-linux-libghostty
       - build-nix
+      # - build-nix-macos
       - build-macos
       - build-macos-freetype
       - build-snap
@@ -164,7 +165,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -222,7 +223,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -258,7 +259,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -277,6 +278,11 @@ jobs:
       fail-fast: false
       matrix:
         dir: ${{ fromJSON(needs.list-examples.outputs.cmake) }}
+        exclude:
+          # Cross-compilation with zig cc requires a single-config
+          # generator (Makefiles/Ninja). The Windows CI uses Visual
+          # Studio which always uses MSVC and ignores CMAKE_C_COMPILER.
+          - dir: c-vt-cmake-cross
     name: Example ${{ matrix.dir }} (Windows)
     runs-on: namespace-profile-ghostty-windows
     timeout-minutes: 45
@@ -356,7 +362,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -394,7 +400,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -506,7 +512,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -540,7 +546,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -584,7 +590,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -661,7 +667,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -749,7 +755,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -778,7 +784,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -811,7 +817,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -838,28 +844,40 @@ jobs:
         run: nm result/bin/.ghostty-wrapped 2>&1 | grep -q 'main_ghostty.main'
 
       - name: Test ReleaseFast build of libghostty-vt
-        run: nix build .#libghostty-vt-releasefast
-
-      - name: Check to see if the library looks sane
-        run: nm result/lib/libghostty-vt.so.0.1.0 2>&1 | grep -q 'ghostty_terminal_new'
+        run: |
+          nix build .#libghostty-vt-releasefast
+          nix build .#libghostty-vt-releasefast.tests.sanity-check
+          nix build .#libghostty-vt-releasefast.tests.pkg-config
+          nix build .#libghostty-vt-releasefast.tests.build-with-shared
+          nix build .#libghostty-vt-releasefast.tests.build-with-static
+          nix build .#libghostty-vt-releasefast.tests.build-example-c-vt-build-info
 
       - name: Test ReleaseFast (no SIMD) build of libghostty-vt
-        run: nix build .#libghostty-vt-releasefast-no-simd
-
-      - name: Check to see if the library looks sane
-        run: nm result/lib/libghostty-vt.so.0.1.0 2>&1 | grep -q 'ghostty_terminal_new'
+        run: |
+          nix build .#libghostty-vt-releasefast-no-simd
+          nix build .#libghostty-vt-releasefast-no-simd.tests.sanity-check
+          nix build .#libghostty-vt-releasefast-no-simd.tests.pkg-config
+          nix build .#libghostty-vt-releasefast-no-simd.tests.build-with-shared
+          nix build .#libghostty-vt-releasefast-no-simd.tests.build-with-static
+          nix build .#libghostty-vt-releasefast-no-simd.tests.build-example-c-vt-build-info
 
       - name: Test Debug build of libghostty-vt
-        run: nix build .#libghostty-vt-debug
-
-      - name: Check to see if the library looks sane
-        run: nm result/lib/libghostty-vt.so.0.1.0 2>&1 | grep -q 'ghostty_terminal_new'
+        run: |
+          nix build .#libghostty-vt-debug
+          nix build .#libghostty-vt-debug.tests.sanity-check
+          nix build .#libghostty-vt-debug.tests.pkg-config
+          nix build .#libghostty-vt-debug.tests.build-with-shared
+          nix build .#libghostty-vt-debug.tests.build-with-static
+          nix build .#libghostty-vt-debug.tests.build-example-c-vt-build-info
 
       - name: Test Debug (no SIMD) build of libghostty-vt
-        run: nix build .#libghostty-vt-debug-no-simd
-
-      - name: Check to see if the library looks sane
-        run: nm result/lib/libghostty-vt.so.0.1.0 2>&1 | grep -q 'ghostty_terminal_new'
+        run: |
+          nix build .#libghostty-vt-debug-no-simd
+          nix build .#libghostty-vt-debug-no-simd.tests.sanity-check
+          nix build .#libghostty-vt-debug-no-simd.tests.pkg-config
+          nix build .#libghostty-vt-debug-no-simd.tests.build-with-shared
+          nix build .#libghostty-vt-debug-no-simd.tests.build-with-static
+          nix build .#libghostty-vt-debug-no-simd.tests.build-example-c-vt-build-info
 
   build-dist:
     runs-on: namespace-profile-ghostty-sm
@@ -881,7 +899,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -921,7 +939,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -980,6 +998,58 @@ jobs:
             --field source-artifact-id=${{ needs.build-dist.outputs.artifact-id }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # build-nix-macos:
+  #   runs-on: namespace-profile-ghostty-macos-tahoe
+  #   needs: test
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+  #     # Install Nix and use that to run our tests so our environment matches exactly.
+  #     - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
+  #       with:
+  #         nix_path: nixpkgs=channel:nixos-unstable
+  #     - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
+  #       with:
+  #         name: ghostty
+  #         authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+
+  #     - name: Test ReleaseFast build of libghostty-vt
+  #       run: |
+  #         nix build .#libghostty-vt-releasefast
+  #         nix build .#libghostty-vt-releasefast.tests.sanity-check
+  #         nix build .#libghostty-vt-releasefast.tests.pkg-config
+  #         nix build .#libghostty-vt-releasefast.tests.build-with-shared
+  #         nix build .#libghostty-vt-releasefast.tests.build-with-static
+  #         nix build .#libghostty-vt-releasefast.tests.build-example-c-vt-build-info
+
+  #     - name: Test ReleaseFast (no SIMD) build of libghostty-vt
+  #       run: |
+  #         nix build .#libghostty-vt-releasefast-no-simd
+  #         nix build .#libghostty-vt-releasefast-no-simd.tests.sanity-check
+  #         nix build .#libghostty-vt-releasefast-no-simd.tests.pkg-config
+  #         nix build .#libghostty-vt-releasefast-no-simd.tests.build-with-shared
+  #         nix build .#libghostty-vt-releasefast-no-simd.tests.build-with-static
+  #         nix build .#libghostty-vt-releasefast-no-simd.tests.build-example-c-vt-build-info
+
+  #     - name: Test Debug build of libghostty-vt
+  #       run: |
+  #         nix build .#libghostty-vt-debug
+  #         nix build .#libghostty-vt-debug.tests.sanity-check
+  #         nix build .#libghostty-vt-debug.tests.pkg-config
+  #         nix build .#libghostty-vt-debug.tests.build-with-shared
+  #         nix build .#libghostty-vt-debug.tests.build-with-static
+  #         nix build .#libghostty-vt-debug.tests.build-example-c-vt-build-info
+
+  #     - name: Test Debug (no SIMD) build of libghostty-vt
+  #       run: |
+  #         nix build .#libghostty-vt-debug-no-simd
+  #         nix build .#libghostty-vt-debug-no-simd.tests.sanity-check
+  #         nix build .#libghostty-vt-debug-no-simd.tests.pkg-config
+  #         nix build .#libghostty-vt-debug-no-simd.tests.build-with-shared
+  #         nix build .#libghostty-vt-debug-no-simd.tests.build-with-static
+  #         nix build .#libghostty-vt-debug-no-simd.tests.build-example-c-vt-build-info
 
   build-macos:
     runs-on: namespace-profile-ghostty-macos-tahoe
@@ -1114,7 +1184,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1151,7 +1221,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1186,7 +1256,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1234,7 +1304,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1269,7 +1339,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1359,7 +1429,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1390,7 +1460,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1432,7 +1502,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1463,7 +1533,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1493,7 +1563,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1551,7 +1621,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1579,7 +1649,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1607,7 +1677,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1640,7 +1710,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1668,7 +1738,7 @@ jobs:
           path: |
             /nix
             /zig
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1705,7 +1775,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17
@@ -1767,7 +1837,7 @@ jobs:
             /zig
 
       # Install Nix and use that to run our tests so our environment matches exactly.
-      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+      - uses: cachix/install-nix-action@616559265b40713947b9c190a8ff4b507b5df49b # v31.10.4
         with:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: cachix/cachix-action@1eb2ef646ac0255473d23a5907ad7b04ce94065c # v17

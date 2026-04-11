@@ -57,7 +57,7 @@ typedef uint64_t GhosttyRow;
  *
  * @ingroup screen
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** A single codepoint (may be zero for empty). */
   GHOSTTY_CELL_CONTENT_CODEPOINT = 0,
 
@@ -69,6 +69,7 @@ typedef enum {
 
   /** No text; background color as RGB. */
   GHOSTTY_CELL_CONTENT_BG_COLOR_RGB = 3,
+  GHOSTTY_CELL_CONTENT_TAG_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyCellContentTag;
 
 /**
@@ -78,7 +79,7 @@ typedef enum {
  *
  * @ingroup screen
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Not a wide character, cell width 1. */
   GHOSTTY_CELL_WIDE_NARROW = 0,
 
@@ -90,6 +91,7 @@ typedef enum {
 
   /** Spacer at end of soft-wrapped line for a wide character. */
   GHOSTTY_CELL_WIDE_SPACER_HEAD = 3,
+  GHOSTTY_CELL_WIDE_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyCellWide;
 
 /**
@@ -100,7 +102,7 @@ typedef enum {
  *
  * @ingroup screen
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Regular output content, such as command output. */
   GHOSTTY_CELL_SEMANTIC_OUTPUT = 0,
 
@@ -109,6 +111,7 @@ typedef enum {
 
   /** Content that is part of a shell prompt. */
   GHOSTTY_CELL_SEMANTIC_PROMPT = 2,
+  GHOSTTY_CELL_SEMANTIC_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyCellSemanticContent;
 
 /**
@@ -119,7 +122,7 @@ typedef enum {
  *
  * @ingroup screen
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid data type. Never results in any data extraction. */
   GHOSTTY_CELL_DATA_INVALID = 0,
 
@@ -201,6 +204,7 @@ typedef enum {
    * Output type: GhosttyColorRgb *
    */
   GHOSTTY_CELL_DATA_COLOR_RGB = 11,
+  GHOSTTY_CELL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyCellData;
 
 /**
@@ -211,7 +215,7 @@ typedef enum {
  *
  * @ingroup screen
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** No prompt cells in this row. */
   GHOSTTY_ROW_SEMANTIC_NONE = 0,
 
@@ -220,6 +224,7 @@ typedef enum {
 
   /** Prompt cells exist and this is a continuation line. */
   GHOSTTY_ROW_SEMANTIC_PROMPT_CONTINUATION = 2,
+  GHOSTTY_ROW_SEMANTIC_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRowSemanticPrompt;
 
 /**
@@ -230,7 +235,7 @@ typedef enum {
  *
  * @ingroup screen
  */
-typedef enum {
+typedef enum GHOSTTY_ENUM_TYPED {
   /** Invalid data type. Never results in any data extraction. */
   GHOSTTY_ROW_DATA_INVALID = 0,
 
@@ -289,6 +294,7 @@ typedef enum {
    * Output type: bool *
    */
   GHOSTTY_ROW_DATA_DIRTY = 8,
+  GHOSTTY_ROW_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyRowData;
 
 /**

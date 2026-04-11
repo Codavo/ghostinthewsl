@@ -329,8 +329,8 @@ pub fn build(b: *std.Build) !void {
         test_lib_vt_step.dependOn(&mod_vt_c_test_run.step);
     }
 
-    // Tests
-    {
+    // Tests (skip when building libghostty-vt)
+    if (!config.emit_lib_vt) {
         // Full unit tests
         const test_exe = b.addTest(.{
             .name = "ghostty-test",
