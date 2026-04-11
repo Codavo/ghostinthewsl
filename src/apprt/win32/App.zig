@@ -542,7 +542,14 @@ pub fn performAction(
             _ = MessageBeep(0xFFFFFFFF);
             return true;
         },
-        .progress_report => return false,
+        .progress_report => {
+            const surface = switch (target) {
+                .app => return false,
+                .surface => |core| core.rt_surface,
+            };
+            surface.setProgressReport(value);
+            return true;
+        },
         .desktop_notification => {
             const window = self.focused_window orelse return false;
             if (window.hwnd) |hwnd| self.showNotification(hwnd, value.title, value.body);

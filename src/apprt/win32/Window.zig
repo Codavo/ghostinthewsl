@@ -610,14 +610,14 @@ fn tabLeaves(tab: *TabState, buf: []*Surface) []const *Surface {
 fn hideTabSurfaces(_: *Window, tab: *TabState) void {
     var leaves: [64]*Surface = undefined;
     for (tabLeaves(tab, &leaves)) |surface| {
-        _ = sys.ShowWindow(surface.hwnd, SW_HIDE);
+        surface.setVisible(false);
     }
 }
 
 fn showTabSurfaces(_: *Window, tab: *TabState) void {
     var leaves: [64]*Surface = undefined;
     for (tabLeaves(tab, &leaves)) |surface| {
-        _ = sys.ShowWindow(surface.hwnd, sys.SW_SHOWNORMAL);
+        surface.setVisible(true);
     }
 }
 
@@ -916,6 +916,7 @@ pub fn relayout(self: *Window) void {
 }
 
 fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
+    surface.setLayoutRect(rect.x, rect.y, rect.w, rect.h);
     _ = sys.SetWindowPos(surface.hwnd, null, rect.x, rect.y, rect.w, rect.h, 0x0004);
 }
 
