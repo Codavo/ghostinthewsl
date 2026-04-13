@@ -735,6 +735,9 @@ fn closeTabAt(self: *Window, index: usize) void {
         // Rebind window state to the newly active tab before rebuilding the
         // tab control so any reentrant messages do not see a freed surface.
         self.loadActiveTabIntoWindow();
+        // The newly active tab's surfaces may have been hidden by a prior tab
+        // switch.  Make them visible now so the window is not blank.
+        self.showTabSurfaces(&self.tabs.items[self.current_tab]);
     }
 
     self.updateTabVisibility();
@@ -768,6 +771,9 @@ fn closeEmptyTabAt(self: *Window, index: usize) void {
         // Rebind window state to the newly active tab before rebuilding the
         // tab control so any reentrant messages do not see a freed surface.
         self.loadActiveTabIntoWindow();
+        // The newly active tab's surfaces may have been hidden by a prior tab
+        // switch.  Make them visible now so the window is not blank.
+        self.showTabSurfaces(&self.tabs.items[self.current_tab]);
     }
 
     self.updateTabVisibility();
