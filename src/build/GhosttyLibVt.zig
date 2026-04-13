@@ -339,6 +339,7 @@ fn combineArchives(
         }),
     });
     const run = b.addRunArtifact(tool);
+    run.addArg(b.graph.zig_exe);
     const output = run.addOutputFileArg("libghostty-vt.a");
     for (sources) |source| run.addFileArg(source);
 
