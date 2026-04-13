@@ -710,6 +710,9 @@ fn closeTabAt(self: *Window, index: usize) void {
 
     if (was_current and self.tree != null) {
         self.syncActiveTabFromWindow();
+        self.tree = null;
+        self.focused_surface = null;
+        self.surface_initialized = false;
     }
 
     var tab = self.tabs.orderedRemove(index);
