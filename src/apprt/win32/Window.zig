@@ -731,6 +731,12 @@ fn closeTabAt(self: *Window, index: usize) void {
         self.current_tab = if (self.current_tab == 0) 0 else self.current_tab - 1;
     }
 
+    if (was_current) {
+        // Rebind window state to the newly active tab before rebuilding the
+        // tab control so any reentrant messages do not see a freed surface.
+        self.loadActiveTabIntoWindow();
+    }
+
     self.updateTabVisibility();
     self.rebuildTabControl();
     self.activateTab(self.current_tab) catch {};
@@ -756,6 +762,12 @@ fn closeEmptyTabAt(self: *Window, index: usize) void {
 
     if (index < self.current_tab or self.current_tab >= self.tabs.items.len) {
         self.current_tab = if (self.current_tab == 0) 0 else self.current_tab - 1;
+    }
+
+    if (was_current) {
+        // Rebind window state to the newly active tab before rebuilding the
+        // tab control so any reentrant messages do not see a freed surface.
+        self.loadActiveTabIntoWindow();
     }
 
     self.updateTabVisibility();
