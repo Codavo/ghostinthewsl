@@ -1280,9 +1280,20 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
                 if (len > 0) {
                     const input = @import("../../input.zig");
+                    var consumed_mods: input.Mods = .{};
+
+                    // AltGr commonly appears as Ctrl+Alt on Windows. When it
+                    // produces text, treat those modifiers as consumed so the
+                    // core sees the resulting character rather than Ctrl+Alt.
+                    if (mods.ctrl and mods.alt) {
+                        consumed_mods.ctrl = true;
+                        consumed_mods.alt = true;
+                    }
+
                     const event = input.KeyEvent{
                         .action = .press,
                         .mods = mods,
+                        .consumed_mods = consumed_mods,
                         .utf8 = utf8_buf[0..len],
                     };
                     _ = core.keyCallback(event) catch |err| {
