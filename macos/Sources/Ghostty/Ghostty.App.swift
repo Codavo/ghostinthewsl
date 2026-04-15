@@ -662,8 +662,7 @@ extension Ghostty {
             case GHOSTTY_ACTION_QUIT_TIMER:
                 fallthrough
             case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
-                Ghostty.logger.info("known but unimplemented action action=\(action.tag.rawValue)")
-                return false
+                return showChildExited(app, target: target, v: action.action.child_exited)
             case GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD:
                 return copyTitleToClipboard(app, target: target)
             default:
@@ -1628,6 +1627,25 @@ extension Ghostty {
 
             default:
                 assertionFailure()
+                return false
+            }
+        }
+
+        private static func showChildExited(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_surface_message_childexited_s,
+        ) -> Bool {
+            switch target.tag {
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return false }
+                guard let surfaceView = self.surfaceView(from: surface) else { return false }
+                // We handle this when the window is visible and timetime_ms is greater than 0,
+                // which will rule out exit codes on launch
+                guard surfaceView.window != nil, v.timetime_ms > 0 else { return false }
+                surfaceView.setChildExitedMessage(.init(v))
+                return true
+            default:
                 return false
             }
         }

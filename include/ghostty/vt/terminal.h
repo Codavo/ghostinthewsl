@@ -1039,6 +1039,39 @@ GHOSTTY_API GhosttyResult ghostty_terminal_get(GhosttyTerminal terminal,
                                     void *out);
 
 /**
+ * Get multiple data fields from a terminal in a single call.
+ *
+ * This is an optimization over calling ghostty_terminal_get()
+ * repeatedly, particularly useful in environments with high per-call
+ * overhead such as FFI or Cgo.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ * The type of each values[i] pointer must match the output type
+ * documented for keys[i].
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param terminal The terminal handle (may be NULL)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_get_multi(GhosttyTerminal terminal,
+                                    size_t count,
+                                    const GhosttyTerminalData* keys,
+                                    void** values,
+                                    size_t* out_written);
+
+/**
  * Resolve a point in the terminal grid to a grid reference.
  *
  * Resolves the given point (which can be in active, viewport, screen,

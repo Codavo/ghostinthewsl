@@ -76,7 +76,6 @@ pub const PlacementData = enum(c_int) {
     columns = 10,
     rows = 11,
     z = 12,
-    info = 13,
 
     pub fn OutType(comptime self: PlacementData) type {
         return switch (self) {
@@ -93,7 +92,6 @@ pub const PlacementData = enum(c_int) {
             .rows,
             => u32,
             .z => i32,
-            .info => PlacementInfo,
         };
     }
 };
@@ -180,7 +178,6 @@ pub const ImageData = enum(c_int) {
     compression = 6,
     data_ptr = 7,
     data_len = 8,
-    info = 9,
 
     pub fn OutType(comptime self: ImageData) type {
         return switch (self) {
@@ -190,7 +187,6 @@ pub const ImageData = enum(c_int) {
             .compression => ImageCompression,
             .data_ptr => [*]const u8,
             .data_len => usize,
-            .info => ImageInfo,
         };
     }
 };
@@ -222,6 +218,29 @@ pub fn image_get(
     };
 }
 
+pub fn image_get_multi(
+    image_: ImageHandle,
+    count: usize,
+    keys: ?[*]const ImageData,
+    values: ?[*]?*anyopaque,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const k = keys orelse return .invalid_value;
+    const v = values orelse return .invalid_value;
+
+    for (0..count) |i| {
+        const result = image_get(image_, k[i], v[i]);
+        if (result != .success) {
+            if (out_written) |w| w.* = i;
+            return result;
+        }
+    }
+    if (out_written) |w| w.* = count;
+    return .success;
+}
+
 fn imageGetTyped(
     image_: ImageHandle,
     comptime data: ImageData,
@@ -239,17 +258,6 @@ fn imageGetTyped(
         .compression => out.* = image.compression,
         .data_ptr => out.* = image.data.ptr,
         .data_len => out.* = image.data.len,
-        .info => {
-            if (out.size < @sizeOf(ImageInfo)) return .invalid_value;
-            out.id = image.id;
-            out.number = image.number;
-            out.width = image.width;
-            out.height = image.height;
-            out.format = image.format;
-            out.compression = image.compression;
-            out.data_ptr = image.data.ptr;
-            out.data_len = image.data.len;
-        },
     }
 
     return .success;
@@ -343,6 +351,29 @@ pub fn placement_get(
     };
 }
 
+pub fn placement_get_multi(
+    iter_: PlacementIterator,
+    count: usize,
+    keys: ?[*]const PlacementData,
+    values: ?[*]?*anyopaque,
+    out_written: ?*usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const k = keys orelse return .invalid_value;
+    const v = values orelse return .invalid_value;
+
+    for (0..count) |i| {
+        const result = placement_get(iter_, k[i], v[i]);
+        if (result != .success) {
+            if (out_written) |w| w.* = i;
+            return result;
+        }
+    }
+    if (out_written) |w| w.* = count;
+    return .success;
+}
+
 fn placementGetTyped(
     iter_: PlacementIterator,
     comptime data: PlacementData,
@@ -368,21 +399,6 @@ fn placementGetTyped(
         .columns => out.* = val.columns,
         .rows => out.* = val.rows,
         .z => out.* = val.z,
-        .info => {
-            if (out.size < @sizeOf(PlacementInfo)) return .invalid_value;
-            out.image_id = key.image_id;
-            out.placement_id = key.placement_id.id;
-            out.is_virtual = val.location == .virtual;
-            out.x_offset = val.x_offset;
-            out.y_offset = val.y_offset;
-            out.source_x = val.source_x;
-            out.source_y = val.source_y;
-            out.source_width = val.source_width;
-            out.source_height = val.source_height;
-            out.columns = val.columns;
-            out.rows = val.rows;
-            out.z = val.z;
-        },
     }
 
     return .success;
@@ -507,36 +523,6 @@ pub fn placement_source_rect(
 
     return .success;
 }
-
-/// C: GhosttyKittyGraphicsImageInfo
-pub const ImageInfo = extern struct {
-    size: usize = @sizeOf(ImageInfo),
-    id: u32 = 0,
-    number: u32 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-    format: ImageFormat = .rgb,
-    compression: ImageCompression = .none,
-    data_ptr: [*]const u8 = @as([*]const u8, @ptrFromInt(1)),
-    data_len: usize = 0,
-};
-
-/// C: GhosttyKittyGraphicsPlacementInfo
-pub const PlacementInfo = extern struct {
-    size: usize = @sizeOf(PlacementInfo),
-    image_id: u32 = 0,
-    placement_id: u32 = 0,
-    is_virtual: bool = false,
-    x_offset: u32 = 0,
-    y_offset: u32 = 0,
-    source_x: u32 = 0,
-    source_y: u32 = 0,
-    source_width: u32 = 0,
-    source_height: u32 = 0,
-    columns: u32 = 0,
-    rows: u32 = 0,
-    z: i32 = 0,
-};
 
 /// C: GhosttyKittyGraphicsPlacementRenderInfo
 pub const PlacementRenderInfo = extern struct {
@@ -1523,83 +1509,6 @@ test "image_get on null returns invalid_value" {
     try testing.expectEqual(Result.invalid_value, image_get(null, .id, @ptrCast(&id)));
 }
 
-test "image_get info returns all fields" {
-    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
-
-    var t: terminal_c.Terminal = null;
-    try testing.expectEqual(Result.success, terminal_c.new(
-        &lib.alloc.test_allocator,
-        &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
-    ));
-    defer terminal_c.free(t);
-    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
-
-    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2;////////\x1b\\";
-    terminal_c.vt_write(t, cmd.ptr, cmd.len);
-
-    var graphics: KittyGraphics = undefined;
-    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
-    const img = image_get_handle(graphics, 1);
-    try testing.expect(img != null);
-
-    var info: ImageInfo = .{};
-    try testing.expectEqual(Result.success, image_get(img, .info, @ptrCast(&info)));
-    try testing.expectEqual(1, info.id);
-    try testing.expectEqual(1, info.width);
-    try testing.expectEqual(2, info.height);
-    try testing.expectEqual(ImageFormat.rgb, info.format);
-    try testing.expectEqual(ImageCompression.none, info.compression);
-    try testing.expectEqual(6, info.data_len);
-}
-
-test "image_get info null returns invalid_value" {
-    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
-
-    var info: ImageInfo = .{};
-    try testing.expectEqual(Result.invalid_value, image_get(null, .info, @ptrCast(&info)));
-}
-
-test "placement_get info returns all fields" {
-    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
-
-    var t: terminal_c.Terminal = null;
-    try testing.expectEqual(Result.success, terminal_c.new(
-        &lib.alloc.test_allocator,
-        &t,
-        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
-    ));
-    defer terminal_c.free(t);
-    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
-
-    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,c=10,r=1;////////\x1b\\";
-    terminal_c.vt_write(t, cmd.ptr, cmd.len);
-
-    var graphics: KittyGraphics = undefined;
-    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
-
-    var iter: PlacementIterator = null;
-    try testing.expectEqual(Result.success, placement_iterator_new(&lib.alloc.test_allocator, &iter));
-    defer placement_iterator_free(iter);
-    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
-    try testing.expect(placement_iterator_next(iter));
-
-    var info: PlacementInfo = .{};
-    try testing.expectEqual(Result.success, placement_get(iter, .info, @ptrCast(&info)));
-    try testing.expectEqual(1, info.image_id);
-    try testing.expectEqual(1, info.placement_id);
-    try testing.expect(!info.is_virtual);
-    try testing.expectEqual(10, info.columns);
-    try testing.expectEqual(1, info.rows);
-}
-
-test "placement_get info null returns invalid_value" {
-    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
-
-    var info: PlacementInfo = .{};
-    try testing.expectEqual(Result.invalid_value, placement_get(null, .info, @ptrCast(&info)));
-}
-
 test "placement_render_info returns all fields" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
@@ -1686,4 +1595,116 @@ test "placement_render_info null returns invalid_value" {
 
     var ri: PlacementRenderInfo = .{};
     try testing.expectEqual(Result.invalid_value, placement_render_info(null, null, null, &ri));
+}
+
+test "image_get_multi success" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
+
+    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2;////////\x1b\\";
+    terminal_c.vt_write(t, cmd.ptr, cmd.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    const img = image_get_handle(graphics, 1);
+    try testing.expect(img != null);
+
+    var id: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var written: usize = 0;
+
+    const keys = [_]ImageData{ .id, .width, .height };
+    var values = [_]?*anyopaque{ @ptrCast(&id), @ptrCast(&width), @ptrCast(&height) };
+    try testing.expectEqual(Result.success, image_get_multi(img, keys.len, &keys, &values, &written));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(1, id);
+    try testing.expectEqual(1, width);
+    try testing.expectEqual(2, height);
+}
+
+test "image_get_multi error sets out_written" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var written: usize = 99;
+
+    const keys = [_]ImageData{ .id, .invalid };
+    var values = [_]?*anyopaque{ @ptrCast(&id), @ptrCast(&id) };
+    try testing.expectEqual(Result.invalid_value, image_get_multi(null, keys.len, &keys, &values, &written));
+    try testing.expectEqual(0, written);
+}
+
+test "image_get_multi null keys returns invalid_value" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var values = [_]?*anyopaque{@ptrCast(&id)};
+    try testing.expectEqual(Result.invalid_value, image_get_multi(null, 1, null, &values, null));
+}
+
+test "placement_get_multi success" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
+
+    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,c=10,r=1;////////\x1b\\";
+    terminal_c.vt_write(t, cmd.ptr, cmd.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(&lib.alloc.test_allocator, &iter));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+    try testing.expect(placement_iterator_next(iter));
+
+    var image_id: u32 = 0;
+    var columns: u32 = 0;
+    var z: i32 = 99;
+    var written: usize = 0;
+
+    const keys = [_]PlacementData{ .image_id, .columns, .z };
+    var values = [_]?*anyopaque{ @ptrCast(&image_id), @ptrCast(&columns), @ptrCast(&z) };
+    try testing.expectEqual(Result.success, placement_get_multi(iter, keys.len, &keys, &values, &written));
+    try testing.expectEqual(keys.len, written);
+    try testing.expectEqual(1, image_id);
+    try testing.expectEqual(10, columns);
+    try testing.expectEqual(0, z);
+}
+
+test "placement_get_multi error sets out_written" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var written: usize = 99;
+
+    const keys = [_]PlacementData{ .image_id, .invalid };
+    var values = [_]?*anyopaque{ @ptrCast(&id), @ptrCast(&id) };
+    try testing.expectEqual(Result.invalid_value, placement_get_multi(null, keys.len, &keys, &values, &written));
+    try testing.expectEqual(0, written);
+}
+
+test "placement_get_multi null keys returns invalid_value" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var id: u32 = 0;
+    var values = [_]?*anyopaque{@ptrCast(&id)};
+    try testing.expectEqual(Result.invalid_value, placement_get_multi(null, 1, null, &values, null));
 }

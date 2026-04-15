@@ -20,6 +20,7 @@
 # "!denounce" or "!denounce [username]" on a discussion.
 00-kat
 04cb
+0xdvc
 aalhendi
 abdurrahmanski
 abudvytis
@@ -100,6 +101,7 @@ hqnna
 hulet
 i999rri
 icodesign
+illiakrauchanka
 j0hnm4r5
 jacobsandlund
 jake-stewart

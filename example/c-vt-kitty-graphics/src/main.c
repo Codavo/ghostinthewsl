@@ -145,14 +145,15 @@ int main() {
     bool is_virtual = false;
     int32_t z = 0;
 
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID, &image_id);
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID, &placement_id);
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL, &is_virtual);
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z, &z);
+    ghostty_kitty_graphics_placement_get_multi(iter, 4,
+        (GhosttyKittyGraphicsPlacementData[]){
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z,
+        },
+        (void*[]){ &image_id, &placement_id, &is_virtual, &z },
+        NULL);
 
     printf("  placement #%d: image_id=%u placement_id=%u virtual=%s z=%d\n",
            placement_count, image_id, placement_id,
@@ -170,11 +171,16 @@ int main() {
     GhosttyKittyImageFormat format = 0;
     size_t data_len = 0;
 
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_NUMBER, &number);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &width);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &height);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &format);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &data_len);
+    ghostty_kitty_graphics_image_get_multi(image, 5,
+        (GhosttyKittyGraphicsImageData[]){
+            GHOSTTY_KITTY_IMAGE_DATA_NUMBER,
+            GHOSTTY_KITTY_IMAGE_DATA_WIDTH,
+            GHOSTTY_KITTY_IMAGE_DATA_HEIGHT,
+            GHOSTTY_KITTY_IMAGE_DATA_FORMAT,
+            GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN,
+        },
+        (void*[]){ &number, &width, &height, &format, &data_len },
+        NULL);
 
     printf("    image: number=%u size=%ux%u format=%d data_len=%zu\n",
            number, width, height, format, data_len);

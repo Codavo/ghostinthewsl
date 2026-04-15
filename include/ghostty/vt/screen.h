@@ -314,8 +314,35 @@ typedef enum GHOSTTY_ENUM_TYPED {
  * @ingroup screen
  */
 GHOSTTY_API GhosttyResult ghostty_cell_get(GhosttyCell cell,
-                               GhosttyCellData data,
-                               void *out);
+                                GhosttyCellData data,
+                                void *out);
+
+/**
+ * Get multiple data fields from a cell in a single call.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param cell The cell value
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup screen
+ */
+GHOSTTY_API GhosttyResult ghostty_cell_get_multi(GhosttyCell cell,
+                                     size_t count,
+                                     const GhosttyCellData* keys,
+                                     void** values,
+                                     size_t* out_written);
 
 /**
  * Get data from a row.
@@ -334,8 +361,35 @@ GHOSTTY_API GhosttyResult ghostty_cell_get(GhosttyCell cell,
  * @ingroup screen
  */
 GHOSTTY_API GhosttyResult ghostty_row_get(GhosttyRow row,
-                              GhosttyRowData data,
-                              void *out);
+                               GhosttyRowData data,
+                               void *out);
+
+/**
+ * Get multiple data fields from a row in a single call.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param row The row value
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup screen
+ */
+GHOSTTY_API GhosttyResult ghostty_row_get_multi(GhosttyRow row,
+                                    size_t count,
+                                    const GhosttyRowData* keys,
+                                    void** values,
+                                    size_t* out_written);
 
 /** @} */
 

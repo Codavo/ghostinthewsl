@@ -215,17 +215,6 @@ typedef enum GHOSTTY_ENUM_TYPED {
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
 
-  /**
-   * All placement metadata as a sized struct.
-   *
-   * This is an optimization over querying each field individually,
-   * particularly useful in environments with high per-call overhead
-   * such as FFI or Cgo.
-   *
-   * Output type: GhosttyKittyGraphicsPlacementInfo *
-   * (initialize with GHOSTTY_INIT_SIZED)
-   */
-  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_INFO = 13,
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
 
@@ -354,95 +343,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
    */
   GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN = 8,
 
-  /**
-   * All image metadata as a sized struct.
-   *
-   * This is an optimization over querying each field individually,
-   * particularly useful in environments with high per-call overhead
-   * such as FFI or Cgo.
-   *
-   * Output type: GhosttyKittyGraphicsImageInfo *
-   * (initialize with GHOSTTY_INIT_SIZED)
-   */
-  GHOSTTY_KITTY_IMAGE_DATA_INFO = 9,
   GHOSTTY_KITTY_IMAGE_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsImageData;
-
-/**
- * All image metadata in a single sized struct.
- *
- * Returned by ghostty_kitty_graphics_image_get() with
- * GHOSTTY_KITTY_IMAGE_DATA_INFO. This is an optimization over
- * querying each field individually, particularly useful in
- * environments with high per-call overhead such as FFI or Cgo.
- *
- * This struct uses the sized-struct ABI pattern. Initialize with
- * GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsImageInfo).
- *
- * @ingroup kitty_graphics
- */
-typedef struct {
-  /** Size of this struct in bytes. Must be set to sizeof(GhosttyKittyGraphicsImageInfo). */
-  size_t size;
-  /** The image ID. */
-  uint32_t id;
-  /** The image number. */
-  uint32_t number;
-  /** Image width in pixels. */
-  uint32_t width;
-  /** Image height in pixels. */
-  uint32_t height;
-  /** Pixel format of the image. */
-  GhosttyKittyImageFormat format;
-  /** Compression of the image. */
-  GhosttyKittyImageCompression compression;
-  /** Borrowed pointer to the raw pixel data. */
-  const uint8_t* data_ptr;
-  /** Length of the raw pixel data in bytes. */
-  size_t data_len;
-} GhosttyKittyGraphicsImageInfo;
-
-/**
- * All placement metadata in a single sized struct.
- *
- * Returned by ghostty_kitty_graphics_placement_get() with
- * GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_INFO. This is an optimization
- * over querying each field individually, particularly useful in
- * environments with high per-call overhead such as FFI or Cgo.
- *
- * This struct uses the sized-struct ABI pattern. Initialize with
- * GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsPlacementInfo).
- *
- * @ingroup kitty_graphics
- */
-typedef struct {
-  /** Size of this struct in bytes. Must be set to sizeof(GhosttyKittyGraphicsPlacementInfo). */
-  size_t size;
-  /** The image ID this placement belongs to. */
-  uint32_t image_id;
-  /** The placement ID. */
-  uint32_t placement_id;
-  /** Whether this is a virtual placement (unicode placeholder). */
-  bool is_virtual;
-  /** Pixel offset from the left edge of the cell. */
-  uint32_t x_offset;
-  /** Pixel offset from the top edge of the cell. */
-  uint32_t y_offset;
-  /** Source rectangle x origin in pixels. */
-  uint32_t source_x;
-  /** Source rectangle y origin in pixels. */
-  uint32_t source_y;
-  /** Source rectangle width in pixels (0 = full image width). */
-  uint32_t source_width;
-  /** Source rectangle height in pixels (0 = full image height). */
-  uint32_t source_height;
-  /** Number of columns this placement occupies. */
-  uint32_t columns;
-  /** Number of rows this placement occupies. */
-  uint32_t rows;
-  /** Z-index for this placement. */
-  int32_t z;
-} GhosttyKittyGraphicsPlacementInfo;
 
 /**
  * Combined rendering geometry for a placement in a single sized struct.
@@ -543,6 +445,40 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_get(
     void* out);
 
 /**
+ * Get multiple data fields from a Kitty graphics image in a single call.
+ *
+ * This is an optimization over calling ghostty_kitty_graphics_image_get()
+ * repeatedly, particularly useful in environments with high per-call
+ * overhead such as FFI or Cgo.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ * The type of each values[i] pointer must match the output type
+ * documented for keys[i].
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param image The image handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_get_multi(
+    GhosttyKittyGraphicsImage image,
+    size_t count,
+    const GhosttyKittyGraphicsImageData* keys,
+    void** values,
+    size_t* out_written);
+
+/**
  * Create a new placement iterator instance.
  *
  * All fields except the allocator are left undefined until populated
@@ -626,6 +562,40 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_get(
     GhosttyKittyGraphicsPlacementIterator iterator,
     GhosttyKittyGraphicsPlacementData data,
     void* out);
+
+/**
+ * Get multiple data fields from the current placement in a single call.
+ *
+ * This is an optimization over calling ghostty_kitty_graphics_placement_get()
+ * repeatedly, particularly useful in environments with high per-call
+ * overhead such as FFI or Cgo.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ * The type of each values[i] pointer must match the output type
+ * documented for keys[i].
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param iterator The iterator handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_get_multi(
+    GhosttyKittyGraphicsPlacementIterator iterator,
+    size_t count,
+    const GhosttyKittyGraphicsPlacementData* keys,
+    void** values,
+    size_t* out_written);
 
 /**
  * Compute the grid rectangle occupied by the current placement.

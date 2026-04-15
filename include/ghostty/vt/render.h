@@ -331,8 +331,36 @@ GHOSTTY_API GhosttyResult ghostty_render_state_update(GhosttyRenderState state,
  * @ingroup render
  */
 GHOSTTY_API GhosttyResult ghostty_render_state_get(GhosttyRenderState state,
-                                       GhosttyRenderStateData data,
-                                       void* out);
+                                        GhosttyRenderStateData data,
+                                        void* out);
+
+/**
+ * Get multiple data fields from a render state in a single call.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param state The render state handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_get_multi(
+    GhosttyRenderState state,
+    size_t count,
+    const GhosttyRenderStateData* keys,
+    void** values,
+    size_t* out_written);
 
 /**
  * Set an option on a render state.
@@ -432,6 +460,34 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_get(
     GhosttyRenderStateRowIterator iterator,
     GhosttyRenderStateRowData data,
     void* out);
+
+/**
+ * Get multiple data fields from the current row in a single call.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param iterator The iterator handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_row_get_multi(
+    GhosttyRenderStateRowIterator iterator,
+    size_t count,
+    const GhosttyRenderStateRowData* keys,
+    void** values,
+    size_t* out_written);
 
 /**
  * Set an option on the current row in a render-state row iterator.
@@ -570,6 +626,34 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_get(
     GhosttyRenderStateRowCells cells,
     GhosttyRenderStateRowCellsData data,
     void* out);
+
+/**
+ * Get multiple data fields from the current cell in a single call.
+ *
+ * Each element in the keys array specifies a data kind, and the
+ * corresponding element in the values array receives the result.
+ *
+ * Processing stops at the first error; on success out_written
+ * is set to count, on error it is set to the index of the
+ * failing key (i.e. the number of values successfully written).
+ *
+ * @param cells The row cells handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param count Number of key/value pairs
+ * @param keys Array of data kinds to query
+ * @param values Array of output pointers (types must match each key's
+ *               documented output type)
+ * @param[out] out_written On return, receives the number of values
+ *             successfully written (may be NULL)
+ * @return GHOSTTY_SUCCESS if all queries succeed
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_get_multi(
+    GhosttyRenderStateRowCells cells,
+    size_t count,
+    const GhosttyRenderStateRowCellsData* keys,
+    void** values,
+    size_t* out_written);
 
 /**
  * Free a row cells instance.

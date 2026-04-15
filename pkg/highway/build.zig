@@ -21,14 +21,6 @@ pub fn build(b: *std.Build) !void {
         .linkage = .static,
     });
     lib.linkLibC();
-    // On MSVC, we must not use linkLibCpp because Zig unconditionally
-    // passes -nostdinc++ and then adds its bundled libc++/libc++abi
-    // include paths, which conflict with MSVC's own C++ runtime headers.
-    // The MSVC SDK include directories (added via linkLibC) contain
-    // both C and C++ headers, so linkLibCpp is not needed.
-    if (target.result.abi != .msvc) {
-        lib.linkLibCpp();
-    }
     if (upstream_) |upstream| {
         lib.addIncludePath(upstream.path(""));
         module.addIncludePath(upstream.path(""));
@@ -47,6 +39,10 @@ pub fn build(b: *std.Build) !void {
     var flags: std.ArrayList([]const u8) = .empty;
     defer flags.deinit(b.allocator);
     try flags.appendSlice(b.allocator, &.{
+        // Highway can avoid libc++ entirely as long as all users compile
+        // against the headers with the same define.
+        "-DHWY_NO_LIBCXX",
+
         // Avoid changing binaries based on the current time and date.
         "-Wno-builtin-macro-redefined",
         "-D__DATE__=\"redacted\"",
@@ -103,13 +99,11 @@ pub fn build(b: *std.Build) !void {
             .root = upstream.path(""),
             .flags = flags.items,
             .files = &.{
-                "hwy/abort.cc",
-                "hwy/aligned_allocator.cc",
-                "hwy/nanobenchmark.cc",
+                // These provide the runtime target selection used by
+                // HWY_DYNAMIC_DISPATCH. The benchmark, timer, print, and
+                // aligned allocator support files are unused by Ghostty.
                 "hwy/per_target.cc",
-                "hwy/print.cc",
                 "hwy/targets.cc",
-                "hwy/timer.cc",
             },
         });
         lib.installHeadersDirectory(

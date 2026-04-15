@@ -157,7 +157,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         scheduledWorkItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             defer { self.pendingInitialPresentation = nil }
-            guard scheduledWorkItem?.isCancelled == false else { return }
+            guard pendingInitialPresentation?.isCancelled == false else { return }
             block()
         }
 

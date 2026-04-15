@@ -7,15 +7,9 @@ import GhosttyKit
 
 extension Ghostty {
     /// The NSView implementation for a terminal surface.
-    class SurfaceView: OSView, ObservableObject, Codable, Identifiable {
-        typealias ID = UUID
-
-        /// Unique ID per surface
-        let id: UUID
-
+    class SurfaceView: OSSurfaceView, Codable, Identifiable {
         // The current title of the surface as defined by the pty. This can be
-        // changed with escape codes. This is public because the callbacks go
-        // to the app level and it is set from there.
+        // changed with escape codes.
         @Published private(set) var title: String = "" {
             didSet {
                 if !title.isEmpty {
@@ -25,28 +19,8 @@ extension Ghostty {
             }
         }
 
-        // The current pwd of the surface as defined by the pty. This can be
-        // changed with escape codes.
-        @Published var pwd: String?
-
-        // The cell size of this surface. This is set by the core when the
-        // surface is first created and any time the cell size changes (i.e.
-        // when the font size changes). This is used to allow windows to be
-        // resized in discrete steps of a single cell.
-        @Published var cellSize: NSSize = .zero
-
-        // The health state of the surface. This currently only reflects the
-        // renderer health. In the future we may want to make this an enum.
-        @Published var healthy: Bool = true
-
-        // Any error while initializing the surface.
-        @Published var error: Error?
-
-        // The hovered URL string
-        @Published var hoverUrl: String?
-
         // The progress report (if any)
-        @Published var progressReport: Action.ProgressReport? {
+        override var progressReport: Action.ProgressReport? {
             didSet {
                 // Cancel any existing timer
                 progressReportTimer?.invalidate()
@@ -65,11 +39,8 @@ extension Ghostty {
         // The currently active key sequence. The sequence is not active if this is empty.
         @Published var keySequence: [KeyboardShortcut] = []
 
-        // The currently active key tables. Empty if no tables are active.
-        @Published var keyTables: [String] = []
-
         // The current search state. When non-nil, the search overlay should be shown.
-        @Published var searchState: SearchState? {
+        override var searchState: SearchState? {
             didSet {
                 if let searchState {
                     // I'm not a Combine expert so if there is a better way to do this I'm
@@ -105,14 +76,6 @@ extension Ghostty {
         // Cancellable for search state needle changes
         private var searchNeedleCancellable: AnyCancellable?
 
-        // The time this surface last became focused. This is a ContinuousClock.Instant
-        // on supported platforms.
-        @Published var focusInstant: ContinuousClock.Instant?
-
-        // Returns sizing information for the surface. This is the raw C
-        // structure because I'm lazy.
-        @Published var surfaceSize: ghostty_surface_size_s?
-
         // Whether the pointer should be visible or not
         @Published private(set) var pointerStyle: CursorStyle = .horizontalText
 
@@ -135,12 +98,6 @@ extension Ghostty {
 
         /// True when the bell is active. This is set inactive on focus or event.
         @Published private(set) var bell: Bool = false
-
-        /// True when the surface is in readonly mode.
-        @Published private(set) var readonly: Bool = false
-
-        /// True when the surface should show a highlight effect (e.g., when presented via goto_split).
-        @Published private(set) var highlighted: Bool = false
 
         // An initial size to request for a window. This will only affect
         // then the view is moved to a new window.
@@ -207,7 +164,7 @@ extension Ghostty {
         private(set) var surfaceModel: Ghostty.Surface?
 
         /// Returns the underlying C value for the surface. See "note" on surfaceModel.
-        var surface: ghostty_surface_t? {
+        override var surface: ghostty_surface_t? {
             surfaceModel?.unsafeCValue
         }
         /// Current scrollbar state, cached here for persistence across rebuilds
@@ -255,7 +212,6 @@ extension Ghostty {
 
         init(_ app: ghostty_app_t, baseConfig: SurfaceConfiguration? = nil, uuid: UUID? = nil) {
             self.markedText = NSMutableAttributedString()
-            self.id = uuid ?? .init()
 
             // Our initial config always is our application wide config.
             if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
@@ -273,7 +229,7 @@ extension Ghostty {
             // Initialize with some default frame size. The important thing is that this
             // is non-zero so that our layer bounds are non-zero so that our renderer
             // can do SOMETHING.
-            super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+            super.init(id: uuid, frame: NSRect(x: 0, y: 0, width: 800, height: 600))
 
             // Our cache of screen data
             cachedScreenContents = .init(duration: .milliseconds(500)) { [weak self] in
@@ -364,11 +320,6 @@ extension Ghostty {
                 object: self)
             center.addObserver(
                 self,
-                selector: #selector(ghosttyDidChangeReadonly(_:)),
-                name: .ghosttyDidChangeReadonly,
-                object: self)
-            center.addObserver(
-                self,
                 selector: #selector(windowDidChangeScreen),
                 name: NSWindow.didChangeScreenNotification,
                 object: nil)
@@ -438,7 +389,7 @@ extension Ghostty {
             progressReportTimer?.invalidate()
         }
 
-        func focusDidChange(_ focused: Bool) {
+        override func focusDidChange(_ focused: Bool) {
             guard let surface = self.surface else { return }
             guard self.focused != focused else { return }
             self.focused = focused
@@ -475,7 +426,7 @@ extension Ghostty {
             }
         }
 
-        func sizeDidChange(_ size: CGSize) {
+        override func sizeDidChange(_ size: CGSize) {
             // Ghostty wants to know the actual framebuffer size... It is very important
             // here that we use "size" and NOT the view frame. If we're in the middle of
             // an animation (i.e. a fullscreen animation), the frame will not yet be updated.
@@ -783,11 +734,6 @@ extension Ghostty {
         @objc private func ghosttyBellDidRing(_ notification: SwiftUI.Notification) {
             // Bell state goes to true
             bell = true
-        }
-
-        @objc private func ghosttyDidChangeReadonly(_ notification: SwiftUI.Notification) {
-            guard let value = notification.userInfo?[SwiftUI.Notification.Name.ReadonlyKey] as? Bool else { return }
-            readonly = value
         }
 
         @objc private func windowDidChangeScreen(notification: SwiftUI.Notification) {
@@ -1627,14 +1573,6 @@ extension Ghostty {
             }
         }
 
-        /// Triggers a brief highlight animation on this surface.
-        func highlight() {
-            highlighted = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                self?.highlighted = false
-            }
-        }
-
         @IBAction func splitRight(_ sender: Any) {
             guard let surface = self.surface else { return }
             ghostty_surface_split(surface, GHOSTTY_SPLIT_DIRECTION_RIGHT)
@@ -1999,21 +1937,7 @@ extension Ghostty.SurfaceView: NSTextInputClient {
            let current = NSApp.currentEvent,
            lastPerformKeyEvent == current.timestamp {
             NSApp.sendEvent(current)
-            return
         }
-
-		guard let surfaceModel else { return }
-        // Process MacOS native scroll events
-        switch selector {
-        case #selector(moveToBeginningOfDocument(_:)):
-            _ = surfaceModel.perform(action: "scroll_to_top")
-        case #selector(moveToEndOfDocument(_:)):
-            _ = surfaceModel.perform(action: "scroll_to_bottom")
-        default:
-            break
-        }
-
-        print("SEL: \(selector)")
     }
 
     /// Sync the preedit state based on the markedText value to libghostty

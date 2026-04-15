@@ -195,7 +195,7 @@ jobs:
           nix develop -c minisign -S -m ghostty-source.tar.gz -s minisign.key < minisign.password
 
       - name: Update Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: 'Ghostty Tip ("Nightly")'
           prerelease: true
@@ -250,7 +250,7 @@ jobs:
           nix develop -c minisign -S -m libghostty-vt-source.tar.gz -s minisign.key < minisign.password
 
       - name: Update Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: 'Ghostty Tip ("Nightly")'
           prerelease: true
@@ -335,7 +335,7 @@ jobs:
           nix develop -c minisign -S -m ghostty-vt.xcframework.zip -s minisign.key < minisign.password
 
       - name: Update Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: 'Ghostty Tip ("Nightly")'
           prerelease: true
@@ -537,7 +537,7 @@ jobs:
 
       # Update Release
       - name: Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: 'Ghostty Tip ("Nightly")'
           prerelease: true
@@ -615,7 +615,7 @@ jobs:
           EOF
 
       - name: Upload Release URLs
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6.0
         with:
           name: release-urls-${{ inputs.pr || '0' }}
           path: release-urls.txt
@@ -786,7 +786,7 @@ jobs:
 
       # Update Release
       - name: Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: 'Ghostty Tip ("Nightly")'
           prerelease: true
@@ -983,7 +983,7 @@ jobs:
 
       # Update Release
       - name: Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: 'Ghostty Tip ("Nightly")'
           prerelease: true

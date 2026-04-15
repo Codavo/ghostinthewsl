@@ -760,6 +760,7 @@ pub fn addSimd(
 ) !void {
     const target = m.resolved_target.?;
     const optimize = m.optimize.?;
+    const system_highway = b.systemIntegrationOption("highway", .{ .default = false });
 
     // Simdutf
     if (b.systemIntegrationOption("simdutf", .{})) {
@@ -778,7 +779,7 @@ pub fn addSimd(
     }
 
     // Highway
-    if (b.systemIntegrationOption("highway", .{ .default = false })) {
+    if (system_highway) {
         m.linkSystemLibrary("libhwy", dynamic_link_opts);
     } else {
         if (b.lazyDependency("highway", .{
@@ -837,10 +838,18 @@ pub fn addSimd(
             "-std=c++17",
         );
 
+        // Keep our SIMD sources in the same Highway header mode as the
+        // vendored package build so HWY's inline dispatch/runtime helpers
+        // have a consistent ABI.
+        if (!system_highway) try flags.append(
+            b.allocator,
+            "-DHWY_NO_LIBCXX",
+        );
+
         // Disable ubsan for Windows C/C++ objects to avoid undefined
         // __ubsan_handle_* references. The Zig libraries on Windows don't
         // currently bundle a matching UBSan runtime for these objects in our
-        // build configurations.
+        // build configurations. This also covers MSVC.
         if (target.result.os.tag == .windows) try flags.appendSlice(b.allocator, &.{
             "-fno-sanitize=undefined",
             "-fno-sanitize-trap=undefined",
