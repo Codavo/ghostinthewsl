@@ -1081,11 +1081,93 @@ extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16;
 fn getModifiers() @import("../../input.zig").Mods {
     const input = @import("../../input.zig");
     var mods: input.Mods = .{};
-    if (GetKeyState(0x10) < 0) mods.shift = true;
-    if (GetKeyState(0x11) < 0) mods.ctrl = true;
-    if (GetKeyState(0x12) < 0) mods.alt = true;
-    if (GetKeyState(0x5B) < 0 or GetKeyState(0x5C) < 0) mods.super = true;
+    if (GetKeyState(0x10) < 0) {
+        mods.shift = true;
+        mods.sides.shift = if (GetKeyState(0xA1) < 0) .right else .left;
+    }
+    if (GetKeyState(0x11) < 0) {
+        mods.ctrl = true;
+        mods.sides.ctrl = if (GetKeyState(0xA3) < 0) .right else .left;
+    }
+    if (GetKeyState(0x12) < 0) {
+        mods.alt = true;
+        mods.sides.alt = if (GetKeyState(0xA5) < 0) .right else .left;
+    }
+    if (GetKeyState(0x5B) < 0 or GetKeyState(0x5C) < 0) {
+        mods.super = true;
+        mods.sides.super = if (GetKeyState(0x5C) < 0) .right else .left;
+    }
     return mods;
+}
+
+fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
+    _ = msg;
+    if (surface.core_surface) |core| {
+        const mods = getModifiers();
+        const codepoint: u21 = @intCast(wparam);
+        if (codepoint < 0x20 or codepoint == 0x7f) return 0;
+        var utf8_buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
+        if (len > 0) {
+            const input = @import("../../input.zig");
+            var consumed_mods: input.Mods = .{};
+
+            // AltGr commonly appears as Left Ctrl + Right Alt on Windows.
+            // When it generates text, those modifiers were consumed to
+            // produce the character and should not be interpreted as a
+            // Ctrl+Alt shortcut by the core.
+            if (mods.ctrl and mods.alt and mods.sides.alt == .right) {
+                consumed_mods.ctrl = true;
+                consumed_mods.alt = true;
+            }
+
+            const event = input.KeyEvent{
+                .action = .press,
+                .mods = mods,
+                .consumed_mods = consumed_mods,
+                .utf8 = utf8_buf[0..len],
+            };
+            _ = core.keyCallback(event) catch |err| {
+                log.err("key callback error: {}", .{err});
+            };
+        }
+    }
+    return 0;
+}
+
+fn isTextVirtualKey(vk: WPARAM) bool {
+    return switch (vk) {
+        0x41...0x5A,
+        0x30...0x39,
+        0x20,
+        0xBA,
+        0xBB,
+        0xBC,
+        0xBD,
+        0xBE,
+        0xBF,
+        0xC0,
+        0xDB,
+        0xDC,
+        0xDD,
+        0xDE,
+        => true,
+        else => false,
+    };
+}
+
+fn shouldDispatchKeyPress(vk: WPARAM, mods: @import("../../input.zig").Mods) bool {
+    if (!isTextVirtualKey(vk)) return true;
+
+    // Text-producing keys should usually be delivered through WM_CHAR /
+    // WM_SYSCHAR so the core receives a single event with the generated
+    // character instead of a duplicate press+text pair. Keep raw key
+    // presses only for actual shortcuts.
+    if (mods.super) return true;
+    if (mods.alt and mods.sides.alt != .right) return true;
+    if (mods.ctrl and !(mods.alt and mods.sides.alt == .right)) return true;
+
+    return false;
 }
 
 fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
@@ -1271,41 +1353,11 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             }
             return 0;
         },
-        WM_CHAR => {
-            if (surface.core_surface) |core| {
-                const mods = getModifiers();
-                const codepoint: u21 = @intCast(wparam);
-                if (codepoint < 0x20 or codepoint == 0x7f) return 0;
-                var utf8_buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
-                if (len > 0) {
-                    const input = @import("../../input.zig");
-                    var consumed_mods: input.Mods = .{};
-
-                    // AltGr commonly appears as Ctrl+Alt on Windows. When it
-                    // produces text, treat those modifiers as consumed so the
-                    // core sees the resulting character rather than Ctrl+Alt.
-                    if (mods.ctrl and mods.alt) {
-                        consumed_mods.ctrl = true;
-                        consumed_mods.alt = true;
-                    }
-
-                    const event = input.KeyEvent{
-                        .action = .press,
-                        .mods = mods,
-                        .consumed_mods = consumed_mods,
-                        .utf8 = utf8_buf[0..len],
-                    };
-                    _ = core.keyCallback(event) catch |err| {
-                        log.err("key callback error: {}", .{err});
-                    };
-                }
-            }
-            return 0;
-        },
+        WM_CHAR, 0x0106 => return handleTextInput(surface, msg, wparam),
         WM_KEYDOWN, 0x0104 => {
             if (surface.core_surface) |core| {
                 const mods = getModifiers();
+                if (!shouldDispatchKeyPress(wparam, mods)) return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
                 const key = mapVirtualKey(wparam);
                 if (key != .unidentified) {
                     const input = @import("../../input.zig");
