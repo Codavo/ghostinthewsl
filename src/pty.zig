@@ -326,9 +326,15 @@ const WindowsPty = struct {
     pub const Error = OpenError || GetSizeError || SetSizeError;
 
     pub const Fd = windows.HANDLE;
+    const HMODULE = ?*anyopaque;
+
+    extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const u16) callconv(.winapi) HMODULE;
+    extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 
     // Process-wide counter for pipe names
     var pipe_name_counter = std.atomic.Value(u32).init(1);
+    var api_cache: ?PseudoConsoleApi = null;
+    var api_cache_attempted: bool = false;
 
     out_pipe: windows.HANDLE,
     in_pipe: windows.HANDLE,
@@ -336,6 +342,73 @@ const WindowsPty = struct {
     in_pipe_pty: windows.HANDLE,
     pseudo_console: windows.exp.HPCON,
     size: winsize,
+
+    const PseudoConsoleApi = struct {
+        create: *const @TypeOf(windows.exp.kernel32.CreatePseudoConsole),
+        resize: *const @TypeOf(windows.exp.kernel32.ResizePseudoConsole),
+        close: *const @TypeOf(windows.exp.kernel32.ClosePseudoConsole),
+    };
+
+    fn loadAdjacentConptyDll() ?HMODULE {
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_path = std.fs.selfExePath(&exe_buf) catch |err| {
+            log.warn("failed to determine executable path for adjacent conpty.dll lookup err={}", .{err});
+            return null;
+        };
+        const exe_dir = std.fs.path.dirname(exe_path) orelse return null;
+
+        var dll_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dll_path = std.fmt.bufPrint(
+            &dll_path_buf,
+            "{s}\\conpty.dll",
+            .{exe_dir},
+        ) catch |err| {
+            log.warn("failed to build adjacent conpty.dll path err={}", .{err});
+            return null;
+        };
+
+        var dll_path_w_buf: [std.fs.max_path_bytes]u16 = undefined;
+        const dll_path_w_len = std.unicode.utf8ToUtf16Le(
+            &dll_path_w_buf,
+            dll_path,
+        ) catch |err| {
+            log.warn("failed to encode adjacent conpty.dll path err={}", .{err});
+            return null;
+        };
+        dll_path_w_buf[dll_path_w_len] = 0;
+
+        return LoadLibraryW(dll_path_w_buf[0..dll_path_w_len :0].ptr);
+    }
+
+    fn pseudoConsoleApi() PseudoConsoleApi {
+        if (!api_cache_attempted) {
+            api_cache_attempted = true;
+
+            if (loadAdjacentConptyDll()) |module| {
+                const create_ptr = GetProcAddress(module, "CreatePseudoConsole");
+                const resize_ptr = GetProcAddress(module, "ResizePseudoConsole");
+                const close_ptr = GetProcAddress(module, "ClosePseudoConsole");
+                if (create_ptr != null and resize_ptr != null and close_ptr != null) {
+                    api_cache = .{
+                        .create = @ptrCast(create_ptr.?),
+                        .resize = @ptrCast(resize_ptr.?),
+                        .close = @ptrCast(close_ptr.?),
+                    };
+                    log.info("using ConPTY APIs from adjacent conpty.dll", .{});
+                } else {
+                    log.warn("loaded adjacent conpty.dll but required pseudo console exports were missing; falling back to kernel32", .{});
+                }
+            } else {
+                log.info("adjacent conpty.dll not available; using kernel32 pseudo console APIs", .{});
+            }
+        }
+
+        return api_cache orelse .{
+            .create = windows.exp.kernel32.CreatePseudoConsole,
+            .resize = windows.exp.kernel32.ResizePseudoConsole,
+            .close = windows.exp.kernel32.ClosePseudoConsole,
+        };
+    }
 
     pub const OpenError = error{Unexpected};
 
@@ -427,7 +500,8 @@ const WindowsPty = struct {
         try windows.SetHandleInformation(pty.out_pipe, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.out_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        const api = pseudoConsoleApi();
+        const result = api.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
@@ -445,7 +519,7 @@ const WindowsPty = struct {
         _ = windows.CloseHandle(self.in_pipe);
         _ = windows.CloseHandle(self.out_pipe_pty);
         _ = windows.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        pseudoConsoleApi().close(self.pseudo_console);
         self.* = undefined;
     }
 
@@ -460,7 +534,7 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
+        const result = pseudoConsoleApi().resize(
             self.pseudo_console,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );
