@@ -1,0 +1,2 @@
+# Default target for building inside WSL
+# For release builds: cargo build --target x86_64-unknown-linux-musl --release

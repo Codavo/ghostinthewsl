@@ -10,6 +10,14 @@
 zig-cache/
 .zig-cache/
 zig-out/
+/dist/ghostinthewsl-*/
+/dist/ghostinthewsl.exe
+/dist/ghostinthewsl-*.exe
+/dist/ghostinthewsl-*.msi
+/dist/ghostinthewsl-*.zip
+/dist/ghostinthewsl-*.sha256
+wsl-pty-bridge/target/
+src/apprt/win32/wsl-pty-bridge.bin
 build-cmake/
 CMakeCache.txt
 CMakeFiles/
@@ -28,4 +36,3 @@ glad.zip
 /ghostty.qcow2
 
 vgcore.*
-

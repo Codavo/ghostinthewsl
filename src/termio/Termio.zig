@@ -21,7 +21,15 @@ const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
+const builtin = @import("builtin");
 const log = std.log.scoped(.io_exec);
+
+const wsl_log = if (builtin.os.tag == .windows)
+    @import("../apprt/win32/wsl_log.zig")
+else
+    struct {
+        pub fn print(comptime _: []const u8, _: anytype) void {}
+    };
 
 /// Mutex state argument for queueMessage.
 pub const MutexState = enum { locked, unlocked };
@@ -55,6 +63,24 @@ surface_mailbox: apprt.surface.Mailbox,
 
 /// The cached size info
 size: renderer.Size,
+
+/// Last grid size sent to the backend (resize APC). Tracked explicitly
+/// instead of deriving from self.size.grid() because the grid()
+/// computation goes through float arithmetic (screen_width / cell_width)
+/// which can produce inconsistent results across calls with identical
+/// inputs, defeating the dedup. Using stored u16 values is exact.
+last_sent_cols: u16 = 0,
+last_sent_rows: u16 = 0,
+
+/// Pending resize for the read thread to apply. When the IO thread can't
+/// acquire the renderer mutex (tryLock fails), it stores the resize here.
+/// The read thread picks it up in processOutput() — which always holds
+/// the renderer mutex — making the reflow deterministic with zero
+/// contention. This eliminates the tryLock retry loop entirely.
+///
+/// Protected by pending_resize_mutex (held for nanoseconds per access).
+pending_resize_mutex: std.Thread.Mutex = .{},
+pending_resize: ?renderer.Size = null,
 
 /// The mailbox implementation to use.
 mailbox: termio.Mailbox,
@@ -460,42 +486,94 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
 }
 
 /// Resize the terminal.
+///
+/// The IO thread calls this from the coalesce timer. If the renderer mutex
+/// is free (tryLock succeeds), reflow happens inline. Otherwise the resize
+/// is stored in `pending_resize` for the read thread to apply in its next
+/// processOutput() call — the read thread always holds the renderer mutex,
+/// so reflow is guaranteed with zero contention.
 pub fn resize(
     self: *Termio,
     td: *ThreadData,
     size: renderer.Size,
-) !void {
-    self.size = size;
+) Allocator.Error!void {
     const grid_size = size.grid();
 
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Only send the resize APC to the backend when the grid actually
+    // changed. We compare against explicitly stored u16 values instead
+    // of self.size.grid() because the grid() computation goes through
+    // float division which can produce inconsistent results.
+    const cols: u16 = std.math.cast(u16, grid_size.columns) orelse 0;
+    const rows: u16 = std.math.cast(u16, grid_size.rows) orelse 0;
+    const size_changed = cols != self.last_sent_cols or rows != self.last_sent_rows;
 
-    // Enter the critical area that we want to keep small
-    {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+    self.size = size;
 
-        // Update the size of our terminal state
-        try self.terminal.resize(
-            self.alloc,
-            grid_size.columns,
-            grid_size.rows,
-        );
-
-        // Update our pixel sizes
-        self.terminal.width_px = grid_size.columns * self.size.cell.width;
-        self.terminal.height_px = grid_size.rows * self.size.cell.height;
-
-        // Disable synchronized output mode so that we show changes
-        // immediately for a resize. This is allowed by the spec.
-        self.terminal.modes.set(.synchronized_output, false);
-
-        // If we have size reporting enabled we need to send a report.
-        if (self.terminal.modes.get(.in_band_size_reports)) {
-            try self.sizeReportLocked(td, .mode_2048);
-        }
+    const t_start = std.time.milliTimestamp();
+    if (size_changed) {
+        self.last_sent_cols = cols;
+        self.last_sent_rows = rows;
+        self.backend.resize(self.alloc, td, grid_size, size.terminal()) catch |err| {
+            log.warn("backend resize error: {}", .{err});
+        };
     }
+    const t_backend = std.time.milliTimestamp();
+
+    // Try to acquire the renderer mutex without blocking.
+    if (!self.renderer_state.mutex.tryLock()) {
+        // Store the resize for the read thread to apply. The read thread
+        // holds the renderer mutex in processOutput() and will pick this
+        // up on its next iteration — deterministic, no retry loop needed.
+        self.pending_resize_mutex.lock();
+        self.pending_resize = size;
+        self.pending_resize_mutex.unlock();
+
+        wsl_log.print("Termio.resize: mutex contended, delegated to read thread (backend={d}ms)", .{
+            t_backend - t_start,
+        });
+
+        // Notify the renderer of the new screen size so it can update
+        // GPU uniforms even before reflow happens.
+        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .instant = {} });
+        self.renderer_wakeup.notify() catch {};
+        return;
+    }
+    defer self.renderer_state.mutex.unlock();
+    const t_locked = std.time.milliTimestamp();
+
+    // Clear any pending resize since we're doing it now.
+    self.pending_resize_mutex.lock();
+    self.pending_resize = null;
+    self.pending_resize_mutex.unlock();
+
+    // Update the size of our terminal state
+    try self.terminal.resize(
+        self.alloc,
+        grid_size.columns,
+        grid_size.rows,
+    );
+    const t_reflow = std.time.milliTimestamp();
+
+    // Update our pixel sizes
+    self.terminal.width_px = grid_size.columns * self.size.cell.width;
+    self.terminal.height_px = grid_size.rows * self.size.cell.height;
+
+    // Disable synchronized output mode so that we show changes
+    // immediately for a resize. This is allowed by the spec.
+    self.terminal.modes.set(.synchronized_output, false);
+
+    // If we have size reporting enabled we need to send a report.
+    if (self.terminal.modes.get(.in_band_size_reports)) {
+        self.sizeReportLocked(td, .mode_2048) catch |err| {
+            log.warn("size report error: {}", .{err});
+        };
+    }
+
+    wsl_log.print("Termio.resize: backend={d}ms mutex_wait={d}ms reflow={d}ms", .{
+        t_backend - t_start,
+        t_locked - t_backend,
+        t_reflow - t_locked,
+    });
 
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
@@ -641,11 +719,100 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
+    const t_start = std.time.milliTimestamp();
+
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
+
+    const t_locked = std.time.milliTimestamp();
+
+    // Check for a pending resize delegated by the IO thread. We hold the
+    // renderer mutex here, so we can do the reflow with zero contention.
+    // This is the "correct by construction" path: the thread that always
+    // gets the lock does the work, eliminating retry loops entirely.
+    self.applyPendingResize();
+
+    const t_resize = std.time.milliTimestamp();
+
     self.processOutputLocked(buf);
+
+    const t_done = std.time.milliTimestamp();
+    const total = t_done - t_start;
+    const vt_ms = t_done - t_resize;
+
+    // Log if anything took meaningful time (>5ms) to help diagnose stalls.
+    if (total > 5) {
+        wsl_log.print("processOutput: {d}B lock={d}ms resize={d}ms vt={d}ms total={d}ms", .{
+            buf.len,
+            t_locked - t_start,
+            t_resize - t_locked,
+            vt_ms,
+            total,
+        });
+    }
+
+    // Dump raw VT data for chunks where parsing took >100ms.
+    // The dump file (%TEMP%\ghostty-vt-dump.bin) contains framed records
+    // that can be replayed to reproduce the slow parsing offline.
+    if (vt_ms > 100) {
+        wsl_log.print("SLOW VT: {d}B in {d}ms — dumping to ghostty-vt-dump.bin (scrollback={d} rows, screen={d}x{d})", .{
+            buf.len,
+            vt_ms,
+            self.terminal.screens.active.pages.total_rows,
+            self.terminal.cols,
+            self.terminal.rows,
+        });
+        wsl_log.dumpVtChunk(buf, @intCast(@min(vt_ms, std.math.maxInt(u32))));
+    }
+}
+
+/// Apply a pending resize (if any) while the renderer mutex is held.
+/// Called from processOutput() on the read thread, and also from resize()
+/// on the IO thread when tryLock succeeds (to clear stale pending data).
+fn applyPendingResize(self: *Termio) void {
+    // Grab the pending resize under the small mutex (nanoseconds).
+    const pending = blk: {
+        self.pending_resize_mutex.lock();
+        defer self.pending_resize_mutex.unlock();
+        const p = self.pending_resize;
+        self.pending_resize = null;
+        break :blk p;
+    };
+
+    const size = pending orelse return;
+    const grid_size = size.grid();
+
+    const t_start = std.time.milliTimestamp();
+
+    self.terminal.resize(
+        self.alloc,
+        grid_size.columns,
+        grid_size.rows,
+    ) catch |err| {
+        log.warn("deferred resize reflow error: {}", .{err});
+        return;
+    };
+
+    const t_reflow = std.time.milliTimestamp();
+
+    // Update pixel sizes
+    self.terminal.width_px = grid_size.columns * size.cell.width;
+    self.terminal.height_px = grid_size.rows * size.cell.height;
+
+    // Disable synchronized output mode on resize (allowed by spec).
+    self.terminal.modes.set(.synchronized_output, false);
+
+    wsl_log.print("applyPendingResize: reflow={d}ms ({d}x{d})", .{
+        t_reflow - t_start,
+        grid_size.columns,
+        grid_size.rows,
+    });
+
+    // Notify renderer to re-render with the new size.
+    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    self.renderer_wakeup.notify() catch {};
 }
 
 /// Process output from readdata but the lock is already held.

@@ -6,12 +6,22 @@ const internal_os = @import("../os/main.zig");
 
 const log = std.log.scoped(.config);
 
+/// Returns the path to a config file sibling to the running executable.
+/// e.g., C:\path\to\ghostinthewsl.conf
+/// Returns null if the exe path cannot be determined.
+pub fn exeSiblingConfigPath(alloc: Allocator) !?[]const u8 {
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&exe_buf) catch return null;
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return null;
+    return try std.fs.path.join(alloc, &.{ exe_dir, "config.ghostinthewsl" });
+}
+
 /// Default path for the XDG home configuration file. Returned value
 /// must be freed by the caller.
 pub fn defaultXdgPath(alloc: Allocator) ![]const u8 {
     return try internal_os.xdg.config(
         alloc,
-        .{ .subdir = "ghostty/config.ghostty" },
+        .{ .subdir = "ghostinthewsl/config.ghostinthewsl" },
     );
 }
 
@@ -20,7 +30,7 @@ pub fn defaultXdgPath(alloc: Allocator) ![]const u8 {
 pub fn legacyDefaultXdgPath(alloc: Allocator) ![]const u8 {
     return try internal_os.xdg.config(
         alloc,
-        .{ .subdir = "ghostty/config" },
+        .{ .subdir = "ghostinthewsl/config" },
     );
 }
 

@@ -65,11 +65,13 @@ pub const Backend = union(Kind) {
 
     pub fn resize(
         self: *Backend,
+        alloc: Allocator,
+        td: *termio.Termio.ThreadData,
         grid_size: renderer.GridSize,
         screen_size: renderer.ScreenSize,
     ) !void {
         switch (self.*) {
-            .exec => |*exec| try exec.resize(grid_size, screen_size),
+            .exec => |*exec| try exec.resize(alloc, td, grid_size, screen_size),
         }
     }
 

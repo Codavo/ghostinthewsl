@@ -12,7 +12,7 @@ install_step: *std.Build.Step.InstallArtifact,
 
 pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty {
     const exe: *std.Build.Step.Compile = b.addExecutable(.{
-        .name = "ghostty",
+        .name = "ghostinthewsl",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = cfg.target,
@@ -51,7 +51,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         .windows => {
             exe.subsystem = .Windows;
             exe.addWin32ResourceFile(.{
-                .file = b.path("dist/windows/ghostty.rc"),
+                .file = b.path("dist/windows/ghostinthewsl.rc"),
             });
         },
 

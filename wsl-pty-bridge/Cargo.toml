@@ -1,0 +1,20 @@
+[package]
+name = "wsl-pty-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Linux PTY bridge for GhostInTheWSL - provides a real Linux PTY inside WSL, bypassing ConPTY"
+
+[dependencies]
+nix = { version = "0.29", features = ["term", "process", "signal", "poll", "ioctl", "fs"] }
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+vsock = "0.5"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

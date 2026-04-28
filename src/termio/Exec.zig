@@ -31,6 +31,16 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
 
+/// File-based debug logger for WSL diagnostics.
+/// Enable with GHOSTWSL_DEBUG=1 environment variable.
+/// Output goes to C:\ghostty-wsl.log.
+const wsl_log = if (builtin.os.tag == .windows)
+    @import("../apprt/win32/wsl_log.zig")
+else
+    struct {
+        pub fn print(comptime _: []const u8, _: anytype) void {}
+    };
+
 /// The termios poll rate in milliseconds.
 const TERMIOS_POLL_MS = 200;
 
@@ -73,7 +83,9 @@ pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
 
     // Setup our initial grid/screen size from the terminal. This
     // can't fail because the pty should not exist at this point.
-    self.resize(.{
+    // We call subprocess.resize directly (not self.resize) because
+    // there's no xev write stream or thread data during init.
+    self.subprocess.resize(.{
         .columns = term.cols,
         .rows = term.rows,
     }, .{
@@ -88,8 +100,20 @@ pub fn threadEnter(
     io: *termio.Termio,
     td: *termio.Termio.ThreadData,
 ) !void {
+    // For WSL mode, show a status message while connecting.
+    // VsockBridge.open() can block for 10-15s on WSL cold start.
+    const show_wsl_status = comptime builtin.os.tag == .windows and
+        @hasField(@TypeOf(self.subprocess), "wsl_mode") and true;
+    if (show_wsl_status and self.subprocess.wsl_mode) {
+        showWslStatus(io, "Connecting to WSL...");
+    }
+
     // Start our subprocess
     const pty_fds = self.subprocess.start(alloc) catch |err| {
+        if (show_wsl_status and self.subprocess.wsl_mode) {
+            clearWslStatus(io);
+        }
+
         // If we specifically got this error then we are in the forked
         // process and our child failed to execute. If we DIDN'T
         // get this specific error then we're in the parent and
@@ -100,6 +124,12 @@ pub fn threadEnter(
         // The Command will output some additional information.
         posix.exit(1);
     };
+
+    // Clear the status message now that we're connected
+    if (show_wsl_status and self.subprocess.wsl_mode) {
+        clearWslStatus(io);
+    }
+
     errdefer self.subprocess.stop();
 
     // Watcher to detect subprocess exit
@@ -113,7 +143,12 @@ pub fn threadEnter(
         // as a special case in os/flatpak.zig) since the
         // command is on the host.
         .flatpak => null,
-    } else return error.ProcessNotStarted;
+    } else if (comptime builtin.os.tag == .windows)
+        // vsock mode: no per-tab process to watch. The read thread
+        // detects socket EOF and pushes child_exited directly.
+        null
+    else
+        return error.ProcessNotStarted;
     errdefer if (process) |*p| p.deinit();
 
     // Track our process start time for abnormal exits
@@ -139,7 +174,10 @@ pub fn threadEnter(
     const read_thread = try std.Thread.spawn(
         .{},
         if (builtin.os.tag == .windows) ReadThread.threadMainWindows else ReadThread.threadMainPosix,
-        .{ pty_fds.read, io, pipe[0] },
+        if (builtin.os.tag == .windows)
+            .{ pty_fds.read, io, pipe[0], self.subprocess.process == null }
+        else
+            .{ pty_fds.read, io, pipe[0] },
     );
     read_thread.setName("io-reader") catch {};
 
@@ -151,6 +189,7 @@ pub fn threadEnter(
         .read_thread = read_thread,
         .read_thread_pipe = pipe[1],
         .read_thread_fd = pty_fds.read,
+        .vsock_socket = if (builtin.os.tag == .windows) self.subprocess.vsock_socket else {},
         .termios_timer = termios_timer,
     } };
 
@@ -222,6 +261,18 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
                 else => |err| log.warn("error interrupting read thread err={}", .{err}),
             }
         }
+
+        // For vsock tabs, close the socket BEFORE join() to unblock the
+        // read thread's blocking recv() call. CancelIoEx only works on
+        // Windows pipe/file handles, not Winsock sockets. Without this,
+        // join() deadlocks when the shell is still running.
+        if (exec.vsock_socket) |sock| {
+            const closesocket = struct {
+                extern "ws2_32" fn closesocket(s: usize) callconv(.winapi) i32;
+            }.closesocket;
+            _ = closesocket(sock);
+            exec.vsock_socket = null;
+        }
     }
 
     exec.read_thread.join();
@@ -237,7 +288,7 @@ pub fn focusGained(
     assert(td.backend == .exec);
     const execdata = &td.backend.exec;
 
-    // Windows has no termios, so there is nothing to poll.
+    // Windows doesn't have termios, so skip the timer entirely.
     if (comptime builtin.os.tag == .windows) return;
 
     if (!focused) {
@@ -263,10 +314,36 @@ pub fn focusGained(
 
 pub fn resize(
     self: *Exec,
+    alloc: Allocator,
+    td: *termio.Termio.ThreadData,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
 ) !void {
-    return try self.subprocess.resize(grid_size, screen_size);
+    try self.subprocess.resize(grid_size, screen_size);
+
+    // In WSL mode, send the resize APC through xev's write path.
+    // We can't call WriteFile directly because the data pipe uses
+    // FILE_FLAG_OVERLAPPED for IOCP — synchronous WriteFile with
+    // lpOverlapped=NULL is undefined behavior on such handles.
+    if (comptime builtin.os.tag == .windows) {
+        if (self.subprocess.wsl_mode) {
+            const cols = std.math.cast(u16, grid_size.columns) orelse 80;
+            const rows = std.math.cast(u16, grid_size.rows) orelse 24;
+            const xpixel = std.math.cast(u16, screen_size.width) orelse 0;
+            const ypixel = std.math.cast(u16, screen_size.height) orelse 0;
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "\x1b_Gwsl;resize;{d};{d};{d};{d}\x1b\\", .{
+                cols, rows, xpixel, ypixel,
+            }) catch return;
+
+            const t0 = std.time.milliTimestamp();
+            try self.queueWrite(alloc, td, msg, false);
+            const t1 = std.time.milliTimestamp();
+            wsl_log.print("resize: {d}x{d} ({d}x{d}px) queueWrite took {d}ms", .{
+                cols, rows, xpixel, ypixel, t1 - t0,
+            });
+        }
+    }
 }
 
 fn processExitCommon(td: *termio.Termio.ThreadData, exit_code: u32) void {
@@ -415,6 +492,22 @@ pub fn queueWrite(
     // If our process is exited then we don't send any more writes.
     if (exec.exited) return;
 
+    // vsock path: use Winsock send() directly instead of xev's overlapped
+    // WriteFile. Overlapped WriteFile on IOCP-registered sockets can cause
+    // spurious failures that corrupt the connection (manifests as tab close
+    // on resize). Winsock send() is the native socket write and is reliable.
+    if (comptime builtin.os.tag == .windows) {
+        if (exec.vsock_socket) |sock| {
+            vsockSendAll(sock, data, linefeed) catch |err| {
+                log.warn("vsock send failed: {}", .{err});
+                wsl_log.print("queueWrite: vsock send failed, marking exited", .{});
+                exec.exited = true;
+                return;
+            };
+            return;
+        }
+    }
+
     // We go through and chunk the data if necessary to fit into
     // our cached buffers that we can queue to the stream.
     var i: usize = 0;
@@ -466,6 +559,66 @@ pub fn queueWrite(
             exec,
             ttyWrite,
         );
+    }
+}
+
+/// Winsock send() for direct vsock writes.
+const winsock_send = if (builtin.os.tag == .windows)
+    struct {
+        extern "ws2_32" fn send(s: usize, buf_: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
+    }.send
+else
+    undefined;
+
+const VsockSendError = error{VsockSendFailed};
+
+/// Send data to a vsock socket using Winsock send().
+/// Handles linefeed translation and partial writes.
+/// Returns error if the socket write fails (connection broken).
+fn vsockSendAll(sock: usize, data: []const u8, linefeed: bool) VsockSendError!void {
+    if (!linefeed) {
+        // Fast path: send data as-is.
+        var sent: usize = 0;
+        while (sent < data.len) {
+            const remaining: i32 = @intCast(@min(data.len - sent, std.math.maxInt(i32)));
+            const n = winsock_send(sock, data[sent..].ptr, remaining, 0);
+            if (n <= 0) return error.VsockSendFailed;
+            sent += @intCast(n);
+        }
+        return;
+    }
+
+    // Slow path: translate \r to \r\n, send in chunks.
+    var buf: [4096]u8 = undefined;
+    var buf_i: usize = 0;
+    for (data) |ch| {
+        if (ch == '\r') {
+            if (buf_i + 2 > buf.len) {
+                try vsockSendBuf(sock, buf[0..buf_i]);
+                buf_i = 0;
+            }
+            buf[buf_i] = '\r';
+            buf[buf_i + 1] = '\n';
+            buf_i += 2;
+        } else {
+            if (buf_i + 1 > buf.len) {
+                try vsockSendBuf(sock, buf[0..buf_i]);
+                buf_i = 0;
+            }
+            buf[buf_i] = ch;
+            buf_i += 1;
+        }
+    }
+    if (buf_i > 0) try vsockSendBuf(sock, buf[0..buf_i]);
+}
+
+fn vsockSendBuf(sock: usize, data: []const u8) VsockSendError!void {
+    var sent: usize = 0;
+    while (sent < data.len) {
+        const remaining: i32 = @intCast(@min(data.len - sent, std.math.maxInt(i32)));
+        const n = winsock_send(sock, data[sent..].ptr, remaining, 0);
+        if (n <= 0) return error.VsockSendFailed;
+        sent += @intCast(n);
     }
 }
 
@@ -530,6 +683,12 @@ pub const ThreadData = struct {
     read_thread_pipe: posix.fd_t,
     read_thread_fd: posix.fd_t,
 
+    /// When set, writes use Winsock send() instead of xev's overlapped
+    /// WriteFile. This is needed for vsock sockets because IOCP-backed
+    /// overlapped WriteFile on a socket can cause completions to fail.
+    vsock_socket: if (builtin.os.tag == .windows) ?usize else void =
+        if (builtin.os.tag == .windows) null else {},
+
     /// The timer to detect termios state changes.
     termios_timer: xev.Timer,
     termios_timer_c: xev.Completion = .{},
@@ -541,6 +700,19 @@ pub const ThreadData = struct {
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         posix.close(self.read_thread_pipe);
+
+        // For vsock tabs, close the socket if it wasn't already closed
+        // in threadExit(). Normally threadExit() closes it before join()
+        // to unblock recv(), so this is just a safety net.
+        if (comptime builtin.os.tag == .windows) {
+            if (self.vsock_socket) |sock| {
+                const closesocket = struct {
+                    extern "ws2_32" fn closesocket(s: usize) callconv(.winapi) i32;
+                }.closesocket;
+                _ = closesocket(sock);
+                self.vsock_socket = null;
+            }
+        }
 
         // Clear our write pools. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -570,6 +742,16 @@ pub const Config = struct {
     resources_dir: ?[]const u8,
     term: []const u8,
 
+    /// WSL PTY bridge mode: bypass ConPTY and launch a bridge process
+    /// inside WSL that creates a real Linux PTY.
+    wsl_mode: bool = false,
+    /// WSL distribution to use (null = default distro).
+    wsl_distro: ?[:0]const u8 = null,
+    /// Shell to launch inside WSL (null = distro default).
+    wsl_shell: ?[:0]const u8 = null,
+    /// Auto-restart the WSL bridge on unexpected crash.
+    wsl_auto_restart: bool = true,
+
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
 };
@@ -589,6 +771,25 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+
+    /// WSL bridge mode configuration.
+    wsl_mode: bool = false,
+    wsl_distro: ?[:0]const u8 = null,
+    wsl_shell: ?[:0]const u8 = null,
+    wsl_auto_restart: bool = true,
+
+    /// When in WSL mode, stores the bridge's stdin pipe handle.
+    /// Not used directly for writes (those go through xev/queueWrite),
+    /// but kept for reference by the PTY struct.
+    wsl_in_pipe: if (builtin.os.tag == .windows) ?windows.HANDLE else void =
+        if (builtin.os.tag == .windows) null else {},
+
+    /// When connected via vsock, stores the raw Winsock SOCKET for direct
+    /// send(). We bypass xev's overlapped WriteFile for vsock because mixing
+    /// IOCP-registered overlapped WriteFile with blocking recv() on the same
+    /// socket can cause write completions to fail, corrupting the connection.
+    vsock_socket: if (builtin.os.tag == .windows) ?usize else void =
+        if (builtin.os.tag == .windows) null else {},
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -864,6 +1065,11 @@ const Subprocess = struct {
             .cwd = cwd,
             .args = args,
 
+            .wsl_mode = cfg.wsl_mode,
+            .wsl_distro = cfg.wsl_distro,
+            .wsl_shell = cfg.wsl_shell,
+            .wsl_auto_restart = cfg.wsl_auto_restart,
+
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
 
@@ -876,7 +1082,23 @@ const Subprocess = struct {
     /// Clean up the subprocess. This will stop the subprocess if it is started.
     pub fn deinit(self: *Subprocess) void {
         self.stop();
-        if (self.pty) |*pty| pty.deinit();
+        // In WSL bridge mode, the "pty" is a dummy struct with pipe handles
+        // that are owned by the bridge process. We only close the pipe handles
+        // (which are already closed by stop/killCommand), and skip the ConPTY
+        // cleanup that would crash on a null pseudo_console.
+        if (comptime builtin.os.tag == .windows) {
+            if (self.wsl_mode) {
+                // For vsock tabs, the socket was already closed by
+                // ThreadData.deinit() (to unblock the read thread).
+                // For WSL vsock tabs, pipes are closed by stop()/killCommand().
+                // Just reset the pty.
+                self.pty = null;
+            } else {
+                if (self.pty) |*pty| pty.deinit();
+            }
+        } else {
+            if (self.pty) |*pty| pty.deinit();
+        }
         if (self.env) |*env| env.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -884,11 +1106,21 @@ const Subprocess = struct {
 
     /// Start the subprocess. If the subprocess is already started this
     /// will crash.
-    pub fn start(self: *Subprocess, alloc: Allocator) !struct {
+    const StartResult = struct {
         read: Pty.Fd,
         write: Pty.Fd,
-    } {
+    };
+
+    pub fn start(self: *Subprocess, alloc: Allocator) !StartResult {
         assert(self.pty == null and self.process == null);
+
+        // WSL mode: bypass ConPTY entirely on Windows.
+        // Connect to the vsock daemon via AF_HYPERV socket.
+        if (comptime builtin.os.tag == .windows) {
+            if (self.wsl_mode) {
+                return self.startWslVsock(alloc);
+            }
+        }
 
         // This function is funny because on POSIX systems it can
         // fail in the forked process. This is flipped to true if
@@ -1071,6 +1303,74 @@ const Subprocess = struct {
         };
     }
 
+    /// Start the WSL vsock connection. This is the Windows-only code path
+    /// that bypasses ConPTY entirely by connecting to a PTY daemon inside
+    /// WSL via AF_HYPERV (vsock).
+    ///
+    /// The daemon creates a real Linux PTY, so all escape sequences
+    /// (including kitty graphics) pass through unmodified.
+    fn startWslVsock(self: *Subprocess, alloc: Allocator) !StartResult {
+        if (comptime builtin.os.tag != .windows) {
+            @compileError("WSL vsock is only available on Windows");
+        }
+
+        const VsockBridge = @import("../apprt/win32/VsockBridge.zig");
+
+        const wsl_size = ptypkg.winsize{
+            .ws_row = std.math.cast(u16, self.grid_size.rows) orelse 24,
+            .ws_col = std.math.cast(u16, self.grid_size.columns) orelse 80,
+            .ws_xpixel = std.math.cast(u16, self.screen_size.width) orelse 800,
+            .ws_ypixel = std.math.cast(u16, self.screen_size.height) orelse 600,
+        };
+
+        wsl_log.print("startWslVsock: connecting (distro={s})", .{
+            if (self.wsl_distro) |d| d else "(default)",
+        });
+
+        const vsock = VsockBridge.open(.{
+            .distro = self.wsl_distro,
+            .shell = self.wsl_shell,
+            .size = wsl_size,
+            .cwd = self.cwd,
+        }) catch |err| {
+            log.err("WSL vsock connection failed: {}", .{err});
+            wsl_log.print("startWslVsock: failed ({s})", .{@errorName(err)});
+            return err;
+        };
+
+        log.info("WSL PTY connected via vsock (pty_id={})", .{vsock.pty_id});
+        wsl_log.print("startWslVsock: connected, pty_id={d}, socket={d}", .{ vsock.pty_id, vsock.socket });
+
+        const sock_handle = vsock.socketAsHandle();
+        self.wsl_in_pipe = sock_handle;
+        self.vsock_socket = vsock.socket;
+
+        self.pty = .{
+            .out_pipe = sock_handle, // same socket for both directions
+            .in_pipe = sock_handle, // xev write stream; read uses recv()
+            .out_pipe_pty = undefined,
+            .in_pipe_pty = undefined,
+            .pseudo_console = undefined,
+            .size = vsock.size,
+        };
+
+        // Don't set self.process — vsock tabs have no per-tab process to
+        // watch. The daemon is shared across all tabs and outlives them.
+        // Per-tab exit is detected by the read thread when the socket
+        // closes (EOF/error), which pushes child_exited to the surface.
+
+        _ = alloc;
+        if (self.env) |*env| {
+            env.deinit();
+            self.env = null;
+        }
+
+        return .{
+            .read = sock_handle,
+            .write = sock_handle,
+        };
+    }
+
     /// This should be called after fork but before exec in the child process.
     /// To repeat: this function RUNS IN THE FORKED CHILD PROCESS before
     /// exec is called; it does NOT run in the main Ghostty process.
@@ -1117,6 +1417,23 @@ const Subprocess = struct {
     ) !void {
         self.grid_size = grid_size;
         self.screen_size = screen_size;
+
+        // In WSL bridge mode, skip ConPTY's ResizePseudoConsole — the resize
+        // APC is sent by Exec.resize() through xev's queueWrite instead.
+        // We just update the local pty.size for any code that reads it.
+        if (comptime builtin.os.tag == .windows) {
+            if (self.wsl_mode) {
+                if (self.pty) |*pty| {
+                    pty.size = .{
+                        .ws_row = std.math.cast(u16, grid_size.rows) orelse 24,
+                        .ws_col = std.math.cast(u16, grid_size.columns) orelse 80,
+                        .ws_xpixel = std.math.cast(u16, screen_size.width) orelse 0,
+                        .ws_ypixel = std.math.cast(u16, screen_size.height) orelse 0,
+                    };
+                }
+                return;
+            }
+        }
 
         if (self.pty) |*pty| {
             // It is theoretically possible for the grid or screen size to
@@ -1358,7 +1675,11 @@ pub const ReadThread = struct {
         }
     }
 
-    fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
+    /// Winsock recv() — used for reading from vsock sockets where ReadFile
+    /// is unreliable due to IOCP registration on the same socket object.
+    extern "ws2_32" fn recv(s: usize, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
+
+    fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t, is_socket: bool) void {
         // Always close our end of the pipe when we exit.
         defer posix.close(quit);
 
@@ -1369,7 +1690,46 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
-        var buf: [1024]u8 = undefined;
+        if (is_socket)
+            threadReadSocket(@intFromPtr(fd), io)
+        else
+            threadReadPipe(fd, io, quit);
+    }
+
+    /// Read loop for vsock sockets using Winsock recv().
+    /// ReadFile is unreliable on sockets registered with IOCP (xev's write
+    /// stream), so we use recv() which always works as a blocking call.
+    fn threadReadSocket(sock: usize, io: *termio.Termio) void {
+        wsl_log.print("threadReadSocket: started, sock={d}", .{sock});
+        var buf: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = recv(sock, &buf, buf.len, 0);
+            if (n <= 0) {
+                if (n == 0) {
+                    // Clean EOF — remote end closed the connection.
+                    // The shell inside WSL exited normally.
+                    log.info("vsock EOF, read thread exiting", .{});
+                    wsl_log.print("threadReadSocket: EOF (n=0), pushing child_exited", .{});
+                    _ = io.surface_mailbox.push(.{
+                        .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
+                    }, .{ .forever = {} });
+                } else {
+                    // recv() error — socket was closed locally by
+                    // ThreadData.deinit() (tab closing). Don't push
+                    // child_exited since the surface is already tearing down.
+                    log.info("vsock recv error (socket closed), read thread exiting", .{});
+                    wsl_log.print("threadReadSocket: recv error (n={d}), socket closed locally", .{n});
+                }
+                return;
+            }
+            @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..@intCast(n)] });
+        }
+    }
+
+    /// Read loop for pipes (ConPTY) using ReadFile.
+    fn threadReadPipe(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
+        wsl_log.print("threadReadPipe: started, fd={*}", .{fd});
+        var buf: [64 * 1024]u8 = undefined;
         while (true) {
             while (true) {
                 var n: windows.DWORD = 0;
@@ -1379,11 +1739,34 @@ pub const ReadThread = struct {
                         // Check for a quit signal
                         .OPERATION_ABORTED => break,
 
+                        // Connection/pipe closed by remote end — clean exit.
+                        .BROKEN_PIPE,
+                        .NETNAME_DELETED,
+                        .GRACEFUL_DISCONNECT,
+                        .CONNECTION_ABORTED,
+                        => {
+                            log.info("read fd closed ({}), read thread exiting", .{err});
+                            wsl_log.print("threadReadPipe: pipe closed ({s}), pushing child_exited", .{@tagName(err)});
+                            _ = io.surface_mailbox.push(.{
+                                .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
+                            }, .{ .forever = {} });
+                            return;
+                        },
+
                         else => {
                             log.err("io reader error err={}", .{err});
+                            wsl_log.print("threadReadPipe: fatal error ({s})", .{@tagName(err)});
                             unreachable;
                         },
                     }
+                }
+
+                if (n == 0) {
+                    log.info("read fd EOF, read thread exiting", .{});
+                    _ = io.surface_mailbox.push(.{
+                        .child_exited = .{ .exit_code = 0, .runtime_ms = 0 },
+                    }, .{ .forever = {} });
+                    return;
                 }
 
                 @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
@@ -1403,6 +1786,36 @@ pub const ReadThread = struct {
         }
     }
 };
+
+/// Display a status message in the terminal surface.
+/// Called from the IO thread before blocking operations (e.g. VsockBridge.open).
+/// The renderer thread is separate and will paint the message while we block.
+fn showWslStatus(io: *termio.Termio, msg: []const u8) void {
+    {
+        io.renderer_state.mutex.lock();
+        defer io.renderer_state.mutex.unlock();
+        const t = io.renderer_state.terminal;
+        t.modes.set(.cursor_visible, false);
+        t.eraseDisplay(.complete, false);
+        t.carriageReturn();
+        t.printString(msg) catch {};
+    }
+    io.renderer_wakeup.notify() catch {};
+}
+
+/// Clear the status message and reset the terminal for normal output.
+/// Called from the IO thread after the blocking operation completes.
+fn clearWslStatus(io: *termio.Termio) void {
+    {
+        io.renderer_state.mutex.lock();
+        defer io.renderer_state.mutex.unlock();
+        const t = io.renderer_state.terminal;
+        t.eraseDisplay(.complete, false);
+        t.carriageReturn();
+        t.modes.set(.cursor_visible, true);
+    }
+    io.renderer_wakeup.notify() catch {};
+}
 
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
@@ -1554,39 +1967,28 @@ fn execCommand(
             defer args.deinit(alloc);
 
             if (comptime builtin.os.tag == .windows) {
-                // On Windows we run the shell value directly rather than
-                // wrapping in `cmd.exe /C <shell>`. An intermediate cmd
-                // process is wasteful for the common case (`wsl ~`,
-                // `pwsh -NoLogo`, etc.) and has visible side effects
-                // (extra process in the tree, per-process cmd AutoRun
-                // state not reaching the user's actual shell).
-                //
-                // Values with arguments are split on whitespace. This
-                // does not honor Windows CLI quoting rules; users who
-                // need quoted arguments should use the direct command
-                // form, which takes an argv array as-is.
-                //
-                // Note we don't free any of the memory below since it is
-                // allocated in the arena.
+                // If the shell value is a simple program with no arguments,
+                // run it directly so that features like cmd.exe's AutoRun
+                // registry value (init.cmd) work properly. Wrapping in
+                // `cmd.exe /C ...` disables AutoRun on the wrapped shell.
                 if (std.mem.indexOfAny(u8, v, " \t") == null) {
-                    // No arguments. If the shell is literally "cmd.exe"
-                    // (the default), resolve via %COMSPEC% which is the
-                    // documented path to the current command processor.
-                    // Other values are passed as-is and resolved by
-                    // `internal_os.path.expand` in Command.startWindows.
-                    const argv0 = if (std.ascii.eqlIgnoreCase(v, "cmd.exe"))
+                    // If `v` is exactly "cmd.exe" (no path), use %COMSPEC%
+                    // which contains the absolute path to the command processor.
+                    const path = if (std.mem.eql(u8, v, "cmd.exe"))
                         std.process.getEnvVarOwned(alloc, "COMSPEC") catch
-                            try alloc.dupe(u8, v)
+                            try alloc.dupe(u8, "C:\\Windows\\System32\\cmd.exe")
                     else
                         try alloc.dupe(u8, v);
-                    try args.append(alloc, try alloc.dupeZ(u8, argv0));
-                } else {
-                    var it = std.mem.tokenizeAny(u8, v, " \t");
-                    while (it.next()) |tok| {
-                        try args.append(alloc, try alloc.dupeZ(u8, tok));
-                    }
+                    try args.append(alloc, try alloc.dupeZ(u8, path));
+                    break :shell try args.toOwnedSlice(alloc);
                 }
-                break :shell try args.toOwnedSlice(alloc);
+
+                // Otherwise (shell contains arguments), wrap in cmd.exe /C
+                // so we don't have to parse the command line ourselves.
+                const comspec = std.process.getEnvVarOwned(alloc, "COMSPEC") catch
+                    try alloc.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
+                try args.append(alloc, try alloc.dupeZ(u8, comspec));
+                try args.append(alloc, "/C");
             } else {
                 // We run our shell wrapped in `/bin/sh` so that we don't have
                 // to parse the command line ourselves if it has arguments.
@@ -1773,85 +2175,4 @@ test "execCommand: direct command, config freed" {
     try testing.expectEqual(2, result.len);
     try testing.expectEqualStrings(result[0], "foo");
     try testing.expectEqualStrings(result[1], "bar baz");
-}
-
-test "execCommand windows: bare cmd.exe resolves via COMSPEC" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const testing = std.testing;
-    var arena = ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const result = try execCommand(alloc, .{ .shell = "cmd.exe" }, struct {
-        fn get(_: Allocator) !PasswdEntry {
-            return .{};
-        }
-    });
-
-    try testing.expectEqual(1, result.len);
-
-    // Expect COMSPEC if available, otherwise the documented fallback.
-    const expected = std.process.getEnvVarOwned(alloc, "COMSPEC") catch
-        try alloc.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
-    try testing.expectEqualStrings(expected, result[0]);
-}
-
-test "execCommand windows: bare non-cmd shell is passed through" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const testing = std.testing;
-    var arena = ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const result = try execCommand(alloc, .{ .shell = "pwsh.exe" }, struct {
-        fn get(_: Allocator) !PasswdEntry {
-            return .{};
-        }
-    });
-
-    try testing.expectEqual(1, result.len);
-    try testing.expectEqualStrings("pwsh.exe", result[0]);
-}
-
-test "execCommand windows: shell with args is split on whitespace" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const testing = std.testing;
-    var arena = ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const result = try execCommand(alloc, .{ .shell = "wsl ~" }, struct {
-        fn get(_: Allocator) !PasswdEntry {
-            return .{};
-        }
-    });
-
-    try testing.expectEqual(2, result.len);
-    try testing.expectEqualStrings("wsl", result[0]);
-    try testing.expectEqualStrings("~", result[1]);
-}
-
-test "execCommand windows: direct command is passed through unchanged" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-
-    const testing = std.testing;
-    var arena = ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const result = try execCommand(alloc, .{ .direct = &.{
-        "C:\\tools\\foo.exe",
-        "arg with spaces",
-    } }, struct {
-        fn get(_: Allocator) !PasswdEntry {
-            return .{};
-        }
-    });
-
-    try testing.expectEqual(2, result.len);
-    try testing.expectEqualStrings("C:\\tools\\foo.exe", result[0]);
-    try testing.expectEqualStrings("arg with spaces", result[1]);
 }

@@ -89,8 +89,15 @@ fn configPath(alloc_arena: Allocator) ![]const u8 {
 /// Returns a const list of possible paths the main config file could be
 /// in for the current OS.
 fn configPathCandidates(alloc_arena: Allocator) ![]const []const u8 {
-    var paths: std.ArrayList([]const u8) = try .initCapacity(alloc_arena, 4);
+    var paths: std.ArrayList([]const u8) = try .initCapacity(alloc_arena, 5);
     errdefer paths.deinit(alloc_arena);
+
+    // On Windows, exe-sibling config is highest priority (portable)
+    if (comptime builtin.os.tag == .windows) {
+        if (try file_load.exeSiblingConfigPath(alloc_arena)) |p| {
+            paths.appendAssumeCapacity(p);
+        }
+    }
 
     if (comptime builtin.os.tag == .macos) {
         paths.appendAssumeCapacity(try file_load.defaultAppSupportPath(alloc_arena));

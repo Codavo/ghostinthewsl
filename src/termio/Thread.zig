@@ -430,7 +430,20 @@ fn coalesceCallback(
     if (cb.self.coalesce_data.resize) |v| {
         cb.self.coalesce_data.resize = null;
         cb.io.resize(&cb.data, v) catch |err| {
-            log.warn("error during resize err={}", .{err});
+            // resize() no longer returns ResizeDeferred — on mutex contention
+            // it delegates to the read thread via pending_resize, so only OOM
+            // or similar errors reach here. Retry with a longer delay.
+            log.warn("error during resize err={}, will retry", .{err});
+            cb.self.coalesce_data.resize = v;
+            cb.self.coalesce.reset(
+                &cb.self.loop,
+                &cb.self.coalesce_c,
+                &cb.self.coalesce_cancel_c,
+                250,
+                CallbackData,
+                cb,
+                coalesceCallback,
+            );
         };
     }
 

@@ -362,6 +362,14 @@ fn loadAndAddImage(
     // Validate and store our image
     var img = try loading.complete(alloc);
     errdefer img.deinit(alloc);
+
+    // When replacing an existing image, purge all stale placements.
+    // Without this, virtual placements (U=1) accumulate unboundedly
+    // because `delete all` skips them, causing O(n²) degradation.
+    if (storage.images.contains(img.id)) {
+        storage.removeAllPlacementsForImage(img.id, terminal.screens.active);
+    }
+
     try storage.addImage(alloc, img);
 
     // Get our display settings

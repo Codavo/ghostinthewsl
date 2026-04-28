@@ -394,7 +394,8 @@ fn registerProgressClass() !void {
 
 /// Disable VSync via WGL extension for lower input latency.
 pub fn disableVSync(_: *Self) void {
-    const func: ?*const fn (i32) callconv(.winapi) i32 = @ptrCast(wglGetProcAddress("wglSwapIntervalEXT"));
+    const func: ?*const fn (i32) callconv(.winapi) i32 =
+        @ptrCast(@alignCast(wglGetProcAddress("wglSwapIntervalEXT")));
     if (func) |setInterval| {
         _ = setInterval(0);
     }

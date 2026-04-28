@@ -188,6 +188,24 @@ pub const ImageStorage = struct {
         self.dirty = true;
     }
 
+    /// Remove all placements for a specific image ID. This is used when
+    /// an image is being replaced (re-transmitted with the same ID) to
+    /// prevent unbounded accumulation of stale placements — particularly
+    /// virtual placements (U=1) which are exempt from `delete all`.
+    pub fn removeAllPlacementsForImage(
+        self: *ImageStorage,
+        image_id: u32,
+        s: *terminal.Screen,
+    ) void {
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.image_id == image_id) {
+                entry.value_ptr.deinit(s);
+                self.placements.removeByPtr(entry.key_ptr);
+            }
+        }
+    }
+
     fn clearPlacements(self: *ImageStorage, s: *terminal.Screen) void {
         var it = self.placements.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(s);

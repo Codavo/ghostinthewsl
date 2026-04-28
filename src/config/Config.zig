@@ -2408,8 +2408,7 @@ keybind: Keybinds = .{},
 /// default even if this is `false`. The clipboard it pastes from follows
 /// this setting: with `true` (or `false`) it reads from the selection
 /// clipboard (falling back to the system clipboard on platforms without a
-/// selection clipboard); with `clipboard` it reads from the system
-/// clipboard.
+/// selection clipboard), while `clipboard` uses the system clipboard.
 ///
 /// The default value is true on Linux and macOS.
 @"copy-on-select": CopyOnSelect = switch (builtin.os.tag) {
@@ -2434,8 +2433,8 @@ keybind: Keybinds = .{},
 /// The action to take when the user middle-clicks on the terminal surface.
 ///
 /// Valid values:
-///   * `primary-paste` - Paste from the selection (or system) clipboard per
-///      `copy-on-select`.
+///   * `primary-paste` - Paste from the selection clipboard if possible,
+///     falling back to the system clipboard on platforms without one.
 ///   * `ignore` - Do nothing, ignore the middle click.
 ///
 /// The default value is `primary-paste`.
@@ -3558,6 +3557,31 @@ else
 /// surfaces.
 @"linux-cgroup-hard-fail": bool = false,
 
+/// Enable WSL (Windows Subsystem for Linux) PTY bridge mode. When enabled,
+/// Ghostty will launch a bridge process inside WSL that creates a real
+/// Linux PTY, bypassing Windows ConPTY entirely. This preserves all escape
+/// sequences including the kitty graphics protocol.
+///
+/// Valid values are:
+///
+///   * `false` - Use standard ConPTY (default Windows behavior).
+///   * `true` - Use WSL PTY bridge mode.
+@"wsl-mode": bool = true,
+
+/// The WSL distribution to use when `wsl-mode` is enabled. If not set,
+/// the default WSL distribution will be used.
+@"wsl-distro": ?[:0]const u8 = null,
+
+/// The shell to launch inside WSL when `wsl-mode` is enabled. If not set,
+/// the default login shell of the WSL distribution will be used.
+@"wsl-shell": ?[:0]const u8 = null,
+
+/// Automatically restart the WSL bridge if it crashes unexpectedly.
+/// Only applies when `wsl-mode` is true. The bridge will be restarted
+/// if it exits with a non-zero code and was running for more than
+/// 2 seconds. This prevents restart loops for immediate failures.
+@"wsl-auto-restart": bool = true,
+
 /// Enable or disable GTK's OpenGL debugging logs. The default is `true` for
 /// debug builds, `false` for all others.
 ///
@@ -4023,7 +4047,18 @@ fn writeConfigTemplate(path: []const u8) !void {
 /// The legacy `config` file (without extension) is first loaded,
 /// then `config.ghostty`.
 pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
-    // Load XDG first
+    // On Windows, check for portable exe-sibling config first
+    var exe_sibling_loaded = false;
+    if (comptime builtin.os.tag == .windows) {
+        if (try file_load.exeSiblingConfigPath(alloc)) |exe_path| {
+            defer alloc.free(exe_path);
+            if (self.loadOptionalFile(alloc, exe_path) != .not_found) {
+                exe_sibling_loaded = true;
+            }
+        }
+    }
+
+    // Load XDG paths
     const legacy_xdg_path = try file_load.legacyDefaultXdgPath(alloc);
     defer alloc.free(legacy_xdg_path);
     const xdg_path = try file_load.defaultXdgPath(alloc);
@@ -4086,10 +4121,24 @@ pub fn loadDefaultFiles(self: *Config, alloc: Allocator) !void {
             };
         }
     } else {
-        if (!xdg_loaded) {
-            writeConfigTemplate(xdg_path) catch |err| {
-                log.warn("error creating template config file err={}", .{err});
-            };
+        if (!xdg_loaded and !exe_sibling_loaded) {
+            // On Windows, create template as exe-sibling for portability
+            if (comptime builtin.os.tag == .windows) {
+                if (try file_load.exeSiblingConfigPath(alloc)) |exe_path| {
+                    defer alloc.free(exe_path);
+                    writeConfigTemplate(exe_path) catch |err| {
+                        log.warn("error creating template config file err={}", .{err});
+                    };
+                } else {
+                    writeConfigTemplate(xdg_path) catch |err| {
+                        log.warn("error creating template config file err={}", .{err});
+                    };
+                }
+            } else {
+                writeConfigTemplate(xdg_path) catch |err| {
+                    log.warn("error creating template config file err={}", .{err});
+                };
+            }
         }
     }
 }
@@ -6411,22 +6460,6 @@ pub const RepeatableFontVariation = struct {
     }
 };
 
-/// Returns true if the given key event would trigger a keybinding
-/// if it were to be processed. This is useful for determining if
-/// a key event should be sent to the terminal or not.
-pub fn keyEventIsBinding(
-    self: *Config,
-    event: inputpkg.KeyEvent,
-) bool {
-    switch (event.action) {
-        .release => return false,
-        .press, .repeat => {},
-    }
-
-    // If we have a keybinding for this event then we return true.
-    return self.keybind.set.getEvent(event) != null;
-}
-
 /// Stores a set of keybinds.
 pub const Keybinds = struct {
     set: inputpkg.Binding.Set = .{},
@@ -6777,27 +6810,13 @@ pub const Keybinds = struct {
             // Semantic prompts
             try self.set.put(
                 alloc,
-                .{ .key = .{ .physical = .arrow_up }, .mods = .{ .shift = true, .ctrl = true } },
+                .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .jump_to_prompt = -1 },
             );
             try self.set.put(
                 alloc,
-                .{ .key = .{ .physical = .arrow_down }, .mods = .{ .shift = true, .ctrl = true } },
-                .{ .jump_to_prompt = 1 },
-            );
-
-            // Move tab
-            try self.set.putFlags(
-                alloc,
-                .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true, .ctrl = true } },
-                .{ .move_tab = -1 },
-                .{ .performable = true },
-            );
-            try self.set.putFlags(
-                alloc,
                 .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true, .ctrl = true } },
-                .{ .move_tab = 1 },
-                .{ .performable = true },
+                .{ .jump_to_prompt = 1 },
             );
 
             // Search
@@ -8669,7 +8688,7 @@ pub const MiddleClickAction = enum {
     /// Paste from the selection/standard clipboard per `copy-on-select`.
     @"primary-paste",
 
-    /// No action is taken on middle click.
+    /// No action is taken on middle-click.
     ignore,
 };
 

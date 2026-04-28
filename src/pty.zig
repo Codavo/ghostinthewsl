@@ -390,9 +390,9 @@ const WindowsPty = struct {
                 const close_ptr = GetProcAddress(module, "ClosePseudoConsole");
                 if (create_ptr != null and resize_ptr != null and close_ptr != null) {
                     api_cache = .{
-                        .create = @ptrCast(create_ptr.?),
-                        .resize = @ptrCast(resize_ptr.?),
-                        .close = @ptrCast(close_ptr.?),
+                        .create = @ptrCast(@alignCast(create_ptr.?)),
+                        .resize = @ptrCast(@alignCast(resize_ptr.?)),
+                        .close = @ptrCast(@alignCast(close_ptr.?)),
                     };
                     log.info("using ConPTY APIs from adjacent conpty.dll", .{});
                 } else {

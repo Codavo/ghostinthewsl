@@ -18,6 +18,7 @@ const SplitTree = @import("SplitTree.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const PromptDialog = @import("PromptDialog.zig");
 const SearchPanel = @import("SearchPanel.zig");
+const VsockBridge = @import("VsockBridge.zig");
 const sys = @import("sys.zig");
 
 const log = std.log.scoped(.win32);
@@ -32,10 +33,12 @@ const WPARAM = sys.WPARAM;
 const LPARAM = sys.LPARAM;
 const LRESULT = sys.LRESULT;
 const RECT = sys.RECT;
+const POINT = sys.POINT;
 const MSG = sys.MSG;
 const PAINTSTRUCT = sys.PAINTSTRUCT;
 const WM_CLOSE = sys.WM_CLOSE;
 const WM_SIZE = sys.WM_SIZE;
+const WM_GETMINMAXINFO: UINT = 0x0024;
 const WM_PAINT = sys.WM_PAINT;
 const WM_KEYDOWN = sys.WM_KEYDOWN;
 const WM_CHAR = sys.WM_CHAR;
@@ -44,6 +47,7 @@ const WM_WAKEUP = sys.WM_WAKEUP;
 const COPYDATASTRUCT = sys.COPYDATASTRUCT;
 
 // Additional externs not in sys.zig
+extern "user32" fn ClientToScreen(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) BOOL;
 extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
@@ -51,11 +55,22 @@ extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
 extern "user32" fn MessageBoxW(hWnd: ?HWND, lpText: [*:0]const u16, lpCaption: [*:0]const u16, uType: u32) callconv(.winapi) c_int;
 extern "user32" fn SetProcessDpiAwarenessContext(value: isize) callconv(.winapi) BOOL;
+extern "user32" fn FillRect(hDC: ?*anyopaque, lprc: *const RECT, hbr: ?*anyopaque) callconv(.winapi) c_int;
+extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(.winapi) BOOL;
 extern "user32" fn IsWindowVisible(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn SetLayeredWindowAttributes(hWnd: HWND, crKey: u32, bAlpha: u8, dwFlags: u32) callconv(.winapi) BOOL;
 extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 extern "user32" fn FlashWindowEx(pfwi: *FLASHWINFO) callconv(.winapi) BOOL;
 const WS_EX_LAYERED: u32 = 0x00080000;
+
+const MINMAXINFO = extern struct {
+    ptReserved: sys.POINT,
+    ptMaxSize: sys.POINT,
+    ptMaxPosition: sys.POINT,
+    ptMinTrackSize: sys.POINT,
+    ptMaxTrackSize: sys.POINT,
+};
 
 const FLASHWINFO = extern struct {
     cbSize: UINT,
@@ -68,6 +83,7 @@ const FLASHW_CAPTION: DWORD = 0x00000001;
 const FLASHW_TRAY: DWORD = 0x00000002;
 const FLASHW_ALL: DWORD = FLASHW_CAPTION | FLASHW_TRAY;
 const FLASHW_TIMERNOFG: DWORD = 0x0000000C;
+extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: UINT) callconv(.winapi) BOOL;
 extern "advapi32" fn RegOpenKeyExW(hKey: ?*anyopaque, lpSubKey: [*:0]const u16, ulOptions: DWORD, samDesired: DWORD, phkResult: *?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegCloseKey(hKey: ?*anyopaque) callconv(.winapi) i32;
 extern "advapi32" fn RegQueryValueExW(hKey: ?*anyopaque, lpValueName: [*:0]const u16, lpReserved: ?*DWORD, lpType: ?*DWORD, lpData: ?[*]u8, lpcbData: ?*DWORD) callconv(.winapi) i32;
@@ -173,6 +189,15 @@ search_panel_initialized: bool = false,
 
 /// Single-instance mutex handle.
 instance_mutex: ?*anyopaque = null,
+
+/// Handle to the WSL keepalive process (wsl.exe -- sleep infinity).
+/// Keeps the WSL VM alive while the app is running. One process suffices
+/// because all distros share a single VM by default. Per-distro VM
+/// isolation (opt-in) would need one keepalive per distro.
+wsl_keepalive: ?*anyopaque = null,
+
+/// Cached list of installed WSL distributions (lazy-loaded).
+wsl_distros: ?[][]const u8 = null,
 
 const NewWindowOptions = Window.CreateOptions;
 
@@ -309,10 +334,37 @@ pub fn init(
         return error.AlreadyRunning;
     }
 
+    // If WSL mode is enabled, pre-warm WSL in the background.
+    // This runs a single `wsl.exe -- true` to ensure the VM is booted
+    // before the first tab's IO thread needs to connect, then starts
+    // a keepalive process to prevent WSL from idling out.
+    if (config.@"wsl-mode") {
+        const distro = config.@"wsl-distro";
+        _ = std.Thread.spawn(.{}, initWslBackground, .{ self, distro }) catch |err| {
+            log.warn("failed to spawn WSL init thread: {}", .{err});
+        };
+    }
+
     // Create the first window
     const window = try Window.create(alloc, self, .none);
     try self.windows.append(alloc, window);
     self.focused_window = window;
+}
+
+/// Background thread: pre-warm WSL so the first tab can connect quickly,
+/// then start a keepalive process to prevent WSL from idling out.
+fn initWslBackground(self: *App, distro: ?[:0]const u8) void {
+    const wsl_log = @import("wsl_log.zig");
+    wsl_log.print("initWslBackground: pre-warming WSL (distro={s})", .{
+        if (distro) |d| d else "(default)",
+    });
+
+    VsockBridge.ensureWslRunning(distro);
+
+    wsl_log.print("initWslBackground: WSL warm-up complete, starting keepalive", .{});
+
+    // Start the keepalive process now that WSL is confirmed running.
+    self.wsl_keepalive = VsockBridge.startKeepalive(distro);
 }
 
 pub fn run(self: *App) !void {
@@ -369,7 +421,22 @@ pub fn run(self: *App) !void {
     }
 }
 
+/// Get the cached list of installed WSL distributions.
+/// Lazily loads on first call by running `wsl.exe -l -q`.
+pub fn getWslDistros(self: *App) [][]const u8 {
+    if (self.wsl_distros) |distros| return distros;
+    self.wsl_distros = VsockBridge.listDistros(self.alloc) catch |err| {
+        log.err("failed to enumerate WSL distros: {}", .{err});
+        return &.{};
+    };
+    return self.wsl_distros orelse &.{};
+}
+
 pub fn terminate(self: *App) void {
+    if (self.wsl_distros) |distros| {
+        VsockBridge.freeDistroList(self.alloc, distros);
+        self.wsl_distros = null;
+    }
     if (self.command_palette_initialized) {
         self.command_palette.deinit();
     }
@@ -393,6 +460,12 @@ pub fn terminate(self: *App) void {
     self.windows.deinit(self.alloc);
     self.config.deinit();
     self.alloc.destroy(self.config);
+    // Terminate the WSL keepalive process so WSL can idle out.
+    if (self.wsl_keepalive) |h| {
+        _ = TerminateProcess(h, 0);
+        _ = sys.CloseHandle(h);
+        self.wsl_keepalive = null;
+    }
     if (self.instance_mutex) |h| {
         _ = sys.ReleaseMutex(h);
         _ = sys.CloseHandle(h);
@@ -482,6 +555,8 @@ pub fn performAction(
                 defer self.alloc.free(utf16);
                 _ = sys.SetWindowTextW(hwnd, utf16.ptr);
             }
+            // Also update the active tab title to match
+            window.setActiveTabTitle(value.title) catch {};
             return true;
         },
         .toggle_maximize => {
@@ -604,7 +679,7 @@ pub fn performAction(
             const msg_w = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, msg) catch return false;
             defer self.alloc.free(msg_w);
 
-            const caption = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+            const caption = std.unicode.utf8ToUtf16LeStringLiteral("GhostInTheWSL");
             _ = MessageBoxW(hwnd, msg_w.ptr, caption, 0x00000040);
             return true;
         },
@@ -820,8 +895,8 @@ pub fn performAction(
             const window = self.focused_window orelse return true;
             if (window.hwnd) |hwnd| {
                 const title = switch (value) {
-                    .on => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty (read-only)"),
-                    .off => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                    .on => std.unicode.utf8ToUtf16LeStringLiteral("GhostInTheWSL (read-only)"),
+                    .off => std.unicode.utf8ToUtf16LeStringLiteral("GhostInTheWSL"),
                 };
                 _ = sys.SetWindowTextW(hwnd, title);
             }
@@ -833,8 +908,8 @@ pub fn performAction(
             const window = self.focused_window orelse return true;
             if (window.hwnd) |hwnd| {
                 const title = switch (value) {
-                    .trigger => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty (key sequence...)"),
-                    .end => std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"),
+                    .trigger => std.unicode.utf8ToUtf16LeStringLiteral("GhostInTheWSL (key sequence...)"),
+                    .end => std.unicode.utf8ToUtf16LeStringLiteral("GhostInTheWSL"),
                 };
                 _ = sys.SetWindowTextW(hwnd, title);
             }
@@ -847,13 +922,13 @@ pub fn performAction(
                 switch (value) {
                     .activate => |name| {
                         var buf: [128]u8 = undefined;
-                        const msg = std.fmt.bufPrintZ(&buf, "Ghostty ({s})", .{name}) catch return true;
+                        const msg = std.fmt.bufPrintZ(&buf, "GhostInTheWSL ({s})", .{name}) catch return true;
                         const wtext = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, msg) catch return true;
                         defer self.alloc.free(wtext);
                         _ = sys.SetWindowTextW(hwnd, wtext.ptr);
                     },
                     .deactivate, .deactivate_all => {
-                        _ = sys.SetWindowTextW(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("Ghostty"));
+                        _ = sys.SetWindowTextW(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("GhostInTheWSL"));
                     },
                 }
             }
@@ -1061,7 +1136,7 @@ fn showNotification(self: *App, hwnd: HWND, title: [:0]const u8, body: [:0]const
     @memcpy(nid.szInfo[0..body_len], body_utf16[0..body_len]);
     nid.szInfo[body_len] = 0;
 
-    const tip = std.unicode.utf8ToUtf16LeStringLiteral("Ghostty");
+    const tip = std.unicode.utf8ToUtf16LeStringLiteral("GhostInTheWSL");
     @memcpy(nid.szTip[0..tip.len], tip);
 
     if (!self.tray_registered) {
@@ -1172,16 +1247,42 @@ fn shouldDispatchKeyPress(vk: WPARAM, mods: @import("../../input.zig").Mods) boo
 
 fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
     return switch (vk) {
-        0x41 => .key_a, 0x42 => .key_b, 0x43 => .key_c, 0x44 => .key_d,
-        0x45 => .key_e, 0x46 => .key_f, 0x47 => .key_g, 0x48 => .key_h,
-        0x49 => .key_i, 0x4A => .key_j, 0x4B => .key_k, 0x4C => .key_l,
-        0x4D => .key_m, 0x4E => .key_n, 0x4F => .key_o, 0x50 => .key_p,
-        0x51 => .key_q, 0x52 => .key_r, 0x53 => .key_s, 0x54 => .key_t,
-        0x55 => .key_u, 0x56 => .key_v, 0x57 => .key_w, 0x58 => .key_x,
-        0x59 => .key_y, 0x5A => .key_z,
-        0x30 => .digit_0, 0x31 => .digit_1, 0x32 => .digit_2, 0x33 => .digit_3,
-        0x34 => .digit_4, 0x35 => .digit_5, 0x36 => .digit_6, 0x37 => .digit_7,
-        0x38 => .digit_8, 0x39 => .digit_9,
+        0x41 => .key_a,
+        0x42 => .key_b,
+        0x43 => .key_c,
+        0x44 => .key_d,
+        0x45 => .key_e,
+        0x46 => .key_f,
+        0x47 => .key_g,
+        0x48 => .key_h,
+        0x49 => .key_i,
+        0x4A => .key_j,
+        0x4B => .key_k,
+        0x4C => .key_l,
+        0x4D => .key_m,
+        0x4E => .key_n,
+        0x4F => .key_o,
+        0x50 => .key_p,
+        0x51 => .key_q,
+        0x52 => .key_r,
+        0x53 => .key_s,
+        0x54 => .key_t,
+        0x55 => .key_u,
+        0x56 => .key_v,
+        0x57 => .key_w,
+        0x58 => .key_x,
+        0x59 => .key_y,
+        0x5A => .key_z,
+        0x30 => .digit_0,
+        0x31 => .digit_1,
+        0x32 => .digit_2,
+        0x33 => .digit_3,
+        0x34 => .digit_4,
+        0x35 => .digit_5,
+        0x36 => .digit_6,
+        0x37 => .digit_7,
+        0x38 => .digit_8,
+        0x39 => .digit_9,
         0x08 => .backspace,
         0x09 => .tab,
         0x0D => .enter,
@@ -1210,9 +1311,18 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
         0xBC => .comma,
         0xBE => .period,
         0xBF => .slash,
-        0x70 => .f1, 0x71 => .f2, 0x72 => .f3, 0x73 => .f4,
-        0x74 => .f5, 0x75 => .f6, 0x76 => .f7, 0x77 => .f8,
-        0x78 => .f9, 0x79 => .f10, 0x7A => .f11, 0x7B => .f12,
+        0x70 => .f1,
+        0x71 => .f2,
+        0x72 => .f3,
+        0x73 => .f4,
+        0x74 => .f5,
+        0x75 => .f6,
+        0x76 => .f7,
+        0x77 => .f8,
+        0x78 => .f9,
+        0x79 => .f10,
+        0x7A => .f11,
+        0x7B => .f12,
         else => .unidentified,
     };
 }
@@ -1225,6 +1335,12 @@ fn getWindow(hwnd: HWND) ?*Window {
     const ptr = sys.GetWindowLongPtrW(hwnd, sys.GWLP_USERDATA);
     if (ptr == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(ptr)));
+}
+
+/// Convert config background color to Win32 COLORREF (0x00BBGGRR).
+fn configBgColor(config: *const Config) u32 {
+    const bg = config.background;
+    return (@as(u32, bg.b) << 16) | (@as(u32, bg.g) << 8) | @as(u32, bg.r);
 }
 
 pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT {
@@ -1261,17 +1377,47 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
         },
         WM_CLOSE => {
             if (getWindow(hwnd)) |window| {
-                // Close the focused surface's core, which will trigger
-                // Surface.close -> Window.closeSurface -> App.closeWindow
-                if (window.getFocusedSurface()) |s| {
-                    if (s.core_surface) |core| {
-                        core.close();
+                const tab_count = window.tabs.items.len;
+                if (tab_count > 1) {
+                    // Confirm before closing multiple tabs
+                    const msg_text = std.fmt.allocPrintSentinel(
+                        window.app.alloc,
+                        "You are about to close {d} open tabs. Are you sure?",
+                        .{tab_count},
+                        0,
+                    ) catch {
+                        window.app.closeWindow(window);
                         return 0;
-                    }
+                    };
+                    defer window.app.alloc.free(msg_text);
+                    const msg_w = std.unicode.utf8ToUtf16LeAllocZ(window.app.alloc, msg_text) catch {
+                        window.app.closeWindow(window);
+                        return 0;
+                    };
+                    defer window.app.alloc.free(msg_w);
+                    // MB_OKCANCEL (1) | MB_ICONWARNING (0x30)
+                    const result = MessageBoxW(hwnd, msg_w.ptr, std.unicode.utf8ToUtf16LeStringLiteral("Close Window"), 0x31);
+                    if (result != 1) return 0; // User cancelled (IDOK == 1)
                 }
-                // Fallback: close the window directly
+                // Close the entire window with all tabs
                 window.app.closeWindow(window);
             }
+            return 0;
+        },
+        WM_GETMINMAXINFO => {
+            // Enforce minimum window size: 20 columns worth of pixels + chrome.
+            // Most terminals enforce ~80x24 minimum but 20 cols is enough to avoid
+            // crashes from impossibly small grids while letting users go fairly small.
+            const mmi: *MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
+
+            // Minimum client area: 160x100 pixels (~20 cols at typical font size).
+            // AdjustWindowRectEx adds frame/title bar to get the full window size.
+            var min_rect: sys.RECT = .{ .left = 0, .top = 0, .right = 160, .bottom = 100 };
+            const style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, -16)))); // GWL_STYLE
+            const ex_style: u32 = @truncate(@as(usize, @bitCast(sys.GetWindowLongPtrW(hwnd, -20)))); // GWL_EXSTYLE
+            _ = sys.AdjustWindowRectEx(&min_rect, style, 0, ex_style);
+            mmi.ptMinTrackSize.x = min_rect.right - min_rect.left;
+            mmi.ptMinTrackSize.y = min_rect.bottom - min_rect.top;
             return 0;
         },
         WM_SIZE => {
@@ -1320,6 +1466,18 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
             }
             return 0;
         },
+        0x0014 => { // WM_ERASEBKGND: fill with configured bg to prevent flash in gaps
+            const bg = if (getWindow(hwnd)) |w| configBgColor(w.app.config) else 0;
+            const hdc: ?*anyopaque = @ptrFromInt(wparam);
+            var rect: RECT = std.mem.zeroes(RECT);
+            _ = sys.GetClientRect(hwnd, &rect);
+            const brush = CreateSolidBrush(bg);
+            if (brush != null) {
+                _ = FillRect(hdc, &rect, brush);
+                _ = DeleteObject(brush);
+            }
+            return 1;
+        },
         else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -1330,6 +1488,21 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
 
 pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) LRESULT {
     switch (msg) {
+        // Fill with configured background on erase — the OpenGL renderer owns
+        // the surface, but before it draws the first frame (e.g. during tab
+        // switch), the GDI background is visible.
+        0x0014 => { // WM_ERASEBKGND
+            const bg = configBgColor(app.config);
+            const hdc: ?*anyopaque = @ptrFromInt(wparam);
+            var rect: RECT = std.mem.zeroes(RECT);
+            _ = sys.GetClientRect(hwnd, &rect);
+            const brush = CreateSolidBrush(bg);
+            if (brush != null) {
+                _ = FillRect(hdc, &rect, brush);
+                _ = DeleteObject(brush);
+            }
+            return 1;
+        },
         WM_PAINT => {
             var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
             _ = sys.BeginPaint(hwnd, &ps);
@@ -1447,6 +1620,20 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                     .x = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF))),
                     .y = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF))),
                 };
+                // Right-click release: show context menu if terminal isn't capturing mouse
+                if (msg == 0x0205 and !core.mouseCaptured()) {
+                    _ = ReleaseCapture();
+                    // Convert client coords to screen coords for the menu
+                    var pt: POINT = .{
+                        .x = @as(i16, @truncate(lparam & 0xFFFF)),
+                        .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+                    };
+                    _ = ClientToScreen(hwnd, &pt);
+                    if (surface.window) |w| {
+                        showContextMenu(app, w, hwnd, pt.x, pt.y);
+                    }
+                    return 0;
+                }
                 const input = @import("../../input.zig");
                 const button: input.MouseButton = switch (msg) {
                     0x0202 => .left,
@@ -1516,5 +1703,89 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             return 0;
         },
         else => return sys.DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// Context menu constants
+const MF_STRING: u32 = 0x0000;
+const MF_POPUP: u32 = 0x0010;
+const MF_SEPARATOR: u32 = 0x0800;
+const TPM_RIGHTBUTTON: u32 = 0x0002;
+const TPM_RETURNCMD: u32 = 0x0100;
+
+// Context menu item IDs
+const MENU_COPY: usize = 6001;
+const MENU_PASTE: usize = 6002;
+const MENU_NEW_TAB: usize = 6003;
+const MENU_DISTRO_BASE: usize = 6100;
+
+extern "user32" fn CreatePopupMenu() callconv(.winapi) ?*anyopaque;
+extern "user32" fn AppendMenuW(hMenu: *anyopaque, uFlags: u32, uIDNewItem: usize, lpNewItem: ?[*:0]const u16) callconv(.winapi) i32;
+extern "user32" fn TrackPopupMenu(hMenu: *anyopaque, uFlags: u32, x: i32, y: i32, nReserved: i32, hWnd: HWND, prcRect: ?*anyopaque) callconv(.winapi) i32;
+extern "user32" fn DestroyMenu(hMenu: *anyopaque) callconv(.winapi) i32;
+
+/// Show a right-click context menu with Copy, Paste, New Tab, and WSL distro submenu.
+pub fn showContextMenu(app: *App, window: *Window, hwnd: HWND, screen_x: i32, screen_y: i32) void {
+    const menu = CreatePopupMenu() orelse return;
+    defer _ = DestroyMenu(menu);
+
+    // Copy
+    _ = AppendMenuW(menu, MF_STRING, MENU_COPY, std.unicode.utf8ToUtf16LeStringLiteral("Copy"));
+    // Paste
+    _ = AppendMenuW(menu, MF_STRING, MENU_PASTE, std.unicode.utf8ToUtf16LeStringLiteral("Paste"));
+    // Separator
+    _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    // New Tab (default distro)
+    _ = AppendMenuW(menu, MF_STRING, MENU_NEW_TAB, std.unicode.utf8ToUtf16LeStringLiteral("New Tab"));
+
+    // "New Tab in" submenu with WSL distros
+    const distros = app.getWslDistros();
+    if (distros.len > 0) {
+        const submenu = CreatePopupMenu() orelse return;
+        for (distros, 0..) |distro, i| {
+            const wtext = std.unicode.utf8ToUtf16LeAllocZ(app.alloc, distro) catch continue;
+            defer app.alloc.free(wtext);
+            _ = AppendMenuW(submenu, MF_STRING, MENU_DISTRO_BASE + i, wtext.ptr);
+        }
+        _ = AppendMenuW(menu, MF_POPUP, @intFromPtr(submenu), std.unicode.utf8ToUtf16LeStringLiteral("New Tab in"));
+    }
+
+    // Show the menu and get the selected command
+    const cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, screen_x, screen_y, 0, hwnd, null);
+    const cmd_id: usize = if (cmd > 0) @intCast(cmd) else return;
+
+    switch (cmd_id) {
+        MENU_COPY => {
+            if (window.getFocusedSurface()) |s| {
+                if (s.core_surface) |core| {
+                    const input_mod = @import("../../input.zig");
+                    _ = core.performBindingAction(.{ .copy_to_clipboard = input_mod.Binding.Action.CopyToClipboard.default }) catch {};
+                }
+            }
+        },
+        MENU_PASTE => {
+            if (window.getFocusedSurface()) |s| {
+                if (s.core_surface) |core| {
+                    _ = core.performBindingAction(.{ .paste_from_clipboard = {} }) catch {};
+                }
+            }
+        },
+        MENU_NEW_TAB => {
+            window.newTab(.none) catch |err| {
+                log.err("failed to create new tab: {}", .{err});
+            };
+        },
+        else => {
+            // Check if it's a distro selection
+            if (cmd_id >= MENU_DISTRO_BASE and cmd_id < MENU_DISTRO_BASE + distros.len) {
+                const idx = cmd_id - MENU_DISTRO_BASE;
+                const distro = distros[idx];
+                const owned = app.alloc.dupeZ(u8, distro) catch return;
+                window.newTab(.{ .wsl_distro = owned }) catch |err| {
+                    log.err("failed to create tab for distro {s}: {}", .{ distro, err });
+                    app.alloc.free(owned);
+                };
+            }
+        },
     }
 }
