@@ -325,12 +325,11 @@ fn termiosTimer(
 ) xev.CallbackAction {
     // log.debug("termios timer fired", .{});
 
-    // This should never happen because we guard starting our
-    // timer on windows but we want this assertion to fire if
-    // we ever do start the timer on windows.
-    // TODO: support on windows
+    // Windows doesn't use termios, so this callback is a no-op there.
+    // We still disarm defensively in case the timer is ever started.
     if (comptime builtin.os.tag == .windows) {
-        @panic("termios timer not implemented on Windows");
+        _ = r catch {};
+        return .disarm;
     }
 
     _ = r catch |err| switch (err) {

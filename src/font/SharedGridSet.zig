@@ -250,6 +250,30 @@ fn collection(
         }
     }
 
+    // On Windows without font discovery, search system fonts by family name.
+    if (comptime builtin.os.tag == .windows and Discover == void) {
+        var name_buf: [256]u8 = undefined;
+
+        inline for (@typeInfo(Style).@"enum".fields) |field| {
+            const style = @field(Style, field.name);
+            for (key.descriptorsForStyle(style)) |desc| {
+                if (desc.family) |family| {
+                    if (self.findWindowsFont(family, desc, load_options)) |face| {
+                        log.info("font {s}: {s} (Windows)", .{
+                            field.name,
+                            face.name(&name_buf) catch "<unknown>",
+                        });
+                        _ = try c.add(self.alloc, face, .{
+                            .style = style,
+                            .fallback = false,
+                            .size_adjustment = .none,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Complete our styles to ensure we have something to satisfy every
     // possible style request. We do this before adding our built-in font
     // because we want to ensure our built-in styles are fallbacks to
@@ -435,6 +459,92 @@ pub const Map = std.HashMapUnmanaged(
 /// Initialize once and return the font discovery mechanism. This remains
 /// initialized throughout the lifetime of the application because some
 /// font discovery mechanisms (i.e. fontconfig) are unsafe to reinit.
+/// On Windows, search the system font directory for a font matching
+/// the given family name. Returns a loaded Face if found, null otherwise.
+fn findWindowsFont(
+    self: *SharedGridSet,
+    family: [:0]const u8,
+    desc: font.discovery.Descriptor,
+    load_options: Collection.LoadOptions,
+) ?Face {
+    _ = desc;
+    if (comptime builtin.os.tag != .windows) return null;
+
+    // System fonts directory
+    if (self.findInDir("C:\\Windows\\Fonts", family, load_options)) |face| return face;
+
+    // User-installed fonts directory (%LOCALAPPDATA%\Microsoft\Windows\Fonts)
+    var user_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const user_path = buildUserFontsPath(&user_path_buf) orelse return null;
+    if (self.findInDir(user_path, family, load_options)) |face| return face;
+
+    return null;
+}
+
+fn buildUserFontsPath(buf: []u8) ?[:0]u8 {
+    const local_appdata = std.process.getEnvVarOwned(std.heap.page_allocator, "LOCALAPPDATA") catch return null;
+    defer std.heap.page_allocator.free(local_appdata);
+    return std.fmt.bufPrintZ(buf, "{s}\\Microsoft\\Windows\\Fonts", .{local_appdata}) catch null;
+}
+
+fn findInDir(
+    self: *SharedGridSet,
+    dir_path: [:0]const u8,
+    family: [:0]const u8,
+    load_options: Collection.LoadOptions,
+) ?Face {
+    const fonts_dir = std.fs.openDirAbsoluteZ(dir_path, .{ .iterate = true }) catch return null;
+    var dir = fonts_dir;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+
+        const name = entry.name;
+        const is_font = std.mem.endsWith(u8, name, ".ttf") or
+            std.mem.endsWith(u8, name, ".ttc") or
+            std.mem.endsWith(u8, name, ".otf") or
+            std.mem.endsWith(u8, name, ".TTF") or
+            std.mem.endsWith(u8, name, ".TTC") or
+            std.mem.endsWith(u8, name, ".OTF");
+        if (!is_font) continue;
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const full_path = std.fmt.bufPrintZ(&path_buf, "{s}\\{s}", .{ dir_path, name }) catch continue;
+
+        var face_index: i32 = 0;
+        while (face_index < 16) : (face_index += 1) {
+            var face = Face.initFile(
+                self.font_lib,
+                full_path,
+                face_index,
+                load_options.faceOptions(),
+            ) catch break;
+
+            const ft_family: ?[*:0]const u8 = face.face.handle.*.family_name;
+            const matches = if (ft_family) |fam|
+                std.ascii.eqlIgnoreCase(std.mem.span(fam), family)
+            else
+                false;
+
+            if (matches) return face;
+
+            var name_buf2: [256]u8 = undefined;
+            const sfnt_name = face.name(&name_buf2) catch "";
+            if (sfnt_name.len > 0 and std.ascii.eqlIgnoreCase(sfnt_name, family)) {
+                return face;
+            }
+
+            face.deinit();
+
+            if (!std.mem.endsWith(u8, name, ".ttc") and !std.mem.endsWith(u8, name, ".TTC")) break;
+        }
+    }
+
+    return null;
+}
+
 fn discover(self: *SharedGridSet) !?*Discover {
     // If we're built without a font discovery mechanism, return null
     if (comptime Discover == void) return null;

@@ -294,6 +294,11 @@ fn setQosClass(self: *const Thread) void {
 
 fn syncDrawTimer(self: *Thread) void {
     skip: {
+        // On Win32, always keep the draw timer active because the IOCP
+        // async wakeup may have latency. The draw timer polls for new
+        // frame data at regular intervals.
+        if (comptime @hasDecl(apprt.runtime.Surface, "swapBuffers")) break :skip;
+
         // If our renderer supports animations and has them, then we
         // can apply draw timer based on custom shader animation configuration.
         if (@hasDecl(rendererpkg.Renderer, "hasAnimations") and
@@ -505,8 +510,20 @@ fn drawFrame(self: *Thread, now: bool) void {
             .{ .instant = {} },
         );
     } else {
+        // On Win32, update the GL viewport before drawing since there's
+        // no toolkit managing it for us.
+        if (comptime @hasDecl(apprt.runtime.Surface, "updateViewport")) {
+            self.surface.updateViewport();
+        }
+
         self.renderer.drawFrame(false) catch |err|
             log.warn("error drawing err={}", .{err});
+
+        // On Win32, we need to explicitly swap buffers after rendering
+        // since there's no toolkit managing the GL context for us.
+        if (comptime @hasDecl(apprt.runtime.Surface, "swapBuffers")) {
+            self.surface.swapBuffers();
+        }
     }
 }
 
@@ -581,6 +598,16 @@ fn drawCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+
+    // On Windows IOCP, async wakeup may be delayed, so we also
+    // update frame data on the draw timer to reduce input latency.
+    if (comptime @hasDecl(apprt.runtime.Surface, "swapBuffers")) {
+        t.drainMailbox() catch {};
+        t.renderer.updateFrame(
+            t.state,
+            t.flags.cursor_blink_visible,
+        ) catch {};
+    }
 
     // Draw
     t.drawFrame(false);
