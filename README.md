@@ -1,10 +1,12 @@
 # GhostInTheWSL
 
 <p align="center">
-    <img src="images/icons/icon_1024.png" alt="GhostInTheWSL logo" width="192">
+    <img src="images/ghostinthewsl-logo2.png" alt="GhostInTheWSL logo" width="192">
 </p>
 
 GhostInTheWSL is a Windows version of the [Ghostty](https://ghostty.org/docs) terminal emulator designed for use with WSL. The goal is a seamless modern terminal experience for WSL. It is available as a portable .exe or can be installed if desired.
+
+Downloads: [GitHub Releases](https://github.com/Codavo/ghostinthewsl/releases)
 
 It avoids the Windows terminal infrastructure and only connects directly to the WSL 2 Linux VM.
 
