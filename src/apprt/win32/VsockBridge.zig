@@ -35,7 +35,19 @@ const BRIDGE_SHELL_PATH = "$HOME/.local/bin/wsl-pty-bridge";
 const BRIDGE_DISPLAY_PATH = "~/.local/bin/wsl-pty-bridge";
 
 /// The embedded bridge binary (built from wsl-pty-bridge Rust crate).
-const embedded_bridge = @embedFile("wsl-pty-bridge.bin");
+/// Must be a static-pie musl binary (~1.4MB). A dynamically linked binary
+/// will fail inside WSL if the target distro lacks the required shared libs.
+const embedded_bridge = blk: {
+    const data = @embedFile("wsl-pty-bridge.bin");
+    // Sanity check: static musl binary is >100KB. A dynamically linked
+    // build is typically <50KB and won't run reliably across distros.
+    if (data.len < 100_000) {
+        @compileError("wsl-pty-bridge.bin is too small (" ++
+            std.fmt.comptimePrint("{d}", .{data.len}) ++
+            " bytes). Did you build with --target x86_64-unknown-linux-musl?");
+    }
+    break :blk data;
+};
 
 /// Cached FNV-1a hash of the embedded bridge binary for version detection.
 /// Computed once at runtime (microseconds for ~1.4MB) — comptime would be
@@ -549,14 +561,15 @@ pub fn ensureDeployed(config: Config) Error!void {
             "chmod +x \"$BIN_PATH.tmp\" && " ++
             "mv -f \"$BIN_PATH.tmp\" \"$BIN_PATH\" && " ++
             "echo \"$EXPECTED\" > \"$HASH_FILE\" && " ++
-            "pkill -f \"wsl-pty-bridge --daemon\" 2>/dev/null; " ++ // non-fatal
+            "pkill -f \"[w]sl-pty-bridge --daemon\" 2>/dev/null || true; " ++ // [w] trick avoids self-match
             // Install terminfo from remaining stdin
             "infocmp xterm-ghostty >/dev/null 2>&1 && {{ cat >/dev/null; exit 0; }}; " ++
             "if command -v tic >/dev/null 2>&1; then " ++
             "  mkdir -p ~/.terminfo 2>/dev/null; tic -x - 2>/dev/null; " ++
             "else " ++
             "  cat >/dev/null; " ++ // drain remaining stdin
-            "fi" ++
+            "fi; " ++
+            "exit 0" ++ // always succeed after binary deployed
             "'",
         .{
             BRIDGE_HASH_SHELL_PATH,

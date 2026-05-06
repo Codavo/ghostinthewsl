@@ -103,14 +103,15 @@ pub fn threadEnter(
     // For WSL mode, show a status message while connecting.
     // VsockBridge.open() can block for 10-15s on WSL cold start.
     const show_wsl_status = comptime builtin.os.tag == .windows and
-        @hasField(@TypeOf(self.subprocess), "wsl_mode") and true;
-    if (show_wsl_status and self.subprocess.wsl_mode) {
+        @hasField(@TypeOf(self.subprocess), "shell_mode") and true;
+    const is_wsl_mode = show_wsl_status and (self.subprocess.shell_mode == .wsl or self.subprocess.shell_mode == .auto);
+    if (is_wsl_mode) {
         showWslStatus(io, "Connecting to WSL...");
     }
 
     // Start our subprocess
     const pty_fds = self.subprocess.start(alloc) catch |err| {
-        if (show_wsl_status and self.subprocess.wsl_mode) {
+        if (is_wsl_mode) {
             clearWslStatus(io);
         }
 
@@ -126,7 +127,7 @@ pub fn threadEnter(
     };
 
     // Clear the status message now that we're connected
-    if (show_wsl_status and self.subprocess.wsl_mode) {
+    if (is_wsl_mode) {
         clearWslStatus(io);
     }
 
@@ -321,12 +322,14 @@ pub fn resize(
 ) !void {
     try self.subprocess.resize(grid_size, screen_size);
 
-    // In WSL mode, send the resize APC through xev's write path.
+    // In WSL/vsock mode, send the resize APC through xev's write path.
     // We can't call WriteFile directly because the data pipe uses
     // FILE_FLAG_OVERLAPPED for IOCP — synchronous WriteFile with
     // lpOverlapped=NULL is undefined behavior on such handles.
+    // Check vsock_socket (runtime state) rather than config to correctly
+    // handle auto mode that fell back to ConPTY.
     if (comptime builtin.os.tag == .windows) {
-        if (self.subprocess.wsl_mode) {
+        if (self.subprocess.vsock_socket != null) {
             const cols = std.math.cast(u16, grid_size.columns) orelse 80;
             const rows = std.math.cast(u16, grid_size.rows) orelse 24;
             const xpixel = std.math.cast(u16, screen_size.width) orelse 0;
@@ -379,7 +382,11 @@ fn processExit(
     _: *xev.Completion,
     r: xev.Process.WaitError!u32,
 ) xev.CallbackAction {
-    const exit_code = r catch unreachable;
+    const exit_code = r catch |err| {
+        log.warn("process watcher error: {}", .{err});
+        processExitCommon(td_.?, 1);
+        return .disarm;
+    };
     processExitCommon(td_.?, exit_code);
     return .disarm;
 }
@@ -742,9 +749,8 @@ pub const Config = struct {
     resources_dir: ?[]const u8,
     term: []const u8,
 
-    /// WSL PTY bridge mode: bypass ConPTY and launch a bridge process
-    /// inside WSL that creates a real Linux PTY.
-    wsl_mode: bool = false,
+    /// Shell backend mode: wsl (vsock), local (ConPTY), or auto (try WSL first).
+    shell_mode: configpkg.Config.ShellMode = .wsl,
     /// WSL distribution to use (null = default distro).
     wsl_distro: ?[:0]const u8 = null,
     /// Shell to launch inside WSL (null = distro default).
@@ -772,8 +778,8 @@ const Subprocess = struct {
     pty: ?Pty = null,
     process: ?Process = null,
 
-    /// WSL bridge mode configuration.
-    wsl_mode: bool = false,
+    /// Shell backend mode configuration.
+    shell_mode: configpkg.Config.ShellMode = .wsl,
     wsl_distro: ?[:0]const u8 = null,
     wsl_shell: ?[:0]const u8 = null,
     wsl_auto_restart: bool = true,
@@ -1065,7 +1071,7 @@ const Subprocess = struct {
             .cwd = cwd,
             .args = args,
 
-            .wsl_mode = cfg.wsl_mode,
+            .shell_mode = cfg.shell_mode,
             .wsl_distro = cfg.wsl_distro,
             .wsl_shell = cfg.wsl_shell,
             .wsl_auto_restart = cfg.wsl_auto_restart,
@@ -1082,12 +1088,13 @@ const Subprocess = struct {
     /// Clean up the subprocess. This will stop the subprocess if it is started.
     pub fn deinit(self: *Subprocess) void {
         self.stop();
-        // In WSL bridge mode, the "pty" is a dummy struct with pipe handles
-        // that are owned by the bridge process. We only close the pipe handles
-        // (which are already closed by stop/killCommand), and skip the ConPTY
-        // cleanup that would crash on a null pseudo_console.
+        // In WSL bridge mode (or auto mode that connected via vsock), the "pty"
+        // is a dummy struct with pipe handles that are owned by the bridge
+        // process. We skip ConPTY cleanup that would crash on undefined handles.
+        // Detect by checking vsock_socket — set when startWslVsock succeeded.
         if (comptime builtin.os.tag == .windows) {
-            if (self.wsl_mode) {
+            const used_vsock = self.vsock_socket != null;
+            if (used_vsock) {
                 // For vsock tabs, the socket was already closed by
                 // ThreadData.deinit() (to unblock the read thread).
                 // For WSL vsock tabs, pipes are closed by stop()/killCommand().
@@ -1114,11 +1121,27 @@ const Subprocess = struct {
     pub fn start(self: *Subprocess, alloc: Allocator) !StartResult {
         assert(self.pty == null and self.process == null);
 
-        // WSL mode: bypass ConPTY entirely on Windows.
-        // Connect to the vsock daemon via AF_HYPERV socket.
+        wsl_log.print("Subprocess.start: shell_mode={s} args[0]={s}", .{
+            @tagName(self.shell_mode),
+            if (self.args.len > 0) self.args[0] else "(none)",
+        });
+
+        // Shell mode dispatch on Windows:
+        // - .wsl: bypass ConPTY, connect to vsock daemon
+        // - .auto: try WSL first, fall back to ConPTY
+        // - .local: fall through to ConPTY path below
         if (comptime builtin.os.tag == .windows) {
-            if (self.wsl_mode) {
-                return self.startWslVsock(alloc);
+            switch (self.shell_mode) {
+                .wsl => return self.startWslVsock(alloc),
+                .auto => {
+                    if (self.startWslVsock(alloc)) |result| return result else |_| {
+                        wsl_log.print("Subprocess.start: WSL vsock failed, falling back to ConPTY", .{});
+                    }
+                    // Fall through to ConPTY path
+                },
+                .local => {
+                    wsl_log.print("Subprocess.start: using ConPTY (local shell mode)", .{});
+                }, // Fall through to ConPTY path
             }
         }
 
@@ -1128,6 +1151,10 @@ const Subprocess = struct {
         // process).
         var in_child: bool = false;
 
+        wsl_log.print("Subprocess.start: opening PTY (ConPTY path) grid={d}x{d}", .{
+            self.grid_size.columns, self.grid_size.rows,
+        });
+
         // Create our pty
         var pty = try Pty.open(.{
             .ws_row = @intCast(self.grid_size.rows),
@@ -1136,6 +1163,8 @@ const Subprocess = struct {
             .ws_ypixel = @intCast(self.screen_size.height),
         });
         self.pty = pty;
+
+        wsl_log.print("Subprocess.start: PTY opened OK", .{});
         errdefer if (!in_child) {
             if (comptime builtin.os.tag != .windows) {
                 _ = posix.close(pty.slave);
@@ -1269,7 +1298,10 @@ const Subprocess = struct {
             .data = self,
         };
 
+        wsl_log.print("Subprocess.start: calling cmd.start (path={s})", .{self.args[0]});
+
         cmd.start(alloc) catch |err| {
+            wsl_log.print("Subprocess.start: cmd.start FAILED: {s}", .{@errorName(err)});
             // We have to do this because start on Windows can't
             // ever return ExecFailedInChild
             const StartError = error{ExecFailedInChild} || @TypeOf(err);
@@ -1287,6 +1319,7 @@ const Subprocess = struct {
         errdefer killCommand(&cmd) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
+        wsl_log.print("Subprocess.start: cmd.start OK", .{});
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
 
         self.process = .{ .fork_exec = cmd };
@@ -1418,11 +1451,13 @@ const Subprocess = struct {
         self.grid_size = grid_size;
         self.screen_size = screen_size;
 
-        // In WSL bridge mode, skip ConPTY's ResizePseudoConsole — the resize
+        // In WSL/vsock mode, skip ConPTY's ResizePseudoConsole — the resize
         // APC is sent by Exec.resize() through xev's queueWrite instead.
         // We just update the local pty.size for any code that reads it.
+        // Check vsock_socket (runtime state) to correctly handle auto mode
+        // that fell back to ConPTY.
         if (comptime builtin.os.tag == .windows) {
-            if (self.wsl_mode) {
+            if (self.vsock_socket != null) {
                 if (self.pty) |*pty| {
                     pty.size = .{
                         .ws_row = std.math.cast(u16, grid_size.rows) orelse 24,
@@ -1800,6 +1835,7 @@ fn showWslStatus(io: *termio.Termio, msg: []const u8) void {
         t.carriageReturn();
         t.printString(msg) catch {};
     }
+    io.renderer_content_dirty.store(true, .release);
     io.renderer_wakeup.notify() catch {};
 }
 
@@ -1814,6 +1850,7 @@ fn clearWslStatus(io: *termio.Termio) void {
         t.carriageReturn();
         t.modes.set(.cursor_visible, true);
     }
+    io.renderer_content_dirty.store(true, .release);
     io.renderer_wakeup.notify() catch {};
 }
 

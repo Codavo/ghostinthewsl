@@ -306,33 +306,32 @@ fn drainMailbox(
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
     while (mailbox.pop()) |message| {
-        // If we have a message we always redraw
-        redraw = true;
-
         log.debug("mailbox message={s}", .{@tagName(message)});
         switch (message) {
-            .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
-            .crash => @panic("crash request, crashing intentionally"),
+            // These modify visual state and need a redraw:
+            .scroll_viewport => |v| {
+                io.scrollViewport(v);
+                redraw = true;
+            },
+            .clear_screen => |v| {
+                try io.clearScreen(data, v.history);
+                redraw = true;
+            },
             .change_config => |config| {
                 defer config.alloc.destroy(config.ptr);
                 try io.changeConfig(data, config.ptr);
+                redraw = true;
             },
-            .inspector => |v| self.flags.has_inspector = v,
-            .resize => |v| self.handleResize(cb, v),
-            .size_report => |v| try io.sizeReport(data, v),
-            .clear_screen => |v| try io.clearScreen(data, v.history),
-            .scroll_viewport => |v| io.scrollViewport(v),
-            .selection_scroll => |v| {
-                if (v) {
-                    self.startScrollTimer(cb);
-                } else {
-                    self.stopScrollTimer();
-                }
+            .inspector => |v| {
+                self.flags.has_inspector = v;
+                redraw = true;
             },
+
+            // These handle their own dirty+notify internally:
             .jump_to_prompt => |v| try io.jumpToPrompt(v),
-            .start_synchronized_output => self.startSynchronizedOutput(cb),
-            .linefeed_mode => |v| self.flags.linefeed_mode = v,
-            .focused => |v| try io.focusGained(data, v),
+            .resize => |v| self.handleResize(cb, v),
+
+            // These don't change visual terminal state:
             .write_small => |v| try io.queueWrite(
                 data,
                 v.data[0..v.len],
@@ -351,12 +350,28 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+            .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
+            .size_report => |v| try io.sizeReport(data, v),
+            .focused => |v| try io.focusGained(data, v),
+            .linefeed_mode => |v| self.flags.linefeed_mode = v,
+            .start_synchronized_output => self.startSynchronizedOutput(cb),
+            .selection_scroll => |v| {
+                if (v) {
+                    self.startScrollTimer(cb);
+                } else {
+                    self.stopScrollTimer();
+                }
+            },
+
+            .crash => @panic("crash request, crashing intentionally"),
         }
     }
 
-    // Trigger a redraw after we've drained so we don't waste cyces
-    // messaging a redraw.
+    // Trigger a redraw only when we processed messages that changed
+    // visual state. Write messages (keystrokes) don't — the redraw
+    // happens when the shell echoes back via the read thread.
     if (redraw) {
+        io.renderer_content_dirty.store(true, .release);
         try io.renderer_wakeup.notify();
     }
 }

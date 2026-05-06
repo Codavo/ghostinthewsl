@@ -349,6 +349,11 @@ const WindowsPty = struct {
         close: *const @TypeOf(windows.exp.kernel32.ClosePseudoConsole),
     };
 
+    /// Embedded ConPTY binaries from dist/windows/conpty/ (Windows Terminal, MIT licensed).
+    /// These are extracted to %LOCALAPPDATA%\ghostinthewsl\conpty\ on first use.
+    const embedded_conpty_dll = @embedFile("conpty/conpty.dll");
+    const embedded_openconsole_exe = @embedFile("conpty/OpenConsole.exe");
+
     fn loadAdjacentConptyDll() ?HMODULE {
         var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
         const exe_path = std.fs.selfExePath(&exe_buf) catch |err| {
@@ -380,29 +385,241 @@ const WindowsPty = struct {
         return LoadLibraryW(dll_path_w_buf[0..dll_path_w_len :0].ptr);
     }
 
+    /// Extract embedded conpty.dll and OpenConsole.exe to
+    /// %LOCALAPPDATA%\ghostinthewsl\conpty\ and LoadLibrary the DLL.
+    /// Uses file size as a cache key — re-extracts only when the embedded
+    /// binary changes (i.e. on version update).
+    fn loadEmbeddedConptyDll() ?HMODULE {
+        const GetEnvironmentVariableW = struct {
+            extern "kernel32" fn GetEnvironmentVariableW(
+                lpName: [*:0]const u16,
+                lpBuffer: ?[*]u16,
+                nSize: u32,
+            ) callconv(.winapi) u32;
+        }.GetEnvironmentVariableW;
+
+        // Get %LOCALAPPDATA%
+        const localappdata_key = std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA");
+        var appdata_buf: [std.fs.max_path_bytes / 2]u16 = undefined;
+        const appdata_len = GetEnvironmentVariableW(localappdata_key, &appdata_buf, appdata_buf.len);
+        if (appdata_len == 0) {
+            log.warn("failed to get LOCALAPPDATA for embedded conpty extraction", .{});
+            return null;
+        }
+
+        // Create directory (CreateDirectoryW, ignore ERROR_ALREADY_EXISTS)
+        const CreateDirectoryW = struct {
+            extern "kernel32" fn CreateDirectoryW(
+                lpPathName: [*:0]const u16,
+                lpSecurityAttributes: ?*anyopaque,
+            ) callconv(.winapi) i32;
+        }.CreateDirectoryW;
+
+        // Use separate buffers for directory path and DLL path to avoid aliasing.
+        var dir_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var dll_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var dir_w_buf: [512]u16 = undefined;
+
+        // Create parent: %LOCALAPPDATA%\ghostinthewsl
+        var parent_w_buf: [512]u16 = undefined;
+        const parent_path = std.fmt.bufPrint(&dir_path_buf, "{f}\\ghostinthewsl", .{
+            std.unicode.fmtUtf16Le(appdata_buf[0..appdata_len]),
+        }) catch return null;
+        const parent_w_len = std.unicode.utf8ToUtf16Le(&parent_w_buf, parent_path) catch return null;
+        parent_w_buf[parent_w_len] = 0;
+        _ = CreateDirectoryW(parent_w_buf[0..parent_w_len :0].ptr, null);
+
+        // Create child: %LOCALAPPDATA%\ghostinthewsl\conpty
+        const dir_full_path = std.fmt.bufPrint(&dir_path_buf, "{f}\\ghostinthewsl\\conpty", .{
+            std.unicode.fmtUtf16Le(appdata_buf[0..appdata_len]),
+        }) catch return null;
+        const dir_w_len = std.unicode.utf8ToUtf16Le(&dir_w_buf, dir_full_path) catch return null;
+        dir_w_buf[dir_w_len] = 0;
+        _ = CreateDirectoryW(dir_w_buf[0..dir_w_len :0].ptr, null);
+
+        // Build DLL path in a SEPARATE buffer (dir_full_path is a slice of dir_path_buf)
+        const dll_path = std.fmt.bufPrint(&dll_path_buf, "{s}\\conpty.dll", .{dir_full_path}) catch return null;
+
+        // Check if conpty.dll exists with expected size (cache key)
+        const needs_extract = needs_extraction: {
+            var dll_w_buf2: [512]u16 = undefined;
+            const dll_w_len2 = std.unicode.utf8ToUtf16Le(&dll_w_buf2, dll_path) catch break :needs_extraction true;
+            dll_w_buf2[dll_w_len2] = 0;
+
+            const GetFileAttributesExW = struct {
+                extern "kernel32" fn GetFileAttributesExW(
+                    lpFileName: [*:0]const u16,
+                    fInfoLevelId: u32,
+                    lpFileInformation: *anyopaque,
+                ) callconv(.winapi) i32;
+            }.GetFileAttributesExW;
+
+            const WIN32_FILE_ATTRIBUTE_DATA = extern struct {
+                dwFileAttributes: u32,
+                ftCreationTime: u64,
+                ftLastAccessTime: u64,
+                ftLastWriteTime: u64,
+                nFileSizeHigh: u32,
+                nFileSizeLow: u32,
+            };
+
+            var file_info: WIN32_FILE_ATTRIBUTE_DATA = undefined;
+            if (GetFileAttributesExW(dll_w_buf2[0..dll_w_len2 :0].ptr, 0, @ptrCast(&file_info)) == 0) {
+                break :needs_extraction true;
+            }
+
+            const file_size: u64 = (@as(u64, file_info.nFileSizeHigh) << 32) | file_info.nFileSizeLow;
+            break :needs_extraction file_size != embedded_conpty_dll.len;
+        };
+
+        if (needs_extract) {
+            log.info("extracting embedded conpty.dll ({d} bytes) and OpenConsole.exe ({d} bytes)", .{
+                embedded_conpty_dll.len, embedded_openconsole_exe.len,
+            });
+            // Write conpty.dll atomically
+            if (!writeFileAtomic(dir_full_path, "conpty.dll", embedded_conpty_dll)) return null;
+            // Write OpenConsole.exe atomically
+            if (!writeFileAtomic(dir_full_path, "OpenConsole.exe", embedded_openconsole_exe)) return null;
+        }
+
+        // Load the extracted DLL
+        var load_path_buf: [512]u16 = undefined;
+        const load_path_len = std.unicode.utf8ToUtf16Le(&load_path_buf, dll_path) catch return null;
+        load_path_buf[load_path_len] = 0;
+        return LoadLibraryW(load_path_buf[0..load_path_len :0].ptr);
+    }
+
+    /// Write data to dir\filename via a .tmp file + MoveFileExW for atomicity.
+    fn writeFileAtomic(dir: []const u8, filename: []const u8, data: []const u8) bool {
+        const CreateFileW = windows.kernel32.CreateFileW;
+        const WriteFile = windows.kernel32.WriteFile;
+        const MoveFileExW = struct {
+            extern "kernel32" fn MoveFileExW(
+                lpExistingFileName: [*:0]const u16,
+                lpNewFileName: [*:0]const u16,
+                dwFlags: u32,
+            ) callconv(.winapi) i32;
+        }.MoveFileExW;
+
+        var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tmp_path = std.fmt.bufPrint(&tmp_path_buf, "{s}\\{s}.tmp", .{ dir, filename }) catch return false;
+        var final_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const final_path = std.fmt.bufPrint(&final_path_buf, "{s}\\{s}", .{ dir, filename }) catch return false;
+
+        var tmp_w_buf: [512]u16 = undefined;
+        const tmp_w_len = std.unicode.utf8ToUtf16Le(&tmp_w_buf, tmp_path) catch return false;
+        tmp_w_buf[tmp_w_len] = 0;
+
+        var final_w_buf: [512]u16 = undefined;
+        const final_w_len = std.unicode.utf8ToUtf16Le(&final_w_buf, final_path) catch return false;
+        final_w_buf[final_w_len] = 0;
+
+        // Create temp file
+        const handle = CreateFileW(
+            tmp_w_buf[0..tmp_w_len :0].ptr,
+            windows.GENERIC_WRITE,
+            0,
+            null,
+            windows.CREATE_ALWAYS,
+            windows.FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (handle == windows.INVALID_HANDLE_VALUE) {
+            log.warn("failed to create temp file for {s}", .{filename});
+            return false;
+        }
+
+        // Write all data
+        var written: u32 = 0;
+        var remaining = data;
+        while (remaining.len > 0) {
+            const chunk_len: u32 = @intCast(@min(remaining.len, 0x7FFF_FFFF));
+            if (WriteFile(handle, remaining.ptr, chunk_len, &written, null) == 0) {
+                _ = windows.CloseHandle(handle);
+                log.warn("failed to write {s}", .{filename});
+                return false;
+            }
+            remaining = remaining[@intCast(written)..];
+        }
+        _ = windows.CloseHandle(handle);
+
+        // Atomic rename (MOVEFILE_REPLACE_EXISTING = 1)
+        if (MoveFileExW(tmp_w_buf[0..tmp_w_len :0].ptr, final_w_buf[0..final_w_len :0].ptr, 1) == 0) {
+            log.warn("failed to rename temp file to {s}", .{filename});
+            return false;
+        }
+
+        return true;
+    }
+
+    /// Resolve ConPTY API functions from a loaded DLL module.
+    /// Tries Conpty-prefixed names first (NuGet/Windows Terminal convention),
+    /// then falls back to unprefixed names (system conpty.dll).
+    fn resolveConptyExports(module: HMODULE) ?PseudoConsoleApi {
+        // Try Conpty-prefixed first (NuGet Windows Terminal builds)
+        var create_ptr = GetProcAddress(module, "ConptyCreatePseudoConsole");
+        var resize_ptr = GetProcAddress(module, "ConptyResizePseudoConsole");
+        var close_ptr = GetProcAddress(module, "ConptyClosePseudoConsole");
+
+        // Fallback to unprefixed (older builds, system conpty.dll)
+        if (create_ptr == null) create_ptr = GetProcAddress(module, "CreatePseudoConsole");
+        if (resize_ptr == null) resize_ptr = GetProcAddress(module, "ResizePseudoConsole");
+        if (close_ptr == null) close_ptr = GetProcAddress(module, "ClosePseudoConsole");
+
+        if (create_ptr != null and resize_ptr != null and close_ptr != null) {
+            return .{
+                .create = @ptrCast(create_ptr.?),
+                .resize = @ptrCast(resize_ptr.?),
+                .close = @ptrCast(close_ptr.?),
+            };
+        }
+        return null;
+    }
+
     fn pseudoConsoleApi() PseudoConsoleApi {
         if (!api_cache_attempted) {
             api_cache_attempted = true;
 
+            wsl_log.print("pseudoConsoleApi: first call, loading ConPTY", .{});
+
+            // 1. Try adjacent conpty.dll (user-provided, highest priority)
             if (loadAdjacentConptyDll()) |module| {
-                const create_ptr = GetProcAddress(module, "CreatePseudoConsole");
-                const resize_ptr = GetProcAddress(module, "ResizePseudoConsole");
-                const close_ptr = GetProcAddress(module, "ClosePseudoConsole");
-                if (create_ptr != null and resize_ptr != null and close_ptr != null) {
-                    api_cache = .{
-                        .create = @ptrCast(@alignCast(create_ptr.?)),
-                        .resize = @ptrCast(@alignCast(resize_ptr.?)),
-                        .close = @ptrCast(@alignCast(close_ptr.?)),
-                    };
+                wsl_log.print("pseudoConsoleApi: adjacent conpty.dll loaded", .{});
+                if (resolveConptyExports(module)) |api| {
+                    api_cache = api;
                     log.info("using ConPTY APIs from adjacent conpty.dll", .{});
+                    wsl_log.print("pseudoConsoleApi: using adjacent conpty.dll", .{});
                 } else {
-                    log.warn("loaded adjacent conpty.dll but required pseudo console exports were missing; falling back to kernel32", .{});
+                    log.warn("loaded adjacent conpty.dll but required exports missing", .{});
+                    wsl_log.print("pseudoConsoleApi: adjacent exports missing", .{});
                 }
-            } else {
-                log.info("adjacent conpty.dll not available; using kernel32 pseudo console APIs", .{});
+            }
+
+            // 2. Try embedded extraction (built-in Windows Terminal ConPTY)
+            if (api_cache == null) {
+                wsl_log.print("pseudoConsoleApi: trying embedded extraction", .{});
+                if (loadEmbeddedConptyDll()) |module| {
+                    wsl_log.print("pseudoConsoleApi: embedded DLL loaded", .{});
+                    if (resolveConptyExports(module)) |api| {
+                        api_cache = api;
+                        log.info("using ConPTY APIs from embedded/extracted conpty.dll", .{});
+                        wsl_log.print("pseudoConsoleApi: using embedded conpty.dll", .{});
+                    } else {
+                        log.warn("loaded extracted conpty.dll but required exports missing", .{});
+                        wsl_log.print("pseudoConsoleApi: embedded exports missing", .{});
+                    }
+                } else {
+                    log.info("embedded conpty.dll extraction failed; using kernel32 fallback", .{});
+                    wsl_log.print("pseudoConsoleApi: embedded extraction failed", .{});
+                }
+            }
+
+            if (api_cache == null) {
+                wsl_log.print("pseudoConsoleApi: using kernel32 fallback", .{});
             }
         }
 
+        // 3. Kernel32 fallback (system ConPTY, always available on Win10+)
         return api_cache orelse .{
             .create = windows.exp.kernel32.CreatePseudoConsole,
             .resize = windows.exp.kernel32.ResizePseudoConsole,
@@ -413,8 +630,12 @@ const WindowsPty = struct {
     pub const OpenError = error{Unexpected};
 
     /// Open a new PTY with the given initial size.
+    const wsl_log = @import("apprt/win32/wsl_log.zig");
+
     pub fn open(size: winsize) OpenError!Pty {
         var pty: Pty = undefined;
+
+        wsl_log.print("Pty.open: start col={d} row={d}", .{ size.ws_col, size.ws_row });
 
         var pipe_path_buf: [128]u8 = undefined;
         var pipe_path_buf_w: [128]u16 = undefined;
@@ -453,9 +674,12 @@ const WindowsPty = struct {
             &security_attributes,
         );
         if (pty.in_pipe == windows.INVALID_HANDLE_VALUE) {
+            wsl_log.print("Pty.open: CreateNamedPipeW FAILED", .{});
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
         errdefer _ = windows.CloseHandle(pty.in_pipe);
+
+        wsl_log.print("Pty.open: named pipe created", .{});
 
         var security_attributes_read = security_attributes;
         pty.in_pipe_pty = windows.kernel32.CreateFileW(
@@ -468,9 +692,12 @@ const WindowsPty = struct {
             null,
         );
         if (pty.in_pipe_pty == windows.INVALID_HANDLE_VALUE) {
+            wsl_log.print("Pty.open: CreateFileW for in_pipe_pty FAILED", .{});
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
         errdefer _ = windows.CloseHandle(pty.in_pipe_pty);
+
+        wsl_log.print("Pty.open: in_pipe_pty opened", .{});
 
         // The in_pipe needs to be created as a named pipe, since anonymous
         // pipes created with CreatePipe do not support overlapped operations,
@@ -488,6 +715,7 @@ const WindowsPty = struct {
         // }
 
         if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == 0) {
+            wsl_log.print("Pty.open: CreatePipe for out_pipe FAILED", .{});
             return windows.unexpectedError(windows.kernel32.GetLastError());
         }
         errdefer {
@@ -495,12 +723,19 @@ const WindowsPty = struct {
             _ = windows.CloseHandle(pty.out_pipe_pty);
         }
 
+        wsl_log.print("Pty.open: out_pipe created", .{});
+
         try windows.SetHandleInformation(pty.in_pipe, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.in_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.out_pipe, windows.HANDLE_FLAG_INHERIT, 0);
         try windows.SetHandleInformation(pty.out_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
 
+        wsl_log.print("Pty.open: handle inheritance cleared, loading ConPTY API", .{});
+
         const api = pseudoConsoleApi();
+
+        wsl_log.print("Pty.open: calling CreatePseudoConsole", .{});
+
         const result = api.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
@@ -508,7 +743,12 @@ const WindowsPty = struct {
             0,
             &pty.pseudo_console,
         );
-        if (result != windows.S_OK) return error.Unexpected;
+        if (result != windows.S_OK) {
+            wsl_log.print("Pty.open: CreatePseudoConsole FAILED (HRESULT not S_OK)", .{});
+            return error.Unexpected;
+        }
+
+        wsl_log.print("Pty.open: pseudo console created OK", .{});
 
         pty.size = size;
         return pty;

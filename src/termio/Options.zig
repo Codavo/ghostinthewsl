@@ -1,5 +1,6 @@
 //! The options that are used to configure a terminal IO implementation.
 
+const std = @import("std");
 const xev = @import("../global.zig").xev;
 const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
@@ -32,7 +33,11 @@ renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
 /// a repaint should happen.
-renderer_wakeup: xev.Async,
+renderer_wakeup: *xev.Async,
+
+/// Atomic dirty flag — set by IO thread before notify() so the renderer's
+/// draw timer can detect new content without waiting for the IOCP wakeup.
+renderer_content_dirty: *std.atomic.Value(bool),
 
 /// The mailbox for renderer messages.
 renderer_mailbox: *renderer.Thread.Mailbox,

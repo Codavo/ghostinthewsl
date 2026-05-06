@@ -334,11 +334,12 @@ pub fn init(
         return error.AlreadyRunning;
     }
 
-    // If WSL mode is enabled, pre-warm WSL in the background.
+    // If shell-mode may use WSL, pre-warm WSL in the background.
     // This runs a single `wsl.exe -- true` to ensure the VM is booted
     // before the first tab's IO thread needs to connect, then starts
     // a keepalive process to prevent WSL from idling out.
-    if (config.@"wsl-mode") {
+    const shell_mode = config.@"shell-mode";
+    if (shell_mode == .wsl or shell_mode == .auto) {
         const distro = config.@"wsl-distro";
         _ = std.Thread.spawn(.{}, initWslBackground, .{ self, distro }) catch |err| {
             log.warn("failed to spawn WSL init thread: {}", .{err});
@@ -346,9 +347,15 @@ pub fn init(
     }
 
     // Create the first window
-    const window = try Window.create(alloc, self, .none);
+    const wsl_log = @import("wsl_log.zig");
+    wsl_log.print("App.init: creating first window (shell-mode={s})", .{@tagName(shell_mode)});
+    const window = Window.create(alloc, self, .none) catch |err| {
+        wsl_log.print("App.init: Window.create FAILED: {s}", .{@errorName(err)});
+        return err;
+    };
     try self.windows.append(alloc, window);
     self.focused_window = window;
+    wsl_log.print("App.init: window created successfully, entering message loop", .{});
 }
 
 /// Background thread: pre-warm WSL so the first tab can connect quickly,
@@ -369,15 +376,19 @@ fn initWslBackground(self: *App, distro: ?[:0]const u8) void {
 
 pub fn run(self: *App) !void {
     log.info("starting Win32 event loop", .{});
+    const wsl_log2 = @import("wsl_log.zig");
+    wsl_log2.print("App.run: entering message loop", .{});
 
     while (self.running) {
         var msg: MSG = std.mem.zeroes(MSG);
         const ret = sys.GetMessageW(&msg, null, 0, 0);
         if (ret == 0) {
+            wsl_log2.print("App.run: WM_QUIT received, exiting loop", .{});
             self.running = false;
             break;
         }
         if (ret == -1) {
+            wsl_log2.print("App.run: GetMessage returned -1 (error)", .{});
             log.err("GetMessage failed", .{});
             return error.Win32Error;
         }
@@ -517,6 +528,8 @@ pub fn closeWindow(self: *App, window: *Window) void {
 
     // If no more windows, quit the app
     if (self.windows.items.len == 0) {
+        const wsl_log3 = @import("wsl_log.zig");
+        wsl_log3.print("closeWindow: last window closed, posting WM_QUIT", .{});
         sys.PostQuitMessage(0);
     }
 }
@@ -549,14 +562,26 @@ pub fn performAction(
             return true;
         },
         .set_title => {
-            const window = self.focused_window orelse return false;
-            if (window.hwnd) |hwnd| {
-                const utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, value.title) catch return false;
-                defer self.alloc.free(utf16);
-                _ = sys.SetWindowTextW(hwnd, utf16.ptr);
+            const window = switch (target) {
+                .surface => |core| core.rt_surface.window orelse return false,
+                .app => self.focused_window orelse return false,
+            };
+            // Update the tab title for the specific surface that sent this
+            const is_active_tab = switch (target) {
+                .surface => |core| window.setTabTitleForSurface(core.rt_surface, value.title) catch false,
+                .app => blk: {
+                    window.setActiveTabTitle(value.title) catch {};
+                    break :blk true;
+                },
+            };
+            // Only update window title bar if the surface is in the active tab
+            if (is_active_tab) {
+                if (window.hwnd) |hwnd| {
+                    const utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, value.title) catch return false;
+                    defer self.alloc.free(utf16);
+                    _ = sys.SetWindowTextW(hwnd, utf16.ptr);
+                }
             }
-            // Also update the active tab title to match
-            window.setActiveTabTitle(value.title) catch {};
             return true;
         },
         .toggle_maximize => {
@@ -743,7 +768,14 @@ pub fn performAction(
         .pwd => return true,
         .secure_input => return true,
         .initial_size, .cell_size, .size_limit => return true,
-        .scrollbar => return true,
+        .scrollbar => {
+            const surface = switch (target) {
+                .app => return false,
+                .surface => |core| core.rt_surface,
+            };
+            surface.updateScrollbar(value);
+            return true;
+        },
         .close_all_windows => {
             // Close all windows
             var i = self.windows.items.len;
@@ -994,7 +1026,7 @@ pub fn performAction(
                 .surface => |core| core,
             };
             const window = core.rt_surface.window orelse return false;
-            window.setActiveTabTitle(value.title) catch return false;
+            _ = window.setTabTitleForSurface(core.rt_surface, value.title) catch return false;
             return true;
         },
         .undo,
@@ -1247,42 +1279,16 @@ fn shouldDispatchKeyPress(vk: WPARAM, mods: @import("../../input.zig").Mods) boo
 
 fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
     return switch (vk) {
-        0x41 => .key_a,
-        0x42 => .key_b,
-        0x43 => .key_c,
-        0x44 => .key_d,
-        0x45 => .key_e,
-        0x46 => .key_f,
-        0x47 => .key_g,
-        0x48 => .key_h,
-        0x49 => .key_i,
-        0x4A => .key_j,
-        0x4B => .key_k,
-        0x4C => .key_l,
-        0x4D => .key_m,
-        0x4E => .key_n,
-        0x4F => .key_o,
-        0x50 => .key_p,
-        0x51 => .key_q,
-        0x52 => .key_r,
-        0x53 => .key_s,
-        0x54 => .key_t,
-        0x55 => .key_u,
-        0x56 => .key_v,
-        0x57 => .key_w,
-        0x58 => .key_x,
-        0x59 => .key_y,
-        0x5A => .key_z,
-        0x30 => .digit_0,
-        0x31 => .digit_1,
-        0x32 => .digit_2,
-        0x33 => .digit_3,
-        0x34 => .digit_4,
-        0x35 => .digit_5,
-        0x36 => .digit_6,
-        0x37 => .digit_7,
-        0x38 => .digit_8,
-        0x39 => .digit_9,
+        0x41 => .key_a, 0x42 => .key_b, 0x43 => .key_c, 0x44 => .key_d,
+        0x45 => .key_e, 0x46 => .key_f, 0x47 => .key_g, 0x48 => .key_h,
+        0x49 => .key_i, 0x4A => .key_j, 0x4B => .key_k, 0x4C => .key_l,
+        0x4D => .key_m, 0x4E => .key_n, 0x4F => .key_o, 0x50 => .key_p,
+        0x51 => .key_q, 0x52 => .key_r, 0x53 => .key_s, 0x54 => .key_t,
+        0x55 => .key_u, 0x56 => .key_v, 0x57 => .key_w, 0x58 => .key_x,
+        0x59 => .key_y, 0x5A => .key_z,
+        0x30 => .digit_0, 0x31 => .digit_1, 0x32 => .digit_2, 0x33 => .digit_3,
+        0x34 => .digit_4, 0x35 => .digit_5, 0x36 => .digit_6, 0x37 => .digit_7,
+        0x38 => .digit_8, 0x39 => .digit_9,
         0x08 => .backspace,
         0x09 => .tab,
         0x0D => .enter,
@@ -1311,18 +1317,9 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
         0xBC => .comma,
         0xBE => .period,
         0xBF => .slash,
-        0x70 => .f1,
-        0x71 => .f2,
-        0x72 => .f3,
-        0x73 => .f4,
-        0x74 => .f5,
-        0x75 => .f6,
-        0x76 => .f7,
-        0x77 => .f8,
-        0x78 => .f9,
-        0x79 => .f10,
-        0x7A => .f11,
-        0x7B => .f12,
+        0x70 => .f1, 0x71 => .f2, 0x72 => .f3, 0x73 => .f4,
+        0x74 => .f5, 0x75 => .f6, 0x76 => .f7, 0x77 => .f8,
+        0x78 => .f9, 0x79 => .f10, 0x7A => .f11, 0x7B => .f12,
         else => .unidentified,
     };
 }
@@ -1588,6 +1585,11 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                 const y: f32 = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF)));
                 surface.cursor_pos = .{ .x = x, .y = y };
                 core.cursorPosCallback(.{ .x = x, .y = y }, getModifiers()) catch {};
+                // Show scrollbar when mouse is near the right edge
+                const sx: i32 = @as(i16, @truncate(lparam & 0xFFFF));
+                if (sx >= @as(i32, @intCast(surface.width)) - Surface.scrollbar_hover_zone) {
+                    surface.showScrollbar();
+                }
             }
             return 0;
         },
@@ -1718,6 +1720,8 @@ const MENU_COPY: usize = 6001;
 const MENU_PASTE: usize = 6002;
 const MENU_NEW_TAB: usize = 6003;
 const MENU_DISTRO_BASE: usize = 6100;
+const MENU_POWERSHELL: usize = 6200;
+const MENU_CMD: usize = 6201;
 
 extern "user32" fn CreatePopupMenu() callconv(.winapi) ?*anyopaque;
 extern "user32" fn AppendMenuW(hMenu: *anyopaque, uFlags: u32, uIDNewItem: usize, lpNewItem: ?[*:0]const u16) callconv(.winapi) i32;
@@ -1738,15 +1742,20 @@ pub fn showContextMenu(app: *App, window: *Window, hwnd: HWND, screen_x: i32, sc
     // New Tab (default distro)
     _ = AppendMenuW(menu, MF_STRING, MENU_NEW_TAB, std.unicode.utf8ToUtf16LeStringLiteral("New Tab"));
 
-    // "New Tab in" submenu with WSL distros
+    // "New Tab in" submenu with WSL distros + local shells
     const distros = app.getWslDistros();
-    if (distros.len > 0) {
+    {
         const submenu = CreatePopupMenu() orelse return;
         for (distros, 0..) |distro, i| {
             const wtext = std.unicode.utf8ToUtf16LeAllocZ(app.alloc, distro) catch continue;
             defer app.alloc.free(wtext);
             _ = AppendMenuW(submenu, MF_STRING, MENU_DISTRO_BASE + i, wtext.ptr);
         }
+        if (distros.len > 0) {
+            _ = AppendMenuW(submenu, MF_SEPARATOR, 0, null);
+        }
+        _ = AppendMenuW(submenu, MF_STRING, MENU_POWERSHELL, std.unicode.utf8ToUtf16LeStringLiteral("PowerShell"));
+        _ = AppendMenuW(submenu, MF_STRING, MENU_CMD, std.unicode.utf8ToUtf16LeStringLiteral("Command Prompt"));
         _ = AppendMenuW(menu, MF_POPUP, @intFromPtr(submenu), std.unicode.utf8ToUtf16LeStringLiteral("New Tab in"));
     }
 
@@ -1773,6 +1782,18 @@ pub fn showContextMenu(app: *App, window: *Window, hwnd: HWND, screen_x: i32, sc
         MENU_NEW_TAB => {
             window.newTab(.none) catch |err| {
                 log.err("failed to create new tab: {}", .{err});
+            };
+        },
+        MENU_POWERSHELL => {
+            const cmd_str = app.alloc.dupeZ(u8, "powershell.exe") catch return;
+            window.newTab(.{ .shell_mode = .local, .command = .{ .shell = cmd_str }, .title = "PowerShell" }) catch {
+                app.alloc.free(cmd_str);
+            };
+        },
+        MENU_CMD => {
+            const cmd_str = app.alloc.dupeZ(u8, "cmd.exe") catch return;
+            window.newTab(.{ .shell_mode = .local, .command = .{ .shell = cmd_str }, .title = "Command Prompt" }) catch {
+                app.alloc.free(cmd_str);
             };
         },
         else => {

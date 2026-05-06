@@ -38,7 +38,11 @@ pub const StreamHandler = struct {
 
     /// A handle to wake up the renderer. This hints to the renderer that
     /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    renderer_wakeup: *xev.Async,
+
+    /// Atomic dirty flag — set before notify() so the renderer's draw timer
+    /// can detect new content without waiting for the IOCP wakeup.
+    renderer_content_dirty: *std.atomic.Value(bool),
 
     /// The default cursor state. This is used with CSI q. This is
     /// set to true when we're currently in the default cursor state.
@@ -102,6 +106,7 @@ pub const StreamHandler = struct {
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.
     pub inline fn queueRender(self: *StreamHandler) !void {
+        self.renderer_content_dirty.store(true, .release);
         try self.renderer_wakeup.notify();
     }
 
@@ -160,6 +165,7 @@ pub const StreamHandler = struct {
         // and then try again.
         self.renderer_state.mutex.unlock();
         defer self.renderer_state.mutex.lock();
+        self.renderer_content_dirty.store(true, .release);
         self.renderer_wakeup.notify() catch |err| {
             // This is an EXTREMELY unlikely case. We still don't return
             // and attempt to send the message because its most likely

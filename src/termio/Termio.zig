@@ -52,8 +52,13 @@ terminal: terminalpkg.Terminal,
 renderer_state: *renderer.State,
 
 /// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// a repaint should happen. Must be a pointer (not a copy) so that
+/// notify() actually wakes the renderer's event loop after wait() is called.
+renderer_wakeup: *xev.Async,
+
+/// Atomic dirty flag — set by IO thread before notify() so the renderer's
+/// draw timer can detect new content without waiting for the IOCP wakeup.
+renderer_content_dirty: *std.atomic.Value(bool),
 
 /// The mailbox for notifying the renderer of things.
 renderer_mailbox: *renderer.Thread.Mailbox,
@@ -306,6 +311,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .surface_mailbox = opts.surface_mailbox,
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
+        .renderer_content_dirty = opts.renderer_content_dirty,
         .renderer_mailbox = opts.renderer_mailbox,
         .size = &self.size,
         .terminal = &self.terminal,
@@ -327,6 +333,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .config = opts.config,
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
+        .renderer_content_dirty = opts.renderer_content_dirty,
         .renderer_mailbox = opts.renderer_mailbox,
         .surface_mailbox = opts.surface_mailbox,
         .size = opts.size,
@@ -535,6 +542,7 @@ pub fn resize(
         // Notify the renderer of the new screen size so it can update
         // GPU uniforms even before reflow happens.
         _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .instant = {} });
+        self.renderer_content_dirty.store(true, .release);
         self.renderer_wakeup.notify() catch {};
         return;
     }
@@ -577,6 +585,7 @@ pub fn resize(
 
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    self.renderer_content_dirty.store(true, .release);
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -615,6 +624,7 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     self.terminal.modes.set(.synchronized_output, false);
+    self.renderer_content_dirty.store(true, .release);
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -691,6 +701,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 
+    self.renderer_content_dirty.store(true, .release);
     try self.renderer_wakeup.notify();
 }
 
@@ -812,6 +823,7 @@ fn applyPendingResize(self: *Termio) void {
 
     // Notify renderer to re-render with the new size.
     _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    self.renderer_content_dirty.store(true, .release);
     self.renderer_wakeup.notify() catch {};
 }
 

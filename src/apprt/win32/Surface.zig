@@ -86,6 +86,13 @@ extern "opengl32" fn wglDeleteContext(hglrc: HGLRC) callconv(.winapi) BOOL;
 extern "opengl32" fn wglMakeCurrent(hdc: HDC, hglrc: HGLRC) callconv(.winapi) BOOL;
 extern "opengl32" fn wglGetProcAddress(lpszProc: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 
+// Scrollbar / layered window API
+extern "user32" fn SetLayeredWindowAttributes(hWnd: HWND, crKey: u32, bAlpha: u8, dwFlags: u32) callconv(.winapi) BOOL;
+extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+extern "user32" fn GetParent(hWnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn SendMessageW(hWnd: HWND, msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize;
+
 // Clipboard API
 const UINT = u32;
 const HANDLE = ?*anyopaque;
@@ -135,6 +142,15 @@ layout_x: i32 = 0,
 layout_y: i32 = 0,
 layout_w: i32 = 0,
 
+// Scrollbar overlay state
+scrollbar_hwnd: ?HWND = null,
+scrollbar_state: terminal.Scrollbar = .zero,
+scrollbar_visible: bool = false,
+scrollbar_dragging: bool = false,
+scrollbar_drag_anchor: i32 = 0,
+scrollbar_fade_phase: u8 = 255,
+scrollbar_activity: bool = false,
+
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const ProgressState = terminal.osc.Command.ProgressReport.State;
@@ -143,11 +159,25 @@ const progress_timeout_ms: UINT = 15_000;
 const progress_pulse_ms: UINT = 120;
 const progress_timeout_timer_id: usize = 1;
 const progress_pulse_timer_id: usize = 2;
+const scrollbar_width: i32 = 8;
+const scrollbar_min_thumb: i32 = 20;
+const scrollbar_fade_delay_ms: UINT = 1500;
+const scrollbar_fade_step_ms: UINT = 30;
+pub const scrollbar_hover_zone: i32 = 24;
+const scrollbar_activity_timer_id: usize = 3;
+const scrollbar_fade_timer_id: usize = 4;
 const SW_HIDE: c_int = 0;
 const SW_SHOWNORMAL: c_int = 1;
 const WM_PAINT: UINT = 0x000F;
 const WM_TIMER: UINT = 0x0113;
+const WM_LBUTTONDOWN: UINT = 0x0201;
+const WM_LBUTTONUP: UINT = 0x0202;
+const WM_MOUSEMOVE: UINT = 0x0200;
+const WM_MOUSEWHEEL: UINT = 0x020A;
+const LWA_ALPHA: u32 = 0x00000002;
+const WS_EX_LAYERED: u32 = 0x00080000;
 var progress_class_registered: bool = false;
+var scrollbar_class_registered: bool = false;
 
 pub fn core(self: *Self) *CoreSurface {
     return self.core_surface.?;
@@ -197,6 +227,7 @@ pub fn init(self: *Self, parent: HWND, app: *App) !void {
     // Store self pointer on the child window for message handling
     _ = SetWindowLongPtrW(child, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     try self.createProgressOverlay();
+    self.createScrollbarOverlay();
 
     try self.initOpenGL();
 }
@@ -257,8 +288,86 @@ fn progressWndProc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) callconv(
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
+fn scrollbarWndProc(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
+    const ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (ptr == 0) return DefWindowProcW(hwnd, msg, wparam, lparam);
+    const self: *Self = @ptrFromInt(@as(usize, @bitCast(ptr)));
+    switch (msg) {
+        WM_PAINT => {
+            self.paintScrollbar(hwnd);
+            return 0;
+        },
+        WM_TIMER => {
+            switch (wparam) {
+                scrollbar_activity_timer_id => {
+                    // Activity timeout expired — start fade-out
+                    _ = KillTimer(hwnd, scrollbar_activity_timer_id);
+                    _ = SetTimer(hwnd, scrollbar_fade_timer_id, scrollbar_fade_step_ms, null);
+                    self.scrollbar_activity = false;
+                    return 0;
+                },
+                scrollbar_fade_timer_id => {
+                    // No alpha fading (WS_EX_LAYERED conflicts with OpenGL).
+                    // Just hide immediately after the activity timeout.
+                    _ = KillTimer(hwnd, scrollbar_fade_timer_id);
+                    _ = ShowWindow(hwnd, SW_HIDE);
+                    self.scrollbar_visible = false;
+                    return 0;
+                },
+                else => {},
+            }
+        },
+        WM_LBUTTONDOWN => {
+            const mouse_y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+            const thumb = self.scrollbarThumbRect();
+            if (mouse_y >= thumb.top and mouse_y < thumb.bottom) {
+                // Thumb hit — start drag
+                self.scrollbar_dragging = true;
+                self.scrollbar_drag_anchor = mouse_y - thumb.top;
+                _ = SetCapture(hwnd);
+            } else {
+                // Track hit — jump scroll
+                const row = self.scrollbarRowFromY(mouse_y);
+                self.scrollToRow(row);
+            }
+            return 0;
+        },
+        WM_MOUSEMOVE => {
+            if (self.scrollbar_dragging) {
+                const mouse_y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
+                const row = self.scrollbarRowFromDragY(mouse_y - self.scrollbar_drag_anchor);
+                self.scrollToRow(row);
+            }
+            // Reset fade on any mouse activity over scrollbar
+            self.showScrollbar();
+            return 0;
+        },
+        WM_LBUTTONUP => {
+            if (self.scrollbar_dragging) {
+                self.scrollbar_dragging = false;
+                _ = ReleaseCapture();
+            }
+            return 0;
+        },
+        WM_MOUSEWHEEL => {
+            // Forward mouse wheel to parent surface
+            const parent = GetParent(hwnd);
+            if (parent) |p| {
+                return SendMessageW(p, WM_MOUSEWHEEL, wparam, lparam);
+            }
+            return 0;
+        },
+        else => {},
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
 pub fn deinit(self: *Self) void {
     self.hideProgressOverlay();
+    if (self.scrollbar_hwnd) |hwnd| {
+        _ = DestroyWindow(hwnd);
+        self.scrollbar_hwnd = null;
+    }
     if (self.progress_hwnd) |hwnd| {
         _ = DestroyWindow(hwnd);
         self.progress_hwnd = null;
@@ -392,10 +501,58 @@ fn registerProgressClass() !void {
     progress_class_registered = true;
 }
 
+fn createScrollbarOverlay(self: *Self) void {
+    registerScrollbarClass() catch |err| {
+        const wsl_log = @import("wsl_log.zig");
+        const sys = @import("sys.zig");
+        wsl_log.print("scrollbar: registerClass failed: {s} (win32={d})", .{ @errorName(err), sys.GetLastError() });
+        return;
+    };
+    const WS_CHILD: u32 = 0x40000000;
+    // Don't use WS_EX_LAYERED — it conflicts with the parent's OpenGL surface
+    // on some systems/drivers (CreateWindowExW returns NULL with error 0).
+    // Use simple show/hide instead of alpha fading.
+    const hwnd = CreateWindowExW(
+        0,
+        std.unicode.utf8ToUtf16LeStringLiteral("GhosttyScrollbarOverlay"),
+        null,
+        WS_CHILD,
+        0,
+        0,
+        scrollbar_width,
+        @intCast(self.height),
+        self.hwnd,
+        null,
+        GetModuleHandleW(null),
+        null,
+    ) orelse {
+        const wsl_log = @import("wsl_log.zig");
+        const sys = @import("sys.zig");
+        wsl_log.print("scrollbar: CreateWindowExW failed (win32={d})", .{sys.GetLastError()});
+        return;
+    };
+    self.scrollbar_hwnd = hwnd;
+    _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+}
+
+fn registerScrollbarClass() !void {
+    if (scrollbar_class_registered) return;
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyScrollbarOverlay");
+    const hinstance = GetModuleHandleW(null);
+    var wc: WNDCLASSEXW = std.mem.zeroes(WNDCLASSEXW);
+    wc.cbSize = @sizeOf(WNDCLASSEXW);
+    wc.style = 0x0002 | 0x0001;
+    wc.lpfnWndProc = scrollbarWndProc;
+    wc.hInstance = hinstance;
+    wc.hCursor = LoadCursorW(null, @ptrFromInt(32512));
+    wc.lpszClassName = class_name;
+    if (RegisterClassExW(&wc) == 0) return error.Win32Error;
+    scrollbar_class_registered = true;
+}
+
 /// Disable VSync via WGL extension for lower input latency.
 pub fn disableVSync(_: *Self) void {
-    const func: ?*const fn (i32) callconv(.winapi) i32 =
-        @ptrCast(@alignCast(wglGetProcAddress("wglSwapIntervalEXT")));
+    const func: ?*const fn (i32) callconv(.winapi) i32 = @ptrCast(wglGetProcAddress("wglSwapIntervalEXT"));
     if (func) |setInterval| {
         _ = setInterval(0);
     }
@@ -463,12 +620,16 @@ pub fn setLayoutRect(self: *Self, x: i32, y: i32, w: i32, h: i32) void {
     _ = h;
     self.layout_w = w;
     self.updateProgressOverlayRect();
+    self.updateScrollbarRect();
 }
 
 pub fn setVisible(self: *Self, visible: bool) void {
     _ = ShowWindow(self.hwnd, if (visible) SW_SHOWNORMAL else SW_HIDE);
     if (self.progress_hwnd) |hwnd| {
         _ = ShowWindow(hwnd, if (visible and self.progress_visible) SW_SHOWNORMAL else SW_HIDE);
+    }
+    if (self.scrollbar_hwnd) |hwnd| {
+        _ = ShowWindow(hwnd, if (visible and self.scrollbar_visible) SW_SHOWNORMAL else SW_HIDE);
     }
 }
 
@@ -568,6 +729,130 @@ fn paintProgress(self: *Self, hwnd: HWND) void {
     }
 }
 
+// --- Scrollbar overlay logic ---
+
+pub fn updateScrollbar(self: *Self, value: terminal.Scrollbar) void {
+    self.scrollbar_state = value;
+    if (value.total > value.len) {
+        self.showScrollbar();
+        if (self.scrollbar_hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    } else {
+        self.hideScrollbar();
+    }
+}
+
+pub fn showScrollbar(self: *Self) void {
+    if (self.scrollbar_state.total <= self.scrollbar_state.len) return;
+    const hwnd = self.scrollbar_hwnd orelse return;
+    self.scrollbar_visible = true;
+    _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+    // Kill any running fade timer, start/restart activity timer
+    _ = KillTimer(hwnd, scrollbar_fade_timer_id);
+    _ = KillTimer(hwnd, scrollbar_activity_timer_id);
+    _ = SetTimer(hwnd, scrollbar_activity_timer_id, scrollbar_fade_delay_ms, null);
+    self.scrollbar_activity = true;
+}
+
+fn hideScrollbar(self: *Self) void {
+    const hwnd = self.scrollbar_hwnd orelse return;
+    _ = KillTimer(hwnd, scrollbar_activity_timer_id);
+    _ = KillTimer(hwnd, scrollbar_fade_timer_id);
+    self.scrollbar_visible = false;
+    self.scrollbar_dragging = false;
+    _ = ShowWindow(hwnd, SW_HIDE);
+}
+
+fn updateScrollbarRect(self: *Self) void {
+    const hwnd = self.scrollbar_hwnd orelse return;
+    if (self.layout_w <= 0) return;
+    const h: i32 = @intCast(self.height);
+    const x = self.layout_w - scrollbar_width;
+    const HWND_TOP: ?HWND = null;
+    const SWP_NOACTIVATE: UINT = 0x0010;
+    _ = SetWindowPos(hwnd, HWND_TOP, x, 0, scrollbar_width, h, SWP_NOACTIVATE);
+}
+
+const ThumbRect = struct { top: i32, bottom: i32 };
+
+fn scrollbarThumbRect(self: *Self) ThumbRect {
+    const state = self.scrollbar_state;
+    if (state.total == 0 or state.len >= state.total) return .{ .top = 0, .bottom = 0 };
+    const track_height: i32 = @intCast(self.height);
+    const thumb_height = @max(scrollbar_min_thumb, @divTrunc(@as(i32, @intCast(state.len)) * track_height, @as(i32, @intCast(state.total))));
+    const max_offset: i32 = @intCast(state.total - state.len);
+    const thumb_top = if (max_offset > 0)
+        @divTrunc(@as(i32, @intCast(state.offset)) * (track_height - thumb_height), max_offset)
+    else
+        0;
+    return .{ .top = thumb_top, .bottom = thumb_top + thumb_height };
+}
+
+fn scrollbarRowFromY(self: *Self, y: i32) usize {
+    const state = self.scrollbar_state;
+    if (state.total <= state.len) return 0;
+    const track_height: i32 = @intCast(self.height);
+    const thumb_height = @max(scrollbar_min_thumb, @divTrunc(@as(i32, @intCast(state.len)) * track_height, @as(i32, @intCast(state.total))));
+    const usable = track_height - thumb_height;
+    if (usable <= 0) return 0;
+    const max_offset = state.total - state.len;
+    const clamped_y = std.math.clamp(y, 0, usable);
+    return @as(usize, @intCast(clamped_y)) * max_offset / @as(usize, @intCast(usable));
+}
+
+fn scrollbarRowFromDragY(self: *Self, thumb_top_y: i32) usize {
+    const state = self.scrollbar_state;
+    if (state.total <= state.len) return 0;
+    const track_height: i32 = @intCast(self.height);
+    const thumb_height = @max(scrollbar_min_thumb, @divTrunc(@as(i32, @intCast(state.len)) * track_height, @as(i32, @intCast(state.total))));
+    const usable = track_height - thumb_height;
+    if (usable <= 0) return 0;
+    const max_offset = state.total - state.len;
+    const clamped = std.math.clamp(thumb_top_y, 0, usable);
+    return @as(usize, @intCast(clamped)) * max_offset / @as(usize, @intCast(usable));
+}
+
+fn scrollToRow(self: *Self, row: usize) void {
+    const cs = self.core_surface orelse return;
+    cs.renderer_state.mutex.lock();
+    defer cs.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = cs.renderer_state.terminal;
+    t.screens.active.scroll(.{ .row = row });
+    cs.renderer_thread.wakeup.notify() catch {};
+}
+
+fn paintScrollbar(self: *Self, hwnd: HWND) void {
+    var ps: PAINTSTRUCT = std.mem.zeroes(PAINTSTRUCT);
+    const hdc = BeginPaint(hwnd, &ps);
+    defer _ = EndPaint(hwnd, &ps);
+
+    var rect: RECT = std.mem.zeroes(RECT);
+    _ = GetClientRect(hwnd, &rect);
+
+    // Track background (dark, semi-transparent via layered window alpha)
+    const track_brush = CreateSolidBrush(0x00303030);
+    if (track_brush != null) {
+        _ = FillRect(hdc, &rect, track_brush);
+        _ = DeleteObject(track_brush);
+    }
+
+    // Thumb
+    const thumb = self.scrollbarThumbRect();
+    if (thumb.bottom > thumb.top) {
+        var thumb_rect: RECT = .{
+            .left = rect.left,
+            .top = thumb.top,
+            .right = rect.right,
+            .bottom = thumb.bottom,
+        };
+        const color: u32 = if (self.scrollbar_dragging) 0x00B0B0B0 else 0x00808080;
+        const thumb_brush = CreateSolidBrush(color);
+        if (thumb_brush != null) {
+            _ = FillRect(hdc, &thumb_rect, thumb_brush);
+            _ = DeleteObject(thumb_brush);
+        }
+    }
+}
+
 // --- Interface methods required by CoreSurface ---
 
 pub fn getContentScale(self: *const Self) !apprt.ContentScale {
@@ -607,12 +892,15 @@ pub fn getTitle(self: *Self) ?[:0]const u8 {
 
 pub fn close(self: *Self, process_active: bool) void {
     _ = process_active; // Core already gated on needsConfirmQuit
+    const wsl_log = @import("wsl_log.zig");
+    wsl_log.print("Surface.close called (has window={s})", .{if (self.window != null) "yes" else "no"});
     // Ask the window to remove this surface from the tree, destroying the
     // child window. If this is the last surface in the last window, the
     // app will quit.
     if (self.window) |window| {
         window.closeSurface(self);
     } else {
+        wsl_log.print("Surface.close: no window, posting WM_QUIT directly", .{});
         PostQuitMessage(0);
     }
 }

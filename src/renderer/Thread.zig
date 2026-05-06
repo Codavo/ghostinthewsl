@@ -91,6 +91,12 @@ app_mailbox: App.Mailbox,
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
+/// Set by the IO thread (via queueRender) when new terminal content is
+/// available, and by cursor blink when the cursor state changes. The draw
+/// timer checks this atomically and skips the expensive render cycle when
+/// false. This is set from OUTSIDE the renderer thread so it must be atomic.
+content_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
 flags: packed struct {
     /// This is true when a blinking cursor should be visible and false
     /// when it should not be visible. This is toggled on a timer by the
@@ -545,25 +551,27 @@ fn wakeupCallback(
     t.drainMailbox() catch |err|
         log.err("error draining mailbox err={}", .{err});
 
-    // Render immediately
-    _ = renderCallback(t, undefined, undefined, {});
+    // If new content arrived (not just cursor blink), force cursor
+    // visible and restart the blink timer so it stays solid while
+    // content is flowing.
+    if (t.content_dirty.swap(false, .acq_rel)) {
+        t.flags.cursor_blink_visible = true;
+        if (t.cursor_c.state() == .active) {
+            t.cursor_h.reset(
+                &t.loop,
+                &t.cursor_c,
+                &t.cursor_c_cancel,
+                cursorBlinkInterval(),
+                Thread,
+                t,
+                cursorTimerCallback,
+            );
+        }
+    }
 
-    // The below is not used anymore but if we ever want to introduce
-    // a configuration to introduce a delay to coalesce renders, we can
-    // use this.
-    //
-    // // If the timer is already active then we don't have to do anything.
-    // if (t.render_c.state() == .active) return .rearm;
-    //
-    // // Timer is not active, let's start it
-    // t.render_h.run(
-    //     &t.loop,
-    //     &t.render_c,
-    //     10,
-    //     Thread,
-    //     t,
-    //     renderCallback,
-    // );
+    // Render with current state (handles both content updates and
+    // cursor blink toggles).
+    _ = renderCallback(t, undefined, undefined, {});
 
     return .rearm;
 }
@@ -599,18 +607,35 @@ fn drawCallback(
         return .disarm;
     };
 
-    // On Windows IOCP, async wakeup may be delayed, so we also
-    // update frame data on the draw timer to reduce input latency.
-    if (comptime @hasDecl(apprt.runtime.Surface, "swapBuffers")) {
-        t.drainMailbox() catch {};
-        t.renderer.updateFrame(
-            t.state,
-            t.flags.cursor_blink_visible,
-        ) catch {};
-    }
+    // Only render when new content is available. The IO thread sets
+    // content_dirty atomically before calling wakeup.notify(), so the
+    // draw timer can detect new content even if the IOCP notification
+    // hasn't been processed yet.
+    if (t.content_dirty.swap(false, .acq_rel)) {
+        // New content — force cursor visible and restart blink timer
+        // so cursor stays solid while content flows.
+        t.flags.cursor_blink_visible = true;
+        if (t.cursor_c.state() == .active) {
+            t.cursor_h.reset(
+                &t.loop,
+                &t.cursor_c,
+                &t.cursor_c_cancel,
+                cursorBlinkInterval(),
+                Thread,
+                t,
+                cursorTimerCallback,
+            );
+        }
 
-    // Draw
-    t.drawFrame(false);
+        if (comptime @hasDecl(apprt.runtime.Surface, "swapBuffers")) {
+            t.drainMailbox() catch {};
+            t.renderer.updateFrame(
+                t.state,
+                t.flags.cursor_blink_visible,
+            ) catch {};
+        }
+        t.drawFrame(false);
+    }
 
     // Only continue if we're still active
     if (t.draw_active) {
@@ -669,6 +694,8 @@ fn cursorTimerCallback(
     };
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
+    // Cursor blink is cosmetic — don't set content_dirty. The wakeup
+    // callback will render the toggled state directly.
     t.wakeup.notify() catch {};
 
     t.cursor_h.run(

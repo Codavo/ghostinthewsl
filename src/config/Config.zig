@@ -95,6 +95,10 @@ pub const compatibility = std.StaticStringMap(
     // Ghostty 1.3 rename the "window" option to "new-window".
     // See: https://github.com/ghostty-org/ghostty/pull/9764
     .{ "macos-dock-drop-behavior", compatMacOSDockDropBehavior },
+
+    // GhostInTheWSL: wsl-mode was replaced by shell-mode enum.
+    // true → .wsl, false → .local
+    .{ "wsl-mode", compatWslMode },
 });
 
 /// Set Ghostty's graphical user interface language to a language other than the
@@ -3557,29 +3561,30 @@ else
 /// surfaces.
 @"linux-cgroup-hard-fail": bool = false,
 
-/// Enable WSL (Windows Subsystem for Linux) PTY bridge mode. When enabled,
-/// Ghostty will launch a bridge process inside WSL that creates a real
-/// Linux PTY, bypassing Windows ConPTY entirely. This preserves all escape
-/// sequences including the kitty graphics protocol.
+/// Shell backend mode for Windows builds. Controls whether the terminal
+/// connects to WSL (full VT passthrough) or runs a native Windows shell
+/// via ConPTY.
 ///
 /// Valid values are:
 ///
-///   * `false` - Use standard ConPTY (default Windows behavior).
-///   * `true` - Use WSL PTY bridge mode.
-@"wsl-mode": bool = true,
+///   * `wsl` - WSL PTY via vsock (default). Full VT passthrough including
+///     kitty graphics protocol. Bypasses ConPTY entirely.
+///   * `local` - Native Windows process via ConPTY (PowerShell, cmd.exe).
+///   * `auto` - Try WSL first, fall back to local if WSL is unavailable.
+@"shell-mode": ShellMode = .wsl,
 
-/// The WSL distribution to use when `wsl-mode` is enabled. If not set,
-/// the default WSL distribution will be used.
+/// The WSL distribution to use when `shell-mode` is `wsl` or `auto`.
+/// If not set, the default WSL distribution will be used.
 @"wsl-distro": ?[:0]const u8 = null,
 
-/// The shell to launch inside WSL when `wsl-mode` is enabled. If not set,
-/// the default login shell of the WSL distribution will be used.
+/// The shell to launch inside WSL when `shell-mode` is `wsl` or `auto`.
+/// If not set, the default login shell of the WSL distribution will be used.
 @"wsl-shell": ?[:0]const u8 = null,
 
 /// Automatically restart the WSL bridge if it crashes unexpectedly.
-/// Only applies when `wsl-mode` is true. The bridge will be restarted
-/// if it exits with a non-zero code and was running for more than
-/// 2 seconds. This prevents restart loops for immediate failures.
+/// Only applies when `shell-mode` is `wsl` or `auto`. The bridge will
+/// be restarted if it exits with a non-zero code and was running for
+/// more than 2 seconds. This prevents restart loops for immediate failures.
 @"wsl-auto-restart": bool = true,
 
 /// Enable or disable GTK's OpenGL debugging logs. The default is `true` for
@@ -4925,6 +4930,24 @@ fn compatMacOSDockDropBehavior(
     }
 
     return false;
+}
+
+fn compatWslMode(
+    self: *Config,
+    alloc: Allocator,
+    key: []const u8,
+    value: ?[]const u8,
+) bool {
+    _ = alloc;
+    assert(std.mem.eql(u8, key, "wsl-mode"));
+
+    const v = value orelse "true";
+    if (std.mem.eql(u8, v, "true")) {
+        self.@"shell-mode" = .wsl;
+    } else {
+        self.@"shell-mode" = .local;
+    }
+    return true;
 }
 
 /// Add a diagnostic message to the config with the given string.
@@ -8690,6 +8713,16 @@ pub const MiddleClickAction = enum {
 
     /// No action is taken on middle-click.
     ignore,
+};
+
+/// Shell backend mode for Windows builds.
+pub const ShellMode = enum {
+    /// WSL PTY via vsock. Full VT passthrough including kitty graphics.
+    wsl,
+    /// Native Windows process via ConPTY (PowerShell, cmd.exe).
+    local,
+    /// Try WSL first, fall back to local if WSL is unavailable.
+    auto,
 };
 
 /// Shell integration values

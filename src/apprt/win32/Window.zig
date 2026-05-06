@@ -112,11 +112,14 @@ extern "user32" fn CallWindowProcW(lpPrevWndFunc: WNDPROC, hWnd: HWND, Msg: UINT
 extern "user32" fn TrackMouseEvent(lpEventTrack: *TRACKMOUSEEVENT) callconv(.winapi) BOOL;
 
 const MF_STRING: u32 = 0x0000;
+const MF_SEPARATOR: u32 = 0x0800;
 const MF_POPUP: u32 = 0x0010;
 const TPM_LEFTALIGN: u32 = 0x0000;
 const TPM_RETURNCMD: u32 = 0x0100;
 const MENU_NEW_TAB: usize = 6003;
 const MENU_DISTRO_BASE: usize = 6100;
+const MENU_POWERSHELL: usize = 6200;
+const MENU_CMD: usize = 6201;
 const IDC_SIZEWE = @as(?[*:0]align(1) const u16, @ptrFromInt(32644));
 const IDC_SIZENS = @as(?[*:0]align(1) const u16, @ptrFromInt(32645));
 
@@ -365,6 +368,8 @@ pub const CreateOptions = struct {
     quick_terminal: bool = false,
     /// WSL distribution to use for this tab (overrides global wsl-distro config).
     wsl_distro: ?[:0]const u8 = null,
+    /// Shell backend for this tab (overrides global shell-mode config).
+    shell_mode: ?configpkg.Config.ShellMode = null,
 
     pub const none: @This() = .{};
 
@@ -1093,6 +1098,20 @@ pub fn setActiveTabTitle(self: *Window, title: [:0]const u8) !void {
     self.updateTabControlTitle(self.current_tab);
 }
 
+/// Set the title for the tab that contains the given surface.
+/// If the surface isn't in any tab yet (e.g. during init), this is a no-op
+/// since the tab will get its title from CreateOptions when inserted.
+/// Returns true if the updated tab is the currently active tab.
+pub fn setTabTitleForSurface(self: *Window, surface: *Surface, title: [:0]const u8) !bool {
+    const idx = self.findTabIndexForSurface(surface) orelse return false;
+    if (idx >= self.tabs.items.len) return false;
+    const tab = &self.tabs.items[idx];
+    self.app.alloc.free(tab.title);
+    tab.title = try self.app.alloc.dupeZ(u8, title);
+    self.updateTabControlTitle(idx);
+    return idx == self.current_tab;
+}
+
 fn updateTabVisibility(self: *Window) void {
     const hwnd = self.tab_hwnd orelse return;
     _ = sys.ShowWindow(hwnd, sys.SW_SHOWNORMAL);
@@ -1195,6 +1214,12 @@ fn activateTab(self: *Window, index: usize) !void {
     self.relayout();
     self.showTabSurfaces(&self.tabs.items[self.current_tab]);
     if (self.focused_surface) |surface| _ = sys.SetFocus(surface.hwnd);
+    // Update window title bar to match the newly active tab
+    if (self.hwnd) |hwnd| {
+        const utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.app.alloc, self.tabs.items[index].title) catch return;
+        defer self.app.alloc.free(utf16);
+        _ = sys.SetWindowTextW(hwnd, utf16.ptr);
+    }
 }
 
 fn findTabIndexForSurface(self: *Window, surface: *Surface) ?usize {
@@ -1369,6 +1394,12 @@ pub fn focusSurface(self: *Window, surface: *Surface) void {
 }
 
 pub fn initCoreSurface(self: *Window, surface: *Surface, opts: CreateOptions) !void {
+    const wsl_log = @import("wsl_log.zig");
+    wsl_log.print("initCoreSurface: start (shell_mode={s}, has_command={s})", .{
+        if (opts.shell_mode) |m| @tagName(m) else "null",
+        if (opts.command != null) "yes" else "no",
+    });
+
     const alloc = self.app.alloc;
     const core = try alloc.create(CoreSurface);
     errdefer alloc.destroy(core);
@@ -1383,10 +1414,17 @@ pub fn initCoreSurface(self: *Window, surface: *Surface, opts: CreateOptions) !v
     if (opts.working_directory) |wd| config.@"working-directory" = try wd.clone(alloc);
     if (opts.title) |title| config.title = try alloc.dupeZ(u8, title);
     if (opts.wsl_distro) |distro| config.@"wsl-distro" = try alloc.dupeZ(u8, distro);
+    if (opts.shell_mode) |mode| config.@"shell-mode" = mode;
+
+    wsl_log.print("initCoreSurface: config ready, shell-mode={s}, calling core.init", .{
+        @tagName(config.@"shell-mode"),
+    });
 
     try core.init(alloc, &config, self.app.core_app, self.app, surface);
     errdefer core.deinit();
     surface.core_surface = core;
+
+    wsl_log.print("initCoreSurface: core.init completed OK", .{});
 }
 
 pub fn applyConfiguredWindowSize(self: *Window) void {
@@ -1765,15 +1803,19 @@ fn showDropdownMenu(self: *Window) void {
     const menu = CreatePopupMenu() orelse return;
     defer _ = DestroyMenu(menu);
 
-    // "New Tab" (default distro) always first
-    _ = AppendMenuW(menu, MF_STRING, MENU_NEW_TAB, std.unicode.utf8ToUtf16LeStringLiteral("New Tab (default)"));
+    // WSL entries
+    _ = AppendMenuW(menu, MF_STRING, MENU_NEW_TAB, std.unicode.utf8ToUtf16LeStringLiteral("WSL (default)"));
 
-    // Then one entry per WSL distro
     for (distros, 0..) |distro, i| {
         const wtext = std.unicode.utf8ToUtf16LeAllocZ(app.alloc, distro) catch continue;
         defer app.alloc.free(wtext);
         _ = AppendMenuW(menu, MF_STRING, MENU_DISTRO_BASE + i, wtext.ptr);
     }
+
+    // Separator + local shell entries
+    _ = AppendMenuW(menu, MF_SEPARATOR, 0, null);
+    _ = AppendMenuW(menu, MF_STRING, MENU_POWERSHELL, std.unicode.utf8ToUtf16LeStringLiteral("PowerShell"));
+    _ = AppendMenuW(menu, MF_STRING, MENU_CMD, std.unicode.utf8ToUtf16LeStringLiteral("Command Prompt"));
 
     // Position the menu below the dropdown button
     var pt: sys.POINT = .{ .x = 0, .y = TAB_HEIGHT };
@@ -1798,6 +1840,24 @@ fn showDropdownMenu(self: *Window) void {
         self.newTab(.{ .wsl_distro = owned }) catch {
             app.alloc.free(owned);
         };
+    } else if (cmd_id == MENU_POWERSHELL) {
+        const wsl_log = @import("wsl_log.zig");
+        wsl_log.print("showDropdownMenu: PowerShell selected, creating tab", .{});
+        const cmd_str = app.alloc.dupeZ(u8, "powershell.exe") catch return;
+        self.newTab(.{ .shell_mode = .local, .command = .{ .shell = cmd_str }, .title = "PowerShell" }) catch |err| {
+            wsl_log.print("showDropdownMenu: PowerShell newTab FAILED: {s}", .{@errorName(err)});
+            app.alloc.free(cmd_str);
+        };
+        wsl_log.print("showDropdownMenu: PowerShell newTab returned OK", .{});
+    } else if (cmd_id == MENU_CMD) {
+        const wsl_log = @import("wsl_log.zig");
+        wsl_log.print("showDropdownMenu: Command Prompt selected, creating tab", .{});
+        const cmd_str = app.alloc.dupeZ(u8, "cmd.exe") catch return;
+        self.newTab(.{ .shell_mode = .local, .command = .{ .shell = cmd_str }, .title = "Command Prompt" }) catch |err| {
+            wsl_log.print("showDropdownMenu: CMD newTab FAILED: {s}", .{@errorName(err)});
+            app.alloc.free(cmd_str);
+        };
+        wsl_log.print("showDropdownMenu: CMD newTab returned OK", .{});
     }
 }
 

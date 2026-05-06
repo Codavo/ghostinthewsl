@@ -665,6 +665,10 @@ pub fn init(
             .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
             .resources_dir = global_state.resources_dir.host(),
             .term = config.term,
+            .shell_mode = config.@"shell-mode",
+            .wsl_distro = config.@"wsl-distro",
+            .wsl_shell = config.@"wsl-shell",
+            .wsl_auto_restart = config.@"wsl-auto-restart",
             .rt_pre_exec_info = .init(config),
             .rt_post_fork_info = .init(config),
         });
@@ -681,8 +685,9 @@ pub fn init(
             .backend = .{ .exec = io_exec },
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
-            .renderer_mailbox = render_thread.mailbox,
+            .renderer_wakeup = &self.renderer_thread.wakeup,
+            .renderer_content_dirty = &self.renderer_thread.content_dirty,
+            .renderer_mailbox = self.renderer_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         });
     }

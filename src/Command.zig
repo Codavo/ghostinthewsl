@@ -330,7 +330,7 @@ fn startWindows(self: *Command, arena: Allocator) !void {
             .hStdError = stderr,
             .hStdOutput = stdout,
             .hStdInput = stdin,
-            .dwFlags = windows.STARTF_USESTDHANDLES,
+            .dwFlags = if (attribute_list != null) 0 else windows.STARTF_USESTDHANDLES,
             .lpReserved = null,
             .lpDesktop = null,
             .lpTitle = null,
@@ -357,7 +357,7 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         command_line_w.ptr,
         null,
         null,
-        windows.TRUE,
+        if (self.pseudo_console != null) windows.FALSE else windows.TRUE,
         flags,
         if (env_w) |w| w.ptr else null,
         if (cwd_w) |w| w.ptr else null,
@@ -365,6 +365,8 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         &process_information,
     ) == 0) return windows.unexpectedError(windows.kernel32.GetLastError());
 
+    // Close the thread handle immediately — we only need the process handle.
+    _ = windows.CloseHandle(process_information.hThread);
     self.pid = process_information.hProcess;
 }
 
