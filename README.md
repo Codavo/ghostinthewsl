@@ -8,6 +8,8 @@ GhostInTheWSL is a Windows version of the [Ghostty](https://ghostty.org/docs) te
 
 Downloads: [GitHub Releases](https://github.com/Codavo/ghostinthewsl/releases)
 
+Release notes: [CHANGELOG.md](CHANGELOG.md)
+
 It avoids the Windows terminal infrastructure and only connects directly to the WSL 2 Linux VM.
 
 It supports fancy terminal features such as kitty graphics and doesn't suffer from the issues introduced by [ConPTY](https://devblogs.microsoft.com/commandline/windows-command-line-introducing-the-windows-pseudo-console-conpty/) thanks to bypassing it entirely.
