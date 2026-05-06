@@ -568,9 +568,9 @@ const WindowsPty = struct {
 
         if (create_ptr != null and resize_ptr != null and close_ptr != null) {
             return .{
-                .create = @ptrCast(create_ptr.?),
-                .resize = @ptrCast(resize_ptr.?),
-                .close = @ptrCast(close_ptr.?),
+                .create = @ptrCast(@alignCast(create_ptr.?)),
+                .resize = @ptrCast(@alignCast(resize_ptr.?)),
+                .close = @ptrCast(@alignCast(close_ptr.?)),
             };
         }
         return null;

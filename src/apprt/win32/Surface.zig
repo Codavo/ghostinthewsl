@@ -552,8 +552,8 @@ fn registerScrollbarClass() !void {
 
 /// Disable VSync via WGL extension for lower input latency.
 pub fn disableVSync(_: *Self) void {
-    const func: ?*const fn (i32) callconv(.winapi) i32 = @ptrCast(wglGetProcAddress("wglSwapIntervalEXT"));
-    if (func) |setInterval| {
+    if (wglGetProcAddress("wglSwapIntervalEXT")) |func| {
+        const setInterval: *const fn (i32) callconv(.winapi) i32 = @ptrCast(@alignCast(func));
         _ = setInterval(0);
     }
 }
