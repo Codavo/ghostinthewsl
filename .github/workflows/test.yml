@@ -96,7 +96,7 @@ jobs:
       - build-libghostty-vt-android
       - build-libghostty-vt-macos
       - build-libghostty-vt-windows
-      - build-libghostty-windows-gnu
+      - build-ghostty-windows
       - build-linux
       - build-linux-libghostty
       - build-nix
