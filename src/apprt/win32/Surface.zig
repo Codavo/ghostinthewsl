@@ -383,6 +383,8 @@ pub fn deinit(self: *Self) void {
     if (self.hdc != null) {
         _ = ReleaseDC(self.hwnd, self.hdc);
     }
+    _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+    _ = DestroyWindow(self.hwnd);
 }
 
 fn initOpenGL(self: *Self) !void {

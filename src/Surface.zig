@@ -2074,11 +2074,22 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
+        // In the Win32 WSL runtime, terminal pwd values are POSIX paths while
+        // std.fs.path uses Windows semantics. URL-like strings can panic inside
+        // resolution, so leave them to the URL opener instead.
+        if (builtin.os.tag == .windows and
+            std.mem.indexOfScalar(u8, path, ':') != null) return null;
+
         const terminal_pwd = self.io.terminal.getPwd() orelse {
             return null;
         };
 
         const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
+
+        if (!std.fs.path.isAbsolute(resolved)) {
+            self.alloc.free(resolved);
+            return null;
+        }
 
         std.fs.accessAbsolute(resolved, .{}) catch {
             self.alloc.free(resolved);
