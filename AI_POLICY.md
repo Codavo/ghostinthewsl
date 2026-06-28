@@ -22,13 +22,10 @@ The Ghostty project has strict rules for AI usage:
   Text and code are the only acceptable AI-generated content, per the
   other rules in this policy.
 
-- **Bad AI drivers will be denounced** People who produce bad contributions
-  that are clearly AI (slop) will be added to our public denouncement list.
-  This list will block all future contributions. Additionally, the list
-  is public and may be used by other projects to be aware of bad actors.
-  We love to help junior developers learn and grow, but
-  if you're interested in that then don't use AI, and we'll help you.
-  I'm sorry that bad AI drivers have ruined this for you.
+- **Low-quality AI-assisted contributions may be rejected.** Contributions
+  that appear unreviewed, inaccurate, or generated without meaningful human
+  understanding may be closed or rejected. Contributors remain responsible
+  for the correctness and maintainability of their work.
 
 These rules apply only to outside contributions to Ghostty. Maintainers
 are exempt from these rules and may use AI tools at their discretion;
