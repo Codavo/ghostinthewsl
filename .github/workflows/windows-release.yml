@@ -46,6 +46,7 @@ jobs:
           name: bridge-${{ matrix.arch }}
           path: wsl-pty-bridge/target/${{ matrix.rust_target }}/release/wsl-pty-bridge
           if-no-files-found: error
+          retention-days: 2
 
   package-windows:
     name: Package ${{ matrix.arch }}
@@ -116,6 +117,7 @@ jobs:
             dist/${{ env.ASSET_STEM }}.exe
             dist/${{ env.ASSET_STEM }}-setup.exe
           if-no-files-found: error
+          retention-days: 7
 
   publish-release:
     name: Publish Release
