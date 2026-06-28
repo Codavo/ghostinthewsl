@@ -76,6 +76,9 @@ extension Ghostty {
         // Cancellable for search state needle changes
         private var searchNeedleCancellable: AnyCancellable?
 
+        // Cancellable for the debounced accessibility selection-change post.
+        private var accessibilitySelectionCancellable: AnyCancellable?
+
         // Whether the pointer should be visible or not
         @Published private(set) var pointerStyle: CursorStyle = .horizontalText
 
@@ -88,6 +91,12 @@ extension Ghostty {
 
         // Whether the cursor is currently visible (not hidden by typing, etc.)
         @Published private(set) var cursorVisible: Bool = true
+
+        /// Whether the belonging window is visible
+        ///
+        /// We track this to restore surface occlusion state
+        /// after this surface is dragged to another window
+        var isWindowVisible = false
 
         /// The configuration derived from the Ghostty config so we don't need to rely on references.
         @Published private(set) var derivedConfig: DerivedConfig
@@ -279,6 +288,22 @@ extension Ghostty {
                     self.title = "👻"
                 }
             }
+
+            // A drag can emit multiple selection changes. Debounce so screen
+            // readers hear one announcement once the selection settles.
+            accessibilitySelectionCancellable = NotificationCenter.default
+                // The publisher retains its object, so filtering with a weak capture
+                // avoids a cycle between self and the stored cancellable.
+                .publisher(for: .ghosttySelectionDidChange)
+                .filter { [weak self] notification in
+                    guard let self else { return false }
+                    return notification.object as AnyObject? === self
+                }
+                .debounce(for: .milliseconds(100), scheduler: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    guard let self else { return }
+                    NSAccessibility.post(element: self, notification: .selectedTextChanged)
+                }
 
             // Before we initialize the surface we want to register our notifications
             // so there is no window where we can't receive them.
@@ -719,7 +744,18 @@ extension Ghostty {
 
             // Update our derived config
             DispatchQueue.main.async { [weak self] in
-                self?.derivedConfig = DerivedConfig(config)
+                guard let self else { return }
+                self.derivedConfig = DerivedConfig(config)
+
+                // If the cached OSC 11 background color disagrees with the new
+                // config-derived background, drop it so window chrome follows
+                // the new config (e.g., on light/dark theme auto-switch). The
+                // cached value is restored next time the terminal emits a
+                // color_change.
+                if let cached = self.backgroundColor,
+                   cached != self.derivedConfig.backgroundColor {
+                    self.backgroundColor = nil
+                }
             }
         }
 
@@ -1130,22 +1166,33 @@ extension Ghostty {
             // we control the preedit state only through the preedit API.
             syncPreedit(clearIfNeeded: markedTextBefore)
 
-            // Korean IMEs on macOS may commit preedit text via insertText
-            // while handling an arrow key. Send that committed text separately
-            // before replaying arrow movement, except for plain left-arrow
-            // where AppKit already leaves the caret in place.
+            // We're composing if we have preedit (the obvious case). But we're also
+            // composing if we don't have preedit and we had marked text before,
+            // because this input probably just reset the preedit state. It shouldn't
+            // be encoded. Example: Japanese begin composing, then press backspace
+            // or ctrl+h. This should only cancel the composing state but not
+            // actually delete the prior input characters (prior to the composing).
+            let composing = markedText.length > 0 || markedTextBefore
+
+            // The input method may commit all or part of the preedit text via
+            // insertText while handling a key that should not itself be
+            // encoded. Send that committed text separately, then only replay
+            // keys that should still affect the terminal after committing.
             if markedTextBefore,
-               markedText.length == 0,
                let list = keyTextAccumulator,
-               list.count > 0,
-               let preeditCommitArrow = preeditCommitArrowKey(translationEvent) {
+               list.count > 0 {
                 for text in list {
+                    if Ghostty.SurfaceView.shouldSuppressComposingControlInput(
+                        text,
+                        composing: composing
+                    ) {
+                        continue
+                    }
+
                     _ = committedPreeditTextAction(action, text: text)
                 }
 
-                let isPlainLeftArrow = preeditCommitArrow == .arrowLeft &&
-                    event.modifierFlags.isDisjoint(with: [.shift, .control, .option, .command])
-                if !isPlainLeftArrow {
+                if shouldReplayCommittedPreeditKey(translationEvent) {
                     _ = keyAction(
                         action,
                         event: event,
@@ -1157,10 +1204,20 @@ extension Ghostty {
             }
 
             if let list = keyTextAccumulator, list.count > 0 {
-                // If we have text, then we've composed a character, send that down.
-                // These never have "composing" set to true because these are the
-                // result of a composition.
+                // Accumulated text from interpretKeyEvents (committed by the IME).
                 for text in list {
+                    // Drop bare control characters the IME accumulated while
+                    // composing so they don't leak through to the terminal.
+                    if Ghostty.SurfaceView.shouldSuppressComposingControlInput(
+                        text,
+                        composing: composing
+                    ) {
+                        continue
+                    }
+
+                    // We've composed a character; send it down. keyAction's
+                    // default composing=false applies because this is the
+                    // committed result of a composition, not in-progress preedit.
                     _ = keyAction(
                         action,
                         event: event,
@@ -1169,20 +1226,22 @@ extension Ghostty {
                     )
                 }
             } else {
+                // Raw control characters (e.g. ctrl+h) arriving during
+                // composition belong to the IME, not the terminal.
+                if Ghostty.SurfaceView.shouldSuppressComposingControlInput(
+                    event.characters,
+                    composing: composing
+                ) {
+                    return
+                }
+
                 // We have no accumulated text so this is a normal key event.
                 _ = keyAction(
                     action,
                     event: event,
                     translationEvent: translationEvent,
                     text: translationEvent.ghosttyCharacters,
-
-                    // We're composing if we have preedit (the obvious case). But we're also
-                    // composing if we don't have preedit and we had marked text before,
-                    // because this input probably just reset the preedit state. It shouldn't
-                    // be encoded. Example: Japanese begin composing, the press backspace.
-                    // This should only cancel the composing state but not actually delete
-                    // the prior input characters (prior to the composing).
-                    composing: markedText.length > 0 || markedTextBefore
+                    composing: composing
                 )
             }
         }
@@ -1416,13 +1475,17 @@ extension Ghostty {
             }
         }
 
-        private func preeditCommitArrowKey(_ event: NSEvent) -> Ghostty.Input.Key? {
-            guard let key = Ghostty.Input.Key(keyCode: event.keyCode) else { return nil }
+        private func shouldReplayCommittedPreeditKey(_ event: NSEvent) -> Bool {
+            guard let key = Ghostty.Input.Key(keyCode: event.keyCode) else { return false }
             switch key {
-            case .arrowDown, .arrowLeft, .arrowRight, .arrowUp:
-                return key
+            case .arrowDown, .arrowRight, .arrowUp:
+                return true
+            case .arrowLeft:
+                // Don't replay plain left-arrow because AppKit already leaves
+                // the caret in place after Korean IMEs commit preedit text.
+                return !event.modifierFlags.isDisjoint(with: [.shift, .control, .option, .command])
             default:
-                return nil
+                return false
             }
         }
 
@@ -1555,7 +1618,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "copy_to_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1563,7 +1626,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "paste_from_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1571,7 +1634,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "paste_from_clipboard"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1579,7 +1642,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "paste_from_selection"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1587,7 +1650,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "select_all"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1595,7 +1658,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "start_search"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1603,7 +1666,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "search_selection"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1611,7 +1674,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "scroll_to_selection"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1627,7 +1690,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "end_search"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1635,7 +1698,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "toggle_readonly"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1663,7 +1726,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "reset"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1671,7 +1734,7 @@ extension Ghostty {
             guard let surface = self.surface else { return }
             let action = "inspector:toggle"
             if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-                AppDelegate.logger.warning("action failed action=\(action)")
+                AppDelegate.logger.warning("action failed action=\(action, privacy: .public)")
             }
         }
 
@@ -1703,7 +1766,7 @@ extension Ghostty {
             // so we need @MainActor since we're reading/writing view state.
             UNUserNotificationCenter.current().add(request) { @MainActor error in
                 if let error = error {
-                    AppDelegate.logger.error("Error scheduling user notification: \(error)")
+                    AppDelegate.logger.error("Error scheduling user notification: \(error, privacy: .public)")
                     return
                 }
 
@@ -2025,6 +2088,22 @@ extension Ghostty.SurfaceView: NSTextInputClient {
             ghostty_surface_preedit(surface, nil, 0)
         }
     }
+
+    /// True when `text` is a single C0 control character (U+0000-U+001F)
+    /// arriving while the IME is composing. Such input belongs to the IME
+    /// and must not be forwarded to the terminal.
+    static func shouldSuppressComposingControlInput(
+        _ text: String?,
+        composing: Bool
+    ) -> Bool {
+        guard composing, let text else { return false }
+        let scalars = text.unicodeScalars
+        guard let scalar = scalars.first,
+              scalars.index(after: scalars.startIndex) == scalars.endIndex else {
+            return false
+        }
+        return scalar.value < 0x20
+    }
 }
 
 // MARK: Services
@@ -2120,6 +2199,14 @@ extension Ghostty.SurfaceView: NSMenuItemValidation {
         case #selector(toggleReadonly):
             item.state = readonly ? .on : .off
             return true
+
+        case #selector(copy(_:)):
+            // We only enable copy menu item when there're actual selected text
+            if let text = self.accessibilitySelectedText(), text.count > 0 {
+                return true
+            } else {
+                return false
+            }
 
         default:
             return true

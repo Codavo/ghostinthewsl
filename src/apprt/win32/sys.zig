@@ -155,3 +155,4 @@ pub extern "user32" fn FindWindowW(lpClassName: ?[*:0]const u16, lpWindowName: ?
 pub const ERROR_ALREADY_EXISTS: DWORD = 183;
 /// Custom app message used for single-instance "open new window" notification.
 pub const WM_APP_NEW_WINDOW: UINT = 0x8000 + 1; // WM_APP + 1
+pub const WM_APP_TOGGLE_QUICK_TERMINAL: UINT = 0x8000 + 2; // WM_APP + 2
