@@ -1259,6 +1259,7 @@ fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
         const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
         if (len > 0) {
             const input = @import("../../input.zig");
+            var effective_mods = mods;
             var consumed_mods: input.Mods = .{};
 
             // AltGr commonly appears as Left Ctrl + Right Alt on Windows.
@@ -1270,9 +1271,37 @@ fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
                 consumed_mods.alt = true;
             }
 
+            // IME/dead-key composed text (CJK, accented letters, ...) is
+            // delivered via WM_CHAR/WM_SYSCHAR while modifier keys may still
+            // be held physically. For example CorvusSKK confirms a conversion
+            // with Ctrl+J, so Ctrl is down at the moment the committed
+            // characters arrive. The core's legacy encoder emits a fixterms
+            // "CSI <codepoint>;<mods>u" sequence for any Ctrl + single
+            // codepoint (see input/key_encode.zig), which turns committed
+            // text like "相" into garbage such as "ESC[30456;5u" in the
+            // shell. Such modifiers were consumed to compose the character,
+            // not to trigger a shortcut. Control characters (< 0x20) are
+            // already filtered above.
+            //
+            // Non-ASCII WM_CHAR output can come from either composition
+            // (Ctrl held for the IME commit, or AltGr = Ctrl+RightAlt) or an
+            // intentional "Alt + <non-ASCII key>" shortcut. Only the former
+            // should have its modifiers dropped. When Alt is held without
+            // Ctrl we keep Alt so the core still encodes the meta/ESC-prefixed
+            // shortcut; every Ctrl-held case (SKK commit, AltGr) clears the
+            // modifiers so the raw UTF-8 text is emitted instead of CSI-u.
+            if (codepoint >= 0x80) {
+                if (mods.alt and !mods.ctrl) {
+                    consumed_mods = .{};
+                } else {
+                    effective_mods = .{};
+                    consumed_mods = .{};
+                }
+            }
+
             const event = input.KeyEvent{
                 .action = .press,
-                .mods = mods,
+                .mods = effective_mods,
                 .consumed_mods = consumed_mods,
                 .utf8 = utf8_buf[0..len],
             };
