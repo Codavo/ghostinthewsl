@@ -1259,6 +1259,7 @@ fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
         const len = std.unicode.utf8Encode(codepoint, &utf8_buf) catch 0;
         if (len > 0) {
             const input = @import("../../input.zig");
+            var effective_mods = mods;
             var consumed_mods: input.Mods = .{};
 
             // AltGr commonly appears as Left Ctrl + Right Alt on Windows.
@@ -1270,9 +1271,18 @@ fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
                 consumed_mods.alt = true;
             }
 
+            // Some IMEs commit non-ASCII text through WM_CHAR while Ctrl is
+            // still held for the commit key. The legacy encoder treats
+            // Ctrl+single-codepoint text as CSI-u, so clear the live modifiers
+            // for this text path and emit the committed UTF-8 directly.
+            if (codepoint >= 0x80 and mods.ctrl) {
+                effective_mods = .{};
+                consumed_mods = .{};
+            }
+
             const event = input.KeyEvent{
                 .action = .press,
-                .mods = mods,
+                .mods = effective_mods,
                 .consumed_mods = consumed_mods,
                 .utf8 = utf8_buf[0..len],
             };
