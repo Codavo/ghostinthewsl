@@ -410,11 +410,11 @@ primary_surface: *Surface,
 tree: ?SplitTree = null,
 focused_surface: ?*Surface = null,
 surface_initialized: bool = false,
-tabs: std.ArrayListUnmanaged(TabState) = .{},
+tabs: std.ArrayListUnmanaged(TabState) = .empty,
 current_tab: usize = 0,
 fullscreen: FullscreenState = .{},
 quick_terminal: bool = false,
-dividers: std.ArrayListUnmanaged(*DividerState) = .{},
+dividers: std.ArrayListUnmanaged(*DividerState) = .empty,
 drag: ?DividerDrag = null,
 
 const FullscreenState = struct {

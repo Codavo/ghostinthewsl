@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const windows = @import("os/main.zig").windows;
 const posix = std.posix;
 const assert = @import("quirks.zig").inlineAssert;
+const global = @import("global.zig");
 
 const log = std.log.scoped(.pty);
 
@@ -153,19 +154,20 @@ const PosixPty = struct {
         // Set CLOEXEC on the master fd, only the slave fd should be inherited
         // by the child process (shell/command).
         cloexec: {
-            const flags = posix.fcntl(master_fd, posix.F.GETFD, 0) catch |err| {
-                log.warn("error getting flags for master fd err={}", .{err});
+            const flags = posix.system.fcntl(master_fd, posix.F.GETFD);
+            if (flags == -1) {
+                log.warn("error getting flags for master fd err=E{s}", .{@tagName(posix.errno(-1))});
                 break :cloexec;
-            };
+            }
 
-            _ = posix.fcntl(
+            switch (posix.errno(posix.system.fcntl(
                 master_fd,
                 posix.F.SETFD,
                 flags | posix.FD_CLOEXEC,
-            ) catch |err| {
-                log.warn("error setting CLOEXEC on master fd err={}", .{err});
-                break :cloexec;
-            };
+            ))) {
+                .SUCCESS => {},
+                else => |e| log.warn("error setting CLOEXEC on master fd err=E{}", .{e}),
+            }
         }
 
         // Enable UTF-8 mode. I think this is on by default on Linux but it
@@ -260,8 +262,8 @@ const PosixPty = struct {
         }
 
         // Can close master/slave pair now
-        posix.close(self.slave);
-        posix.close(self.master);
+        _ = posix.system.close(self.slave);
+        _ = posix.system.close(self.master);
     }
 
     /// Get information about the process(es) attached to the PTY. Returns
@@ -275,9 +277,9 @@ const PosixPty = struct {
                         const linux = std.os.linux;
                         var pgrp: i32 = undefined;
                         const rc = linux.tcgetpgrp(self.master, &pgrp);
-                        switch (linux.E.init(rc)) {
-                            .SUCCESS => return @intCast(pgrp),
-                            else => return null,
+                        switch (rc) {
+                            0 => return @intCast(pgrp), // SUCCESS
+                            else => return null, // Anything else
                         }
                     },
                     else => {
@@ -340,7 +342,7 @@ const WindowsPty = struct {
     in_pipe: windows.HANDLE,
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
-    pseudo_console: windows.exp.HPCON,
+    pseudo_console: windows.HPCON,
     size: winsize,
 
     const PseudoConsoleApi = struct {
@@ -356,10 +358,11 @@ const WindowsPty = struct {
 
     fn loadAdjacentConptyDll() ?HMODULE {
         var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const exe_path = std.fs.selfExePath(&exe_buf) catch |err| {
+        const exe_path_len = std.process.executablePath(global.io(), &exe_buf) catch |err| {
             log.warn("failed to determine executable path for adjacent conpty.dll lookup err={}", .{err});
             return null;
         };
+        const exe_path = exe_buf[0..exe_path_len];
         const exe_dir = std.fs.path.dirname(exe_path) orelse return null;
 
         var dll_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -491,8 +494,8 @@ const WindowsPty = struct {
 
     /// Write data to dir\filename via a .tmp file + MoveFileExW for atomicity.
     fn writeFileAtomic(dir: []const u8, filename: []const u8, data: []const u8) bool {
-        const CreateFileW = windows.kernel32.CreateFileW;
-        const WriteFile = windows.kernel32.WriteFile;
+        const CreateFileW = windows.exp.kernel32.CreateFileW;
+        const WriteFile = windows.exp.kernel32.WriteFile;
         const MoveFileExW = struct {
             extern "kernel32" fn MoveFileExW(
                 lpExistingFileName: [*:0]const u16,
@@ -534,7 +537,7 @@ const WindowsPty = struct {
         var remaining = data;
         while (remaining.len > 0) {
             const chunk_len: u32 = @intCast(@min(remaining.len, 0x7FFF_FFFF));
-            if (WriteFile(handle, remaining.ptr, chunk_len, &written, null) == 0) {
+            if (WriteFile(handle, remaining.ptr, chunk_len, &written, null) == windows.FALSE) {
                 _ = windows.CloseHandle(handle);
                 log.warn("failed to write {s}", .{filename});
                 return false;
@@ -661,10 +664,10 @@ const WindowsPty = struct {
             .lpSecurityDescriptor = null,
         };
 
-        pty.in_pipe = windows.kernel32.CreateNamedPipeW(
+        pty.in_pipe = windows.exp.kernel32.CreateNamedPipeW(
             pipe_path_w.ptr,
             windows.PIPE_ACCESS_OUTBOUND |
-                windows.exp.FILE_FLAG_FIRST_PIPE_INSTANCE |
+                windows.FILE_FLAG_FIRST_PIPE_INSTANCE |
                 windows.FILE_FLAG_OVERLAPPED,
             windows.PIPE_TYPE_BYTE,
             1,
@@ -675,14 +678,14 @@ const WindowsPty = struct {
         );
         if (pty.in_pipe == windows.INVALID_HANDLE_VALUE) {
             wsl_log.print("Pty.open: CreateNamedPipeW FAILED", .{});
-            return windows.unexpectedError(windows.kernel32.GetLastError());
+            return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.in_pipe);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe);
 
         wsl_log.print("Pty.open: named pipe created", .{});
 
         var security_attributes_read = security_attributes;
-        pty.in_pipe_pty = windows.kernel32.CreateFileW(
+        pty.in_pipe_pty = windows.exp.kernel32.CreateFileW(
             pipe_path_w.ptr,
             windows.GENERIC_READ,
             0,
@@ -693,9 +696,9 @@ const WindowsPty = struct {
         );
         if (pty.in_pipe_pty == windows.INVALID_HANDLE_VALUE) {
             wsl_log.print("Pty.open: CreateFileW for in_pipe_pty FAILED", .{});
-            return windows.unexpectedError(windows.kernel32.GetLastError());
+            return windows.unexpectedError(windows.GetLastError());
         }
-        errdefer _ = windows.CloseHandle(pty.in_pipe_pty);
+        errdefer _ = windows.exp.kernel32.CloseHandle(pty.in_pipe_pty);
 
         wsl_log.print("Pty.open: in_pipe_pty opened", .{});
 
@@ -714,21 +717,33 @@ const WindowsPty = struct {
         //     _ = windows.CloseHandle(pty.in_pipe);
         // }
 
-        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == 0) {
+        if (windows.exp.kernel32.CreatePipe(&pty.out_pipe, &pty.out_pipe_pty, null, 0) == windows.FALSE) {
             wsl_log.print("Pty.open: CreatePipe for out_pipe FAILED", .{});
-            return windows.unexpectedError(windows.kernel32.GetLastError());
+            return windows.unexpectedError(windows.GetLastError());
         }
         errdefer {
-            _ = windows.CloseHandle(pty.out_pipe);
-            _ = windows.CloseHandle(pty.out_pipe_pty);
+            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe);
+            _ = windows.exp.kernel32.CloseHandle(pty.out_pipe_pty);
         }
 
         wsl_log.print("Pty.open: out_pipe created", .{});
 
-        try windows.SetHandleInformation(pty.in_pipe, windows.HANDLE_FLAG_INHERIT, 0);
-        try windows.SetHandleInformation(pty.in_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
-        try windows.SetHandleInformation(pty.out_pipe, windows.HANDLE_FLAG_INHERIT, 0);
-        try windows.SetHandleInformation(pty.out_pipe_pty, windows.HANDLE_FLAG_INHERIT, 0);
+        const SetHandleInformation = struct {
+            fn f(hObject: windows.HANDLE) !void {
+                if (windows.exp.kernel32.SetHandleInformation(
+                    hObject,
+                    windows.HANDLE_FLAG_INHERIT,
+                    0,
+                ) == windows.FALSE) {
+                    return windows.unexpectedError(windows.GetLastError());
+                }
+            }
+        };
+
+        try SetHandleInformation.f(pty.in_pipe);
+        try SetHandleInformation.f(pty.in_pipe_pty);
+        try SetHandleInformation.f(pty.out_pipe);
+        try SetHandleInformation.f(pty.out_pipe_pty);
 
         wsl_log.print("Pty.open: handle inheritance cleared, loading ConPTY API", .{});
 
@@ -755,10 +770,10 @@ const WindowsPty = struct {
     }
 
     pub fn deinit(self: *Pty) void {
-        _ = windows.CloseHandle(self.in_pipe_pty);
-        _ = windows.CloseHandle(self.in_pipe);
-        _ = windows.CloseHandle(self.out_pipe_pty);
-        _ = windows.CloseHandle(self.out_pipe);
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+        _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
+        _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
         pseudoConsoleApi().close(self.pseudo_console);
         self.* = undefined;
     }

@@ -26,6 +26,8 @@ const FILE_APPEND_DATA: windows.DWORD = 0x0004;
 const OPEN_ALWAYS: windows.DWORD = 4;
 
 extern "kernel32" fn GetTempPathW(nBufferLength: windows.DWORD, lpBuffer: [*]u16) callconv(.winapi) windows.DWORD;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn GetEnvironmentVariableW(lpName: [*:0]const u16, lpBuffer: [*]u16, nSize: windows.DWORD) callconv(.winapi) windows.DWORD;
 
 /// Write a formatted message to the debug log file.
 /// No-op if GHOSTWSL_DEBUG is not set to "1".
@@ -38,8 +40,8 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     var pos: usize = 0;
 
     // Timestamp prefix: [HH:MM:SS.mmm]
-    const ts = std.time.milliTimestamp();
-    // Convert to time-of-day (UTC). milliTimestamp is ms since epoch.
+    const ts = GetTickCount64();
+    // Convert uptime milliseconds to time-of-day shaped fields.
     const ms_in_day = @mod(ts, 86400_000);
     const hours = @divTrunc(ms_in_day, 3600_000);
     const mins = @divTrunc(@mod(ms_in_day, 3600_000), 60_000);
@@ -67,7 +69,7 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 
     // Write to file
     var written: windows.DWORD = 0;
-    _ = windows.kernel32.WriteFile(
+    _ = windows.exp.kernel32.WriteFile(
         handle,
         buf[0..pos].ptr,
         @intCast(pos),
@@ -91,13 +93,13 @@ pub fn dumpVtChunk(data: []const u8, vt_ms: u32) void {
     @memcpy(header[4..8], &std.mem.toBytes(vt_ms));
 
     var written: windows.DWORD = 0;
-    _ = windows.kernel32.WriteFile(handle, &header, 8, &written, null);
+    _ = windows.exp.kernel32.WriteFile(handle, &header, 8, &written, null);
 
     // Write chunk data (may need multiple calls for large chunks)
     var remaining = data[0..len];
     while (remaining.len > 0) {
         var n: windows.DWORD = 0;
-        _ = windows.kernel32.WriteFile(
+        _ = windows.exp.kernel32.WriteFile(
             handle,
             remaining.ptr,
             @intCast(remaining.len),
@@ -131,7 +133,7 @@ fn getDumpHandle() ?windows.HANDLE {
     path_buf[pos] = 0;
 
     const FILE_SHARE_WRITE: windows.DWORD = 0x00000002;
-    const handle = windows.kernel32.CreateFileW(
+    const handle = windows.exp.kernel32.CreateFileW(
         @ptrCast(&path_buf),
         FILE_APPEND_DATA,
         windows.FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -153,12 +155,10 @@ fn getHandle() ?windows.HANDLE {
 
     // First call: check environment variable
     if (enabled == .unknown) {
-        const val = std.process.getEnvVarOwned(std.heap.page_allocator, "GHOSTWSL_DEBUG") catch {
-            enabled = .no;
-            return null;
-        };
-        defer std.heap.page_allocator.free(val);
-        if (!std.mem.eql(u8, val, "1")) {
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("GHOSTWSL_DEBUG");
+        var val: [8]u16 = undefined;
+        const len = GetEnvironmentVariableW(name, &val, val.len);
+        if (len != 1 or val[0] != '1') {
             enabled = .no;
             return null;
         }
@@ -188,7 +188,7 @@ fn getHandle() ?windows.HANDLE {
 
     // Open the file for appending (create if not exists)
     const FILE_SHARE_WRITE: windows.DWORD = 0x00000002;
-    const handle = windows.kernel32.CreateFileW(
+    const handle = windows.exp.kernel32.CreateFileW(
         @ptrCast(&path_buf),
         FILE_APPEND_DATA,
         windows.FILE_SHARE_READ | FILE_SHARE_WRITE,

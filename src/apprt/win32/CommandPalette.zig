@@ -87,7 +87,7 @@ list_hwnd: ?HWND = null,
 target_window: ?*Window = null,
 
 /// Currently filtered command indices (into input.command.defaults)
-filtered: std.ArrayListUnmanaged(usize) = .{},
+filtered: std.ArrayListUnmanaged(usize) = .empty,
 
 /// True while open() is in progress; blocks WM_ACTIVATE-driven close.
 opening: bool = false,
@@ -100,7 +100,7 @@ pub fn init(alloc: Allocator, app: *App) CommandPalette {
         .edit_hwnd = null,
         .list_hwnd = null,
         .target_window = null,
-        .filtered = .{},
+        .filtered = .empty,
         .opening = false,
     };
 }
@@ -205,11 +205,17 @@ fn open(self: *CommandPalette, window: *Window) !void {
         const face_name = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
         ui_font = CreateFontW(
             -18, // height in pixels (negative = em height)
-            0, 0, 0,
+            0,
+            0,
+            0,
             400, // FW_NORMAL
-            0, 0, 0,
+            0,
+            0,
+            0,
             1, // DEFAULT_CHARSET
-            0, 0, 0,
+            0,
+            0,
+            0,
             0,
             face_name,
         );

@@ -8,18 +8,20 @@ const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const EnvMap = std.process.EnvMap;
+const EnvMap = std.process.Environ.Map;
 const posix = std.posix;
 const termio = @import("../termio.zig");
 const StreamHandler = @import("stream_handler.zig").StreamHandler;
 const terminalpkg = @import("../terminal/main.zig");
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const renderer = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const internal_os = @import("../os/main.zig");
 const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
+const compat_file = @import("../lib/compat/file.zig");
 
 const builtin = @import("builtin");
 const log = std.log.scoped(.io_exec);
@@ -84,7 +86,7 @@ last_sent_rows: u16 = 0,
 /// contention. This eliminates the tryLock retry loop entirely.
 ///
 /// Protected by pending_resize_mutex (held for nanoseconds per access).
-pending_resize_mutex: std.Thread.Mutex = .{},
+pending_resize_mutex: std.Io.Mutex = .init,
 pending_resize: ?renderer.Size = null,
 
 /// The mailbox implementation to use.
@@ -96,7 +98,7 @@ terminal_stream: StreamHandler.Stream,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
-last_cursor_reset: ?std.time.Instant = null,
+last_cursor_reset: ?std.Io.Timestamp = null,
 
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
@@ -156,7 +158,8 @@ const ThreadEnterState = struct {
             input[i] = switch (item) {
                 .raw => |v| .{ .string = try alloc.dupe(u8, v) },
                 .path => |path| file: {
-                    const f = std.fs.cwd().openFile(
+                    const f = std.Io.Dir.cwd().openFile(
+                        global.io(),
                         path,
                         .{},
                     ) catch |err| {
@@ -177,7 +180,7 @@ const ThreadEnterState = struct {
 
     const Input = union(enum) {
         string: []const u8,
-        file: std.fs.File,
+        file: std.Io.File,
     };
 };
 
@@ -269,13 +272,16 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
     };
 
     // Create our terminal
-    var term = try terminalpkg.Terminal.init(alloc, opts: {
+    var term = try terminalpkg.Terminal.init(global.io(), alloc, opts: {
         const grid_size = opts.size.grid();
         break :opts .{
             .cols = grid_size.columns,
             .rows = grid_size.rows,
-            .max_scrollback = opts.full_config.@"scrollback-limit",
+            .max_scrollback_bytes = opts.full_config.@"scrollback-limit-bytes".optional(),
+            .max_scrollback_lines = opts.full_config.@"scrollback-limit-lines".optional(),
             .default_modes = default_modes,
+            .default_cursor_style = opts.config.cursor_style,
+            .default_cursor_blink = opts.config.cursor_blink,
             .colors = .{
                 .background = .init(opts.config.background.toTerminalRGB()),
                 .foreground = .init(opts.config.foreground.toTerminalRGB()),
@@ -287,13 +293,10 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
                 .palette = .init(opts.config.palette),
             },
             .kitty_image_storage_limit = opts.config.image_storage_limit,
-            .kitty_image_loading_limits = .all,
+            .kitty_image_loading_limits = .allWithTempDir(global.tmpDirPath()),
         };
     });
     errdefer term.deinit(alloc);
-
-    // Set our default cursor style
-    term.screens.active.cursor.cursor_style = opts.config.cursor_style;
 
     // Setup our terminal size in pixels for certain requests.
     term.width_px = term.cols * opts.size.cell.width;
@@ -318,8 +321,6 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
         .enquiry_response = opts.config.enquiry_response,
-        .default_cursor_style = opts.config.cursor_style,
-        .default_cursor_blink = opts.config.cursor_blink,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -397,7 +398,8 @@ pub fn threadEnter(
         },
         .file => |f| self.queueWrite(
             data,
-            f.readToEndAlloc(
+            compat_file.readToEndAlloc(
+                f,
                 self.alloc,
                 10 * 1024 * 1024, // 10 MiB max
             ) catch |err| {
@@ -455,8 +457,8 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // The remainder of this function is modifying terminal state or
     // the read thread data, all of which requires holding the renderer
     // state lock.
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     // Deinit our old config. We do this in the lock because the
     // stream handler may be referencing the old config (i.e. enquiry resp)
@@ -489,7 +491,7 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
 
     // Set the image limits
     try self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
-    self.terminal.setKittyGraphicsLoadingLimits(.all);
+    self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
 }
 
 /// Resize the terminal.
@@ -503,7 +505,7 @@ pub fn resize(
     self: *Termio,
     td: *ThreadData,
     size: renderer.Size,
-) Allocator.Error!void {
+) (Allocator.Error || error{InvalidValue})!void {
     const grid_size = size.grid();
 
     // Only send the resize APC to the backend when the grid actually
@@ -516,7 +518,7 @@ pub fn resize(
 
     self.size = size;
 
-    const t_start = std.time.milliTimestamp();
+    const t_start = nowMillis();
     if (size_changed) {
         self.last_sent_cols = cols;
         self.last_sent_rows = rows;
@@ -524,16 +526,16 @@ pub fn resize(
             log.warn("backend resize error: {}", .{err});
         };
     }
-    const t_backend = std.time.milliTimestamp();
+    const t_backend = nowMillis();
 
     // Try to acquire the renderer mutex without blocking.
     if (!self.renderer_state.mutex.tryLock()) {
         // Store the resize for the read thread to apply. The read thread
         // holds the renderer mutex in processOutput() and will pick this
         // up on its next iteration — deterministic, no retry loop needed.
-        self.pending_resize_mutex.lock();
+        self.pending_resize_mutex.lockUncancelable(global.io());
         self.pending_resize = size;
-        self.pending_resize_mutex.unlock();
+        self.pending_resize_mutex.unlock(global.io());
 
         wsl_log.print("Termio.resize: mutex contended, delegated to read thread (backend={d}ms)", .{
             t_backend - t_start,
@@ -541,34 +543,32 @@ pub fn resize(
 
         // Notify the renderer of the new screen size so it can update
         // GPU uniforms even before reflow happens.
-        _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .instant = {} });
+        _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .instant = {} });
         self.renderer_content_dirty.store(true, .release);
         self.renderer_wakeup.notify() catch {};
         return;
     }
-    defer self.renderer_state.mutex.unlock();
-    const t_locked = std.time.milliTimestamp();
+    defer self.renderer_state.mutex.unlock(global.io());
+    const t_locked = nowMillis();
 
     // Clear any pending resize since we're doing it now.
-    self.pending_resize_mutex.lock();
+    self.pending_resize_mutex.lockUncancelable(global.io());
     self.pending_resize = null;
-    self.pending_resize_mutex.unlock();
+    self.pending_resize_mutex.unlock(global.io());
 
     // Update the size of our terminal state
     try self.terminal.resize(
         self.alloc,
-        grid_size.columns,
-        grid_size.rows,
+        .{
+            .cols = grid_size.columns,
+            .rows = grid_size.rows,
+            .cell_size_px = .{
+                .width = self.size.cell.width,
+                .height = self.size.cell.height,
+            },
+        },
     );
-    const t_reflow = std.time.milliTimestamp();
-
-    // Update our pixel sizes
-    self.terminal.width_px = grid_size.columns * self.size.cell.width;
-    self.terminal.height_px = grid_size.rows * self.size.cell.height;
-
-    // Disable synchronized output mode so that we show changes
-    // immediately for a resize. This is allowed by the spec.
-    self.terminal.modes.set(.synchronized_output, false);
+    const t_reflow = nowMillis();
 
     // If we have size reporting enabled we need to send a report.
     if (self.terminal.modes.get(.in_band_size_reports)) {
@@ -584,15 +584,15 @@ pub fn resize(
     });
 
     // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
     self.renderer_content_dirty.store(true, .release);
     self.renderer_wakeup.notify() catch {};
 }
 
 /// Make a size report.
 pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     try self.sizeReportLocked(td, style);
 }
 
@@ -621,8 +621,8 @@ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeRe
 /// Reset the synchronized output mode. This is usually called by timer
 /// expiration from the termio thread.
 pub fn resetSynchronizedOutput(self: *Termio) void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.modes.set(.synchronized_output, false);
     self.renderer_content_dirty.store(true, .release);
     self.renderer_wakeup.notify() catch {};
@@ -631,8 +631,8 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
 
         // If we're on the alternate screen, we do not clear. Since this is an
         // emulator-level screen clear, this messes up the running programs
@@ -661,6 +661,7 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
             // all of them. We delete all of them for now but if this behavior
             // isn't fully correct we should fix this later.
             self.terminal.screens.active.kitty_images.delete(
+                self.terminal.io(),
                 self.terminal.screens.active.alloc,
                 &self.terminal,
                 .{ .all = true },
@@ -688,16 +689,16 @@ pub fn scrollViewport(
     self: *Termio,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.scrollViewport(scroll);
 }
 
 /// Jump the viewport to the prompt.
 pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 
@@ -707,9 +708,9 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
 
 /// Called when focus is gained or lost (when focus events are enabled)
 pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
-    self.renderer_state.mutex.lock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
     const focus_event = self.renderer_state.terminal.modes.get(.focus_event);
-    self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.unlock(global.io());
 
     // If we have focus events enabled, we send the focus event.
     if (focus_event) {
@@ -730,14 +731,14 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    const t_start = std.time.milliTimestamp();
+    const t_start = nowMillis();
 
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
-    const t_locked = std.time.milliTimestamp();
+    const t_locked = nowMillis();
 
     // Check for a pending resize delegated by the IO thread. We hold the
     // renderer mutex here, so we can do the reflow with zero contention.
@@ -745,11 +746,11 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     // gets the lock does the work, eliminating retry loops entirely.
     self.applyPendingResize();
 
-    const t_resize = std.time.milliTimestamp();
+    const t_resize = nowMillis();
 
     self.processOutputLocked(buf);
 
-    const t_done = std.time.milliTimestamp();
+    const t_done = nowMillis();
     const total = t_done - t_start;
     const vt_ms = t_done - t_resize;
 
@@ -785,8 +786,8 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 fn applyPendingResize(self: *Termio) void {
     // Grab the pending resize under the small mutex (nanoseconds).
     const pending = blk: {
-        self.pending_resize_mutex.lock();
-        defer self.pending_resize_mutex.unlock();
+        self.pending_resize_mutex.lockUncancelable(global.io());
+        defer self.pending_resize_mutex.unlock(global.io());
         const p = self.pending_resize;
         self.pending_resize = null;
         break :blk p;
@@ -795,25 +796,24 @@ fn applyPendingResize(self: *Termio) void {
     const size = pending orelse return;
     const grid_size = size.grid();
 
-    const t_start = std.time.milliTimestamp();
+    const t_start = nowMillis();
 
     self.terminal.resize(
         self.alloc,
-        grid_size.columns,
-        grid_size.rows,
+        .{
+            .cols = grid_size.columns,
+            .rows = grid_size.rows,
+            .cell_size_px = .{
+                .width = size.cell.width,
+                .height = size.cell.height,
+            },
+        },
     ) catch |err| {
         log.warn("deferred resize reflow error: {}", .{err});
         return;
     };
 
-    const t_reflow = std.time.milliTimestamp();
-
-    // Update pixel sizes
-    self.terminal.width_px = grid_size.columns * size.cell.width;
-    self.terminal.height_px = grid_size.rows * size.cell.height;
-
-    // Disable synchronized output mode on resize (allowed by spec).
-    self.terminal.modes.set(.synchronized_output, false);
+    const t_reflow = nowMillis();
 
     wsl_log.print("applyPendingResize: reflow={d}ms ({d}x{d})", .{
         t_reflow - t_start,
@@ -822,7 +822,7 @@ fn applyPendingResize(self: *Termio) void {
     });
 
     // Notify renderer to re-render with the new size.
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
     self.renderer_content_dirty.store(true, .release);
     self.renderer_wakeup.notify() catch {};
 }
@@ -836,19 +836,18 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // non-blink state so it is rendered if visible. If we're under
     // HEAVY read load, we don't want to send a ton of these so we
     // use a timer under the covers
-    if (std.time.Instant.now()) |now| cursor_reset: {
+    const now = std.Io.Timestamp.now(global.io(), .awake);
+    cursor_reset: {
         if (self.last_cursor_reset) |last| {
-            if (now.since(last) <= (500 * std.time.ns_per_ms)) {
+            if (last.durationTo(now).toMilliseconds() <= 500) {
                 break :cursor_reset;
             }
         }
 
         self.last_cursor_reset = now;
-        _ = self.renderer_mailbox.push(.{
+        _ = self.renderer_mailbox.push(global.io(), .{
             .reset_cursor_blink = {},
         }, .{ .instant = {} });
-    } else |err| {
-        log.warn("failed to get current time err={}", .{err});
     }
 
     // If we have an inspector, we enter SLOW MODE because we need to
@@ -881,8 +880,8 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
 
 /// Sends a DSR response for the current color scheme to the pty.
 pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
 
     try self.colorSchemeReportLocked(td, force);
 }
@@ -891,11 +890,39 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
-    const output = switch (self.config.conditional_state.theme) {
-        .light => "\x1B[?997;2n",
-        .dark => "\x1B[?997;1n",
+    const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
+        .light => .light,
+        .dark => .dark,
     };
-    try self.queueWrite(td, output, false);
+
+    var buf: [terminalpkg.device_status.max_color_scheme_report_encode_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try terminalpkg.device_status.encodeColorSchemeReport(&writer, scheme);
+    try self.queueWrite(td, writer.buffered(), false);
+}
+
+/// Sends a visibility report to the pty. Unforced reports are only sent while
+/// DEC mode 2033 is enabled.
+pub fn visibilityReport(
+    self: *Termio,
+    td: *ThreadData,
+    visible: bool,
+    force: bool,
+) !void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    if (!force and !self.renderer_state.terminal.modes.get(.report_visibility)) {
+        return;
+    }
+
+    var buf: [terminalpkg.device_status.max_visibility_report_encode_size]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try terminalpkg.device_status.encodeVisibilityReport(
+        &writer,
+        if (visible) .potentially_visible else .not_visible,
+    );
+    try self.queueWrite(td, writer.buffered(), false);
 }
 
 /// ThreadData is the data created and stored in the termio thread
@@ -933,4 +960,8 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+fn nowMillis() i64 {
+    return std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
 }

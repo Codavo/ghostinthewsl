@@ -47,8 +47,12 @@ andrejdaskalov
 anhthang
 anmitalidev
 anthonyzhoon
+aprilnea
+arvin7liu
 athaapa
 atomk
+aurelleb
+aymanbagabas
 b0uks
 b1nar10
 balazs-szucs
@@ -62,9 +66,12 @@ bitigchi
 bkircher
 bleikurr
 bo2themax
+bousii
 brentschroeter
 brianc442
 c0x0o
+carldaws
+carlvillads
 cespare
 charliie-dev
 chernetskyi
@@ -103,8 +110,11 @@ ephemera
 -eric-assetpass Try talking, not botting
 eriksremess
 erral
+escalonc
+eunos-1128
 exlee
 -f1813483-netizen
+fallintoplace
 faukah
 filip7
 flou
@@ -202,6 +212,7 @@ mrconnorkenway
 mrmage
 mtak
 mustafa0x
+nagato-yuzuru
 natesmyth
 neo773
 neurosnap
@@ -221,6 +232,7 @@ paaloeye
 pan93412
 pangoraw
 pauley-unsaturated
+pearkes
 peilingjiang
 peterdavehello
 philocalyst
@@ -233,7 +245,9 @@ prakhar54-byte
 priyans-hu
 puzza007
 qappell
+quinnypig
 qwerasd205
+ragnoroct
 raphamorim
 reo101
 rewdy
@@ -244,17 +258,24 @@ rjwittams
 rmengelbrecht
 rmunn
 rockorager
+ronijacobson
 rpfaeffle
+ruoyouz
+ruseel
 sahilkmishra
 samasaur1
 sandydoo
+sanjj1
 -schickling-assistant NHITL
 secrus
 seruman
 seyoungjeong
 silveirapf
+simonbcn
 slsrepo
 sunshine-syz
+svmhdvn
+tasselx
 tbrundige
 tdgroot
 tdslot
@@ -271,12 +292,15 @@ unphased
 uzaaft
 vancluever
 vaughanandrews
+-vectorpeak Stupid bot cosplaying as a maintainer
+vegerot
 viruslobster
 vlsi
 voidnv
 williamhcarter
 wyounas
 yabbal
+yak3d
 yamshta
 ydah
 -zaviro

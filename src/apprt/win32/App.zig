@@ -12,6 +12,7 @@ const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
+const global = @import("../../global.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("SplitTree.zig");
@@ -164,7 +165,7 @@ alloc: Allocator,
 running: bool = true,
 
 /// All top-level windows owned by this app.
-windows: std.ArrayListUnmanaged(*Window) = .{},
+windows: std.ArrayListUnmanaged(*Window) = .empty,
 
 /// The window that currently has focus.
 focused_window: ?*Window = null,
@@ -1083,7 +1084,7 @@ pub fn performIpc(
     value: apprt.ipc.Action.Value(action),
 ) !bool {
     var buf: [256]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buf);
+    var stderr_writer = std.Io.File.stderr().writer(global.io(), &buf);
     const stderr = &stderr_writer.interface;
 
     switch (action) {
@@ -1758,9 +1759,9 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         0x010D => { // WM_IME_STARTCOMPOSITION
             if (surface.core_surface) |core| {
-                core.renderer_state.mutex.lock();
+                core.renderer_state.mutex.lockUncancelable(global.io());
                 const cursor = core.renderer_state.terminal.screens.active.cursor;
-                core.renderer_state.mutex.unlock();
+                core.renderer_state.mutex.unlock(global.io());
                 const x: i32 = @intCast(cursor.x * core.size.cell.width + core.size.padding.left);
                 const y: i32 = @intCast(cursor.y * core.size.cell.height + core.size.padding.top);
 

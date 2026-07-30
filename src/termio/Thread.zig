@@ -14,7 +14,8 @@ pub const Thread = @This();
 const std = @import("std");
 const ArenaAllocator = std.heap.ArenaAllocator;
 const builtin = @import("builtin");
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const termio = @import("../termio.zig");
@@ -147,8 +148,8 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
         // the error to the surface thread and let the apprt deal with it
         // in some way but this works for now. Without this, the user would
         // just see a blank terminal window.
-        io.renderer_state.mutex.lock();
-        defer io.renderer_state.mutex.unlock();
+        io.renderer_state.mutex.lockUncancelable(global.io());
+        defer io.renderer_state.mutex.unlock(global.io());
         const t = io.renderer_state.terminal;
 
         // Hide the cursor
@@ -297,7 +298,7 @@ fn drainMailbox(
 
     // If we're draining, we just drain the mailbox and return.
     if (self.flags.drain) {
-        while (mailbox.pop()) |_| {}
+        while (mailbox.pop(global.io())) |_| {}
         return;
     }
 
@@ -305,7 +306,7 @@ fn drainMailbox(
     // expectation is that all our message handlers will be non-blocking
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
-    while (mailbox.pop()) |message| {
+    while (mailbox.pop(global.io())) |message| {
         log.debug("mailbox message={s}", .{@tagName(message)});
         switch (message) {
             // These modify visual state and need a redraw:
@@ -317,6 +318,12 @@ fn drainMailbox(
                 try io.clearScreen(data, v.history);
                 redraw = true;
             },
+            .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
+            .visibility_report => |v| try io.visibilityReport(
+                data,
+                v.visible,
+                v.force,
+            ),
             .change_config => |config| {
                 defer config.alloc.destroy(config.ptr);
                 try io.changeConfig(data, config.ptr);
@@ -350,7 +357,6 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
-            .color_scheme_report => |v| try io.colorSchemeReport(data, v.force),
             .size_report => |v| try io.sizeReport(data, v),
             .focused => |v| try io.focusGained(data, v),
             .linefeed_mode => |v| self.flags.linefeed_mode = v,

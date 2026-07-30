@@ -9,6 +9,7 @@ const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
 const CoreSurface = @import("../../Surface.zig");
 const CoreApp = @import("../../App.zig");
+const global = @import("../../global.zig");
 const terminal = @import("../../terminal/main.zig");
 
 const log = std.log.scoped(.win32_surface);
@@ -68,7 +69,7 @@ const PFD_MAIN_PLANE = 0;
 // WGL / GDI extern declarations
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) c_int;
-extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const std.os.windows.RECT, bErase: BOOL) callconv(.winapi) BOOL;
+extern "user32" fn InvalidateRect(hWnd: ?HWND, lpRect: ?*const RECT, bErase: BOOL) callconv(.winapi) BOOL;
 extern "user32" fn ShowWindow(hWnd: HWND, nCmdShow: c_int) callconv(.winapi) BOOL;
 extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, x: i32, y: i32, cx: i32, cy: i32, uFlags: UINT) callconv(.winapi) BOOL;
 extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(.winapi) HDC;
@@ -815,8 +816,8 @@ fn scrollbarRowFromDragY(self: *Self, thumb_top_y: i32) usize {
 
 fn scrollToRow(self: *Self, row: usize) void {
     const cs = self.core_surface orelse return;
-    cs.renderer_state.mutex.lock();
-    defer cs.renderer_state.mutex.unlock();
+    cs.renderer_state.mutex.lockUncancelable(global.io());
+    defer cs.renderer_state.mutex.unlock(global.io());
     const t: *terminal.Terminal = cs.renderer_state.terminal;
     t.screens.active.scroll(.{ .row = row });
     cs.renderer_thread.wakeup.notify() catch {};
@@ -983,9 +984,9 @@ pub fn setClipboard(
     _ = CloseClipboard();
 }
 
-pub fn defaultTermioEnv(self: *Self) !std.process.EnvMap {
-    const alloc = if (self.app) |app| app.alloc else std.heap.page_allocator;
-    return try @import("../../os/main.zig").getEnvMap(alloc);
+pub fn defaultTermioEnv(self: *Self) !std.process.Environ.Map {
+    _ = self;
+    return try global.environMap();
 }
 
 pub fn redrawInspector(self: *Self) void {

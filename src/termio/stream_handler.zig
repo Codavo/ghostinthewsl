@@ -2,7 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
@@ -43,12 +44,6 @@ pub const StreamHandler = struct {
     /// Atomic dirty flag — set before notify() so the renderer's draw timer
     /// can detect new content without waiting for the IOCP wakeup.
     renderer_content_dirty: *std.atomic.Value(bool),
-
-    /// The default cursor state. This is used with CSI q. This is
-    /// set to true when we're currently in the default cursor state.
-    default_cursor: bool = true,
-    default_cursor_style: terminal.CursorStyle,
-    default_cursor_blink: ?bool,
 
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
@@ -115,13 +110,8 @@ pub const StreamHandler = struct {
         self.osc_color_report_format = config.osc_color_report_format;
         self.clipboard_write = config.clipboard_write;
         self.enquiry_response = config.enquiry_response;
-        self.default_cursor_style = config.cursor_style;
-        self.default_cursor_blink = config.cursor_blink;
-
-        // If our cursor is the default, then we update it immediately.
-        if (self.default_cursor) self.setCursorStyle(.default) catch |err| {
-            log.warn("failed to set default cursor style: {}", .{err});
-        };
+        self.terminal.setDefaultCursorStyle(config.cursor_style);
+        self.terminal.setDefaultCursorBlink(config.cursor_blink);
 
         // The config could have changed any of our colors so update mode 2031
         self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
@@ -134,8 +124,8 @@ pub const StreamHandler = struct {
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
-            self.renderer_state.mutex.unlock();
-            defer self.renderer_state.mutex.lock();
+            self.renderer_state.mutex.unlock(global.io());
+            defer self.renderer_state.mutex.lockUncancelable(global.io());
             _ = self.surface_mailbox.push(msg, .{ .forever = {} });
         }
     }
@@ -163,9 +153,9 @@ pub const StreamHandler = struct {
         // Instant would have blocked. Release the renderer mutex,
         // wake up the renderer to allow it to process the message,
         // and then try again.
-        self.renderer_state.mutex.unlock();
-        defer self.renderer_state.mutex.lock();
         self.renderer_content_dirty.store(true, .release);
+        self.renderer_state.mutex.unlock(global.io());
+        defer self.renderer_state.mutex.lockUncancelable(global.io());
         self.renderer_wakeup.notify() catch |err| {
             // This is an EXTREMELY unlikely case. We still don't return
             // and attempt to send the message because its most likely
@@ -211,6 +201,10 @@ pub const StreamHandler = struct {
                 @branchHint(.likely);
                 try self.terminal.print(value.cp);
             },
+            .print_slice => {
+                @branchHint(.likely);
+                try self.terminal.printSlice(value.cps);
+            },
             .print_repeat => try self.terminal.printRepeat(value),
             .bell => self.bell(),
             .backspace => self.terminal.backspace(),
@@ -244,7 +238,7 @@ pub const StreamHandler = struct {
                 self.terminal.screens.active.cursor.y + 1 +| value.value,
                 self.terminal.screens.active.cursor.x + 1,
             ),
-            .cursor_style => try self.setCursorStyle(value),
+            .cursor_style => self.terminal.setCursorStyle(value),
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
             .erase_display_above => self.terminal.eraseDisplay(.above, value),
             .erase_display_complete => {
@@ -363,6 +357,7 @@ pub const StreamHandler = struct {
             .apc_start => self.apc.start(),
             .apc_end => try self.apcEnd(),
             .apc_put => self.apc.feed(self.alloc, value),
+            .apc_put_slice => self.apc.feedSlice(self.alloc, value.bytes),
 
             // Unimplemented
             .title_push,
@@ -404,7 +399,7 @@ pub const StreamHandler = struct {
                         assert(self.tmux_viewer == null);
                         const viewer = try self.alloc.create(terminal.tmux.Viewer);
                         errdefer self.alloc.destroy(viewer);
-                        viewer.* = try .init(self.alloc);
+                        viewer.* = try .init(global.io(), self.alloc);
                         errdefer viewer.deinit();
                         self.tmux_viewer = viewer;
                         break :tmux;
@@ -475,73 +470,12 @@ pub const StreamHandler = struct {
             },
 
             .decrqss => |decrqss| {
-                var response: [128]u8 = undefined;
-                var stream = std.io.fixedBufferStream(&response);
-                const writer = stream.writer();
-
-                // Offset the stream position to just past the response prefix.
-                // We will write the "payload" (if any) below. If no payload is
-                // written then we send an invalid DECRPSS response.
-                const prefix_fmt = "\x1bP{d}$r";
-                const prefix_len = std.fmt.comptimePrint(prefix_fmt, .{0}).len;
-                stream.pos = prefix_len;
-
-                switch (decrqss) {
-                    // Invalid or unhandled request
-                    .none => {},
-
-                    .sgr => {
-                        const buf = try self.terminal.printAttributes(stream.buffer[stream.pos..]);
-
-                        // printAttributes wrote into our buffer, so adjust the stream
-                        // position
-                        stream.pos += buf.len;
-
-                        try writer.writeByte('m');
-                    },
-
-                    .decscusr => {
-                        const blink = self.terminal.modes.get(.cursor_blinking);
-                        const style: u8 = switch (self.terminal.screens.active.cursor.cursor_style) {
-                            .block => if (blink) 1 else 2,
-                            .underline => if (blink) 3 else 4,
-                            .bar => if (blink) 5 else 6,
-
-                            // Below here, the cursor styles aren't represented by
-                            // DECSCUSR so we map it to some other style.
-                            .block_hollow => if (blink) 1 else 2,
-                        };
-                        try writer.print("{d} q", .{style});
-                    },
-
-                    .decstbm => {
-                        try writer.print("{d};{d}r", .{
-                            self.terminal.scrolling_region.top + 1,
-                            self.terminal.scrolling_region.bottom + 1,
-                        });
-                    },
-
-                    .decslrm => {
-                        // We only send a valid response when left and right
-                        // margin mode (DECLRMM) is enabled.
-                        if (self.terminal.modes.get(.enable_left_and_right_margin)) {
-                            try writer.print("{d};{d}s", .{
-                                self.terminal.scrolling_region.left + 1,
-                                self.terminal.scrolling_region.right + 1,
-                            });
-                        }
-                    },
-                }
-
-                // Our response is valid if we have a response payload
-                const valid = stream.pos > prefix_len;
-
-                // Write the terminator
-                try writer.writeAll("\x1b\\");
-
-                // Write the response prefix into the buffer
-                _ = try std.fmt.bufPrint(response[0..prefix_len], prefix_fmt, .{@intFromBool(valid)});
-                const msg = try termio.Message.writeReq(self.alloc, response[0..stream.pos]);
+                var response: [terminal.dcs.Command.DECRQSS.max_response_bytes]u8 = undefined;
+                const encoded = try decrqss.encode(self.terminal, &response);
+                const msg = try termio.Message.writeReq(
+                    self.alloc,
+                    encoded,
+                );
                 self.messageWriter(msg);
             },
         }
@@ -554,7 +488,7 @@ pub const StreamHandler = struct {
         // log.warn("APC command: {}", .{cmd});
         switch (cmd) {
             .kitty => |*kitty_cmd| {
-                if (self.terminal.kittyGraphics(self.alloc, kitty_cmd)) |resp| {
+                if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
                     var buf: [1024]u8 = undefined;
                     var writer: std.Io.Writer = .fixed(&buf);
                     try resp.encode(&writer);
@@ -688,7 +622,7 @@ pub const StreamHandler = struct {
         // their shell config when they render prompts to ensure the
         // cursor is exactly as they request.
         if (mode == .cursor_blinking and
-            self.default_cursor_blink != null)
+            self.terminal.cursor.default_blink != null)
         {
             return;
         }
@@ -748,8 +682,10 @@ pub const StreamHandler = struct {
                 const grid_size = self.size.grid();
                 self.terminal.resize(
                     self.alloc,
-                    grid_size.columns,
-                    grid_size.rows,
+                    .{
+                        .cols = grid_size.columns,
+                        .rows = grid_size.rows,
+                    },
                 ) catch |err| {
                     log.err("error updating terminal size: {}", .{err});
                 };
@@ -772,6 +708,13 @@ pub const StreamHandler = struct {
 
             .in_band_size_reports => if (enabled) self.messageWriter(.{
                 .size_report = .mode_2048,
+            }),
+
+            .report_visibility => if (enabled) self.messageWriter(.{
+                .visibility_report = .{
+                    .visible = self.terminal.flags.visible,
+                    .force = true,
+                },
             }),
 
             .focus_event => if (enabled) self.messageWriter(.{
@@ -890,55 +833,11 @@ pub const StreamHandler = struct {
             },
 
             .color_scheme => self.messageWriter(.{ .color_scheme_report = .{ .force = true } }),
-        }
-    }
 
-    pub fn setCursorStyle(
-        self: *StreamHandler,
-        style: terminal.CursorStyleReq,
-    ) !void {
-        // Assume we're setting to a non-default.
-        self.default_cursor = false;
-
-        switch (style) {
-            .default => {
-                self.default_cursor = true;
-                self.terminal.screens.active.cursor.cursor_style = self.default_cursor_style;
-                self.terminal.modes.set(
-                    .cursor_blinking,
-                    self.default_cursor_blink orelse true,
-                );
-            },
-
-            .blinking_block => {
-                self.terminal.screens.active.cursor.cursor_style = .block;
-                self.terminal.modes.set(.cursor_blinking, true);
-            },
-
-            .steady_block => {
-                self.terminal.screens.active.cursor.cursor_style = .block;
-                self.terminal.modes.set(.cursor_blinking, false);
-            },
-
-            .blinking_underline => {
-                self.terminal.screens.active.cursor.cursor_style = .underline;
-                self.terminal.modes.set(.cursor_blinking, true);
-            },
-
-            .steady_underline => {
-                self.terminal.screens.active.cursor.cursor_style = .underline;
-                self.terminal.modes.set(.cursor_blinking, false);
-            },
-
-            .blinking_bar => {
-                self.terminal.screens.active.cursor.cursor_style = .bar;
-                self.terminal.modes.set(.cursor_blinking, true);
-            },
-
-            .steady_bar => {
-                self.terminal.screens.active.cursor.cursor_style = .bar;
-                self.terminal.modes.set(.cursor_blinking, false);
-            },
+            .visibility => self.messageWriter(.{ .visibility_report = .{
+                .visible = self.terminal.flags.visible,
+                .force = true,
+            } }),
         }
     }
 
@@ -1176,14 +1075,10 @@ pub const StreamHandler = struct {
             return;
         }
 
-        var host_buffer: [std.Uri.host_name_max]u8 = undefined;
+        var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
         const host = uri.getHost(&host_buffer) catch |err| switch (err) {
             error.UriMissingHost => {
                 log.warn("OSC 7 uri must contain a hostname: {}", .{err});
-                return;
-            },
-            error.UriHostTooLong => {
-                log.warn("failed to get full hostname for OSC 7 validation: {}", .{err});
                 return;
             },
         };
@@ -1191,7 +1086,7 @@ pub const StreamHandler = struct {
         // OSC 7 is a little sketchy because anyone can send any value from
         // any host (such an SSH session). The best practice terminals follow
         // is to valid the hostname to be local.
-        const host_valid = internal_os.hostname.isLocal(host) catch |err| switch (err) {
+        const host_valid = internal_os.hostname.isLocal(host.bytes) catch |err| switch (err) {
             error.PermissionDenied,
             error.Unexpected,
             => {
@@ -1200,7 +1095,7 @@ pub const StreamHandler = struct {
             },
         };
         if (!host_valid) {
-            log.warn("OSC 7 host ({s}) must be local", .{host});
+            log.warn("OSC 7 host ({s}) must be local", .{host.bytes});
             return;
         }
 
@@ -1309,8 +1204,7 @@ pub const StreamHandler = struct {
         var fba: std.heap.FixedBufferAllocator = .init(&buffer);
         const alloc = fba.allocator();
 
-        var response: std.ArrayListUnmanaged(u8) = .empty;
-        const writer = response.writer(alloc);
+        var response: std.Io.Writer.Allocating = .init(alloc);
 
         var it = requests.constIterator(0);
         while (it.next()) |req| {
@@ -1457,7 +1351,7 @@ pub const StreamHandler = struct {
 
                     switch (self.osc_color_report_format) {
                         .@"16-bit" => switch (kind) {
-                            .palette => |i| try writer.print(
+                            .palette => |i| try response.writer.print(
                                 "\x1b]4;{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
                                 .{
                                     i,
@@ -1466,7 +1360,7 @@ pub const StreamHandler = struct {
                                     @as(u16, color.b) * 257,
                                 },
                             ),
-                            .dynamic => |dynamic| try writer.print(
+                            .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
                                 .{
                                     @intFromEnum(dynamic),
@@ -1479,7 +1373,7 @@ pub const StreamHandler = struct {
                         },
 
                         .@"8-bit" => switch (kind) {
-                            .palette => |i| try writer.print(
+                            .palette => |i| try response.writer.print(
                                 "\x1b]4;{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}",
                                 .{
                                     i,
@@ -1488,7 +1382,7 @@ pub const StreamHandler = struct {
                                     @as(u16, color.b),
                                 },
                             ),
-                            .dynamic => |dynamic| try writer.print(
+                            .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}",
                                 .{
                                     @intFromEnum(dynamic),
@@ -1503,15 +1397,15 @@ pub const StreamHandler = struct {
                         .none => unreachable,
                     }
 
-                    try writer.writeAll(terminator.string());
+                    try response.writer.writeAll(terminator.string());
                 },
             }
         }
 
-        if (response.items.len > 0) {
+        if (response.writer.end > 0) {
             // If any of the operations were reports, finalize the report
             // string and send it to the terminal.
-            const msg = try termio.Message.writeReq(self.alloc, response.items);
+            const msg = try termio.Message.writeReq(self.alloc, response.writer.buffered());
             self.messageWriter(msg);
         }
     }

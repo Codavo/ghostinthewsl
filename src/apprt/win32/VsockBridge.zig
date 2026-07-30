@@ -15,6 +15,7 @@ const VsockBridge = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
+const global = @import("../../global.zig");
 const windows = @import("../../os/main.zig").windows;
 const ptypkg = @import("../../pty.zig");
 
@@ -195,7 +196,7 @@ var bridge_deployed = std.atomic.Value(bool).init(false);
 /// Thread-safe per-port authentication token cache.
 /// Each daemon has its own token, so we cache per port.
 var token_cache: std.AutoHashMap(u32, [32]u8) = std.AutoHashMap(u32, [32]u8).init(std.heap.page_allocator);
-var token_cache_lock: std.Thread.Mutex = .{};
+var token_cache_lock: std.Io.Mutex = .init;
 
 // ─── Public API ─────────────────────────────────────────────────────
 
@@ -205,16 +206,10 @@ var token_cache_lock: std.Thread.Mutex = .{};
 /// Idempotent and safe to call from multiple threads.
 pub fn ensureWslRunning(distro: ?[:0]const u8) void {
     var cmd_buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
-
-    writer.writeAll("wsl.exe") catch return;
-    if (distro) |d| {
-        writer.print(" -d {s}", .{d}) catch return;
-    }
-    writer.writeAll(" -- true") catch return;
-
-    const cmd_line = fbs.getWritten();
+    const cmd_line = if (distro) |d|
+        std.fmt.bufPrint(&cmd_buf, "wsl.exe -d {s} -- true", .{d}) catch return
+    else
+        std.fmt.bufPrint(&cmd_buf, "wsl.exe -- true", .{}) catch return;
 
     var cmd_w_buf: [256]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch return;
@@ -238,7 +233,7 @@ pub fn ensureWslRunning(distro: ?[:0]const u8) void {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
+    ) == windows.FALSE) {
         wsl_log.print("ensureWslRunning: CreateProcessW failed", .{});
         return;
     }
@@ -247,10 +242,10 @@ pub fn ensureWslRunning(distro: ?[:0]const u8) void {
     defer _ = windows.CloseHandle(process_info.hThread);
 
     // Wait up to 30s for WSL to boot
-    _ = windows.kernel32.WaitForSingleObject(process_info.hProcess, 30000);
+    _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 30000);
 
     var exit_code: windows.DWORD = 1;
-    _ = windows.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code);
+    _ = windows.exp.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code);
 
     wsl_log.print("ensureWslRunning: done (exit_code={d})", .{exit_code});
 }
@@ -311,7 +306,7 @@ pub fn open(config: Config) Error!VsockBridge {
 
     const delays = [_]u64{ 500, 500, 1000, 2000, 3000 };
     for (delays, 0..) |delay_ms, attempt| {
-        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+        std.Io.sleep(global.io(), .fromMilliseconds(@intCast(delay_ms)), .awake) catch {};
 
         if (!vm_id_ready.load(.acquire)) {
             discoverAndCacheVmId(config.distro);
@@ -373,19 +368,19 @@ pub fn discoverAndCacheVmId(distro: ?[:0]const u8) void {
 /// Read and cache the authentication token for future vsock handshakes.
 /// Tokens are cached per-port since each daemon has its own token.
 pub fn readAndCacheToken(distro: ?[:0]const u8, port: u32) void {
-    token_cache_lock.lock();
+    token_cache_lock.lockUncancelable(global.io());
     if (token_cache.contains(port)) {
-        token_cache_lock.unlock();
+        token_cache_lock.unlock(global.io());
         wsl_log.print("readAndCacheToken: already cached for port {d}", .{port});
         return;
     }
-    token_cache_lock.unlock();
+    token_cache_lock.unlock(global.io());
 
     wsl_log.print("readAndCacheToken: reading token file for port {d}", .{port});
     if (readToken(distro, port)) |tok| {
-        token_cache_lock.lock();
+        token_cache_lock.lockUncancelable(global.io());
         token_cache.put(port, tok) catch {};
-        token_cache_lock.unlock();
+        token_cache_lock.unlock(global.io());
         wsl_log.print("readAndCacheToken: success (port {d})", .{port});
     } else {
         wsl_log.print("readAndCacheToken: failed to read token file", .{});
@@ -418,15 +413,15 @@ fn tryHandshake(
 
 /// Look up a cached token for the given port. Returns null if not cached.
 fn getTokenForPort(port: u32) ?[32]u8 {
-    token_cache_lock.lock();
-    defer token_cache_lock.unlock();
+    token_cache_lock.lockUncancelable(global.io());
+    defer token_cache_lock.unlock(global.io());
     return token_cache.get(port);
 }
 
 /// Invalidate the cached token for a given port (e.g. after restarting a daemon).
 fn invalidateTokenForPort(port: u32) void {
-    token_cache_lock.lock();
-    defer token_cache_lock.unlock();
+    token_cache_lock.lockUncancelable(global.io());
+    defer token_cache_lock.unlock(global.io());
     _ = token_cache.remove(port);
 }
 
@@ -447,16 +442,10 @@ pub fn startDaemonBackground(distro: ?[:0]const u8) void {
 /// and CloseHandle when the app exits.
 pub fn startKeepalive(distro: ?[:0]const u8) ?windows.HANDLE {
     var cmd_buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
-
-    writer.writeAll("wsl.exe") catch return null;
-    if (distro) |d| {
-        writer.print(" -d {s}", .{d}) catch return null;
-    }
-    writer.writeAll(" -- sleep infinity") catch return null;
-
-    const cmd_line = fbs.getWritten();
+    const cmd_line = if (distro) |d|
+        std.fmt.bufPrint(&cmd_buf, "wsl.exe -d {s} -- sleep infinity", .{d}) catch return null
+    else
+        std.fmt.bufPrint(&cmd_buf, "wsl.exe -- sleep infinity", .{}) catch return null;
 
     var cmd_w_buf: [256]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch return null;
@@ -478,8 +467,8 @@ pub fn startKeepalive(distro: ?[:0]const u8) ?windows.HANDLE {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
-        log.warn("failed to start WSL keepalive: {}", .{windows.kernel32.GetLastError()});
+    ) == windows.FALSE) {
+        log.warn("failed to start WSL keepalive: {}", .{windows.GetLastError()});
         return null;
     }
 
@@ -534,8 +523,7 @@ pub fn ensureDeployed(config: Config) Error!void {
     //   2. On mismatch: reads binary from stdin (head -c N), deploys atomically,
     //      writes hash, kills old daemon, then reads+installs terminfo from stdin
     var cmd_buf: [2048]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
+    var writer: std.Io.Writer = .fixed(&cmd_buf);
 
     writer.writeAll("wsl.exe") catch return error.Unexpected;
     if (config.distro) |distro| {
@@ -579,7 +567,7 @@ pub fn ensureDeployed(config: Config) Error!void {
         },
     ) catch return error.Unexpected;
 
-    const cmd_line = fbs.getWritten();
+    const cmd_line = writer.buffered();
 
     var cmd_w_buf: [2048]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch
@@ -589,7 +577,7 @@ pub fn ensureDeployed(config: Config) Error!void {
     // Create pipe to feed binary + terminfo through stdin
     var in_read: windows.HANDLE = undefined;
     var in_write: windows.HANDLE = undefined;
-    if (windows.exp.kernel32.CreatePipe(&in_read, &in_write, null, 0) == 0) {
+    if (windows.exp.kernel32.CreatePipe(&in_read, &in_write, null, 0) == windows.FALSE) {
         return error.DeployFailed;
     }
     errdefer {
@@ -620,7 +608,7 @@ pub fn ensureDeployed(config: Config) Error!void {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
+    ) == windows.FALSE) {
         _ = windows.CloseHandle(in_read);
         _ = windows.CloseHandle(in_write);
         return error.DeployFailed;
@@ -637,13 +625,13 @@ pub fn ensureDeployed(config: Config) Error!void {
         var total_written: usize = 0;
         while (total_written < payload.len) {
             var written: windows.DWORD = 0;
-            if (windows.kernel32.WriteFile(
+            if (windows.exp.kernel32.WriteFile(
                 in_write,
                 payload[total_written..].ptr,
                 @intCast(payload.len - total_written),
                 &written,
                 null,
-            ) == 0) {
+            ) == windows.FALSE) {
                 _ = windows.CloseHandle(in_write);
                 // Don't fail hard — the hash-match path drains stdin and
                 // may close the pipe early. Check exit code below.
@@ -657,10 +645,10 @@ pub fn ensureDeployed(config: Config) Error!void {
     _ = windows.CloseHandle(in_write);
 
     // Wait for completion (30 second timeout)
-    _ = windows.kernel32.WaitForSingleObject(process_info.hProcess, 30000);
+    _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 30000);
 
     var exit_code: windows.DWORD = 1;
-    _ = windows.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code);
+    _ = windows.exp.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code);
 
     if (exit_code == 0) {
         log.info("ensureDeployed: success (hash match or deploy+terminfo OK)", .{});
@@ -684,9 +672,9 @@ pub fn ensureDeployed(config: Config) Error!void {
     // was, we didn't deploy (just verified), so no token invalidation needed.
     if (!bridge_deployed.load(.acquire)) {
         // Deploy killed all daemons — invalidate all cached tokens.
-        token_cache_lock.lock();
+        token_cache_lock.lockUncancelable(global.io());
         token_cache.clearRetainingCapacity();
-        token_cache_lock.unlock();
+        token_cache_lock.unlock(global.io());
     }
 
     if (config.distro == null) {
@@ -699,8 +687,7 @@ pub fn ensureDeployed(config: Config) Error!void {
 /// only on first run or if someone deletes their ~/.terminfo.
 fn installTerminfoOnly(config: Config) void {
     var cmd_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
+    var writer: std.Io.Writer = .fixed(&cmd_buf);
 
     writer.writeAll("wsl.exe") catch return;
     if (config.distro) |distro| {
@@ -708,7 +695,7 @@ fn installTerminfoOnly(config: Config) void {
     }
     writer.writeAll(" -- sh -c \"mkdir -p ~/.terminfo 2>/dev/null; tic -x - 2>/dev/null\"") catch return;
 
-    const cmd_line = fbs.getWritten();
+    const cmd_line = writer.buffered();
 
     var cmd_w_buf: [512]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch return;
@@ -716,7 +703,7 @@ fn installTerminfoOnly(config: Config) void {
 
     var in_read: windows.HANDLE = undefined;
     var in_write: windows.HANDLE = undefined;
-    if (windows.exp.kernel32.CreatePipe(&in_read, &in_write, null, 0) == 0) return;
+    if (windows.exp.kernel32.CreatePipe(&in_read, &in_write, null, 0) == windows.FALSE) return;
 
     windows.SetHandleInformation(in_read, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT) catch {
         _ = windows.CloseHandle(in_read);
@@ -747,7 +734,7 @@ fn installTerminfoOnly(config: Config) void {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
+    ) == windows.FALSE) {
         _ = windows.CloseHandle(in_read);
         _ = windows.CloseHandle(in_write);
         return;
@@ -760,21 +747,21 @@ fn installTerminfoOnly(config: Config) void {
     var total_written: usize = 0;
     while (total_written < embedded_terminfo.len) {
         var written: windows.DWORD = 0;
-        if (windows.kernel32.WriteFile(
+        if (windows.exp.kernel32.WriteFile(
             in_write,
             embedded_terminfo[total_written..].ptr,
             @intCast(embedded_terminfo.len - total_written),
             &written,
             null,
-        ) == 0) break;
+        ) == windows.FALSE) break;
         total_written += written;
     }
 
     _ = windows.CloseHandle(in_write);
-    _ = windows.kernel32.WaitForSingleObject(process_info.hProcess, 10000);
+    _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 10000);
 
     var exit_code: windows.DWORD = 1;
-    _ = windows.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code);
+    _ = windows.exp.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code);
     if (exit_code == 0) {
         log.info("xterm-ghostty terminfo installed successfully", .{});
     } else {
@@ -796,7 +783,7 @@ pub fn listDistros(alloc: std.mem.Allocator) ![][]const u8 {
 
     var out_read: windows.HANDLE = undefined;
     var out_write: windows.HANDLE = undefined;
-    if (windows.exp.kernel32.CreatePipe(&out_read, &out_write, null, 0) == 0) {
+    if (windows.exp.kernel32.CreatePipe(&out_read, &out_write, null, 0) == windows.FALSE) {
         return error.Unexpected;
     }
     defer _ = windows.CloseHandle(out_read);
@@ -825,7 +812,7 @@ pub fn listDistros(alloc: std.mem.Allocator) ![][]const u8 {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
+    ) == windows.FALSE) {
         _ = windows.CloseHandle(out_write);
         return error.Unexpected;
     }
@@ -834,25 +821,25 @@ pub fn listDistros(alloc: std.mem.Allocator) ![][]const u8 {
     defer _ = windows.CloseHandle(process_info.hProcess);
     defer _ = windows.CloseHandle(process_info.hThread);
 
-    _ = windows.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
+    _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
 
     var output_buf: [4096]u8 = undefined;
     var total_read: usize = 0;
     while (total_read < output_buf.len) {
         var bytes_read: windows.DWORD = 0;
-        if (windows.kernel32.ReadFile(
+        if (windows.exp.kernel32.ReadFile(
             out_read,
             output_buf[total_read..].ptr,
             @intCast(output_buf.len - total_read),
             &bytes_read,
             null,
-        ) == 0) break;
+        ) == windows.FALSE) break;
         if (bytes_read == 0) break;
         total_read += bytes_read;
     }
 
     const raw = output_buf[0..total_read];
-    var distros: std.ArrayListUnmanaged([]const u8) = .{};
+    var distros: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (distros.items) |d| alloc.free(d);
         distros.deinit(alloc);
@@ -933,12 +920,11 @@ pub fn freeDistroList(alloc: std.mem.Allocator, distros: [][]const u8) void {
 
 /// Translate a Windows path to its WSL equivalent.
 pub fn windowsToWslPath(buf: []u8, win_path: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
+    var writer: std.Io.Writer = .fixed(buf);
 
     if (win_path.len > 0 and win_path[0] == '/') {
         try writer.writeAll(win_path);
-        return fbs.getWritten();
+        return writer.buffered();
     }
 
     if (win_path.len >= 6 and std.mem.startsWith(u8, win_path, "\\\\wsl")) {
@@ -950,11 +936,11 @@ pub fn windowsToWslPath(buf: []u8, win_path: []const u8) ![]const u8 {
                 for (rest) |c| {
                     try writer.writeByte(if (c == '\\') '/' else c);
                 }
-                return fbs.getWritten();
+                return writer.buffered();
             }
         }
         try writer.writeByte('/');
-        return fbs.getWritten();
+        return writer.buffered();
     }
 
     if (win_path.len >= 2 and win_path[1] == ':') {
@@ -966,19 +952,18 @@ pub fn windowsToWslPath(buf: []u8, win_path: []const u8) ![]const u8 {
                 try writer.writeByte(if (c == '\\') '/' else c);
             }
         }
-        return fbs.getWritten();
+        return writer.buffered();
     }
 
     for (win_path) |c| {
         try writer.writeByte(if (c == '\\') '/' else c);
     }
-    return fbs.getWritten();
+    return writer.buffered();
 }
 
 /// Translate a WSL path to its Windows equivalent.
 pub fn wslToWindowsPath(buf: []u8, wsl_path: []const u8, distro: ?[]const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
+    var writer: std.Io.Writer = .fixed(buf);
 
     if (wsl_path.len >= 6 and std.mem.startsWith(u8, wsl_path, "/mnt/") and
         wsl_path.len > 5 and (wsl_path.len == 6 or wsl_path[6] == '/'))
@@ -993,7 +978,7 @@ pub fn wslToWindowsPath(buf: []u8, wsl_path: []const u8, distro: ?[]const u8) ![
         } else {
             try writer.writeByte('\\');
         }
-        return fbs.getWritten();
+        return writer.buffered();
     }
 
     const distro_name = distro orelse "default";
@@ -1001,7 +986,7 @@ pub fn wslToWindowsPath(buf: []u8, wsl_path: []const u8, distro: ?[]const u8) ![
     for (wsl_path) |c| {
         try writer.writeByte(if (c == '/') '\\' else c);
     }
-    return fbs.getWritten();
+    return writer.buffered();
 }
 
 // ─── Internal Helpers ───────────────────────────────────────────────
@@ -1198,8 +1183,7 @@ fn recvExact(sock: SOCKET, buf_out: []u8) ?[]u8 {
 /// Discover the WSL2 VM ID by running `wslinfo --vm-id` inside WSL.
 fn discoverVmId(distro: ?[:0]const u8) ?GUID {
     var cmd_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
+    var writer: std.Io.Writer = .fixed(&cmd_buf);
 
     writer.writeAll("wsl.exe") catch return null;
     if (distro) |d| {
@@ -1207,7 +1191,7 @@ fn discoverVmId(distro: ?[:0]const u8) ?GUID {
     }
     writer.writeAll(" -- wslinfo --vm-id") catch return null;
 
-    const cmd_line = fbs.getWritten();
+    const cmd_line = writer.buffered();
 
     var cmd_w_buf: [512]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch return null;
@@ -1215,7 +1199,7 @@ fn discoverVmId(distro: ?[:0]const u8) ?GUID {
 
     var out_read: windows.HANDLE = undefined;
     var out_write: windows.HANDLE = undefined;
-    if (windows.exp.kernel32.CreatePipe(&out_read, &out_write, null, 0) == 0) {
+    if (windows.exp.kernel32.CreatePipe(&out_read, &out_write, null, 0) == windows.FALSE) {
         return null;
     }
     defer _ = windows.CloseHandle(out_read);
@@ -1242,7 +1226,7 @@ fn discoverVmId(distro: ?[:0]const u8) ?GUID {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
+    ) == windows.FALSE) {
         _ = windows.CloseHandle(out_write);
         return null;
     }
@@ -1251,10 +1235,10 @@ fn discoverVmId(distro: ?[:0]const u8) ?GUID {
     defer _ = windows.CloseHandle(process_info.hProcess);
     defer _ = windows.CloseHandle(process_info.hThread);
 
-    const wait_result = windows.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
+    const wait_result = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
     if (wait_result == WAIT_TIMEOUT) {
-        _ = windows.kernel32.TerminateProcess(process_info.hProcess, 1);
-        _ = windows.kernel32.WaitForSingleObject(process_info.hProcess, 1000);
+        _ = windows.exp.kernel32.TerminateProcess(process_info.hProcess, 1);
+        _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 1000);
         return null;
     }
 
@@ -1262,13 +1246,13 @@ fn discoverVmId(distro: ?[:0]const u8) ?GUID {
     var total_read: usize = 0;
     while (total_read < output_buf.len) {
         var bytes_read: windows.DWORD = 0;
-        if (windows.kernel32.ReadFile(
+        if (windows.exp.kernel32.ReadFile(
             out_read,
             output_buf[total_read..].ptr,
             @intCast(output_buf.len - total_read),
             &bytes_read,
             null,
-        ) == 0) break;
+        ) == windows.FALSE) break;
         if (bytes_read == 0) break;
         total_read += bytes_read;
     }
@@ -1288,8 +1272,7 @@ fn discoverVmId(distro: ?[:0]const u8) ?GUID {
 /// Parses the "TOKEN <hex>" line and decodes the 64 hex chars into 32 bytes.
 fn readToken(distro: ?[:0]const u8, port: u32) ?[32]u8 {
     var cmd_buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
+    var writer: std.Io.Writer = .fixed(&cmd_buf);
 
     writer.writeAll("wsl.exe") catch return null;
     if (distro) |d| {
@@ -1297,7 +1280,7 @@ fn readToken(distro: ?[:0]const u8, port: u32) ?[32]u8 {
     }
     writer.print(" -- cat /tmp/ghostwsl-{d}.token", .{port}) catch return null;
 
-    const cmd_line = fbs.getWritten();
+    const cmd_line = writer.buffered();
 
     var cmd_w_buf: [512]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch return null;
@@ -1305,7 +1288,7 @@ fn readToken(distro: ?[:0]const u8, port: u32) ?[32]u8 {
 
     var out_read: windows.HANDLE = undefined;
     var out_write: windows.HANDLE = undefined;
-    if (windows.exp.kernel32.CreatePipe(&out_read, &out_write, null, 0) == 0) {
+    if (windows.exp.kernel32.CreatePipe(&out_read, &out_write, null, 0) == windows.FALSE) {
         return null;
     }
     defer _ = windows.CloseHandle(out_read);
@@ -1332,7 +1315,7 @@ fn readToken(distro: ?[:0]const u8, port: u32) ?[32]u8 {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
+    ) == windows.FALSE) {
         _ = windows.CloseHandle(out_write);
         return null;
     }
@@ -1341,10 +1324,10 @@ fn readToken(distro: ?[:0]const u8, port: u32) ?[32]u8 {
     defer _ = windows.CloseHandle(process_info.hProcess);
     defer _ = windows.CloseHandle(process_info.hThread);
 
-    const wait_result = windows.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
+    const wait_result = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
     if (wait_result == WAIT_TIMEOUT) {
-        _ = windows.kernel32.TerminateProcess(process_info.hProcess, 1);
-        _ = windows.kernel32.WaitForSingleObject(process_info.hProcess, 1000);
+        _ = windows.exp.kernel32.TerminateProcess(process_info.hProcess, 1);
+        _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 1000);
         return null;
     }
 
@@ -1352,13 +1335,13 @@ fn readToken(distro: ?[:0]const u8, port: u32) ?[32]u8 {
     var total_read: usize = 0;
     while (total_read < output_buf.len) {
         var bytes_read: windows.DWORD = 0;
-        if (windows.kernel32.ReadFile(
+        if (windows.exp.kernel32.ReadFile(
             out_read,
             output_buf[total_read..].ptr,
             @intCast(output_buf.len - total_read),
             &bytes_read,
             null,
-        ) == 0) break;
+        ) == windows.FALSE) break;
         if (bytes_read == 0) break;
         total_read += bytes_read;
     }
@@ -1403,8 +1386,7 @@ fn startDaemon(distro: ?[:0]const u8, port: u32) Error!void {
     // We wait for it to avoid leaked wsl.exe processes.
 
     var cmd_buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const writer = fbs.writer();
+    var writer: std.Io.Writer = .fixed(&cmd_buf);
 
     writer.writeAll("wsl.exe") catch return error.Unexpected;
     if (distro) |d| {
@@ -1415,7 +1397,7 @@ fn startDaemon(distro: ?[:0]const u8, port: u32) Error!void {
         .{ BRIDGE_SHELL_PATH, port },
     ) catch return error.Unexpected;
 
-    const cmd_line = fbs.getWritten();
+    const cmd_line = writer.buffered();
 
     var cmd_w_buf: [1024]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch
@@ -1438,8 +1420,8 @@ fn startDaemon(distro: ?[:0]const u8, port: u32) Error!void {
         null,
         @ptrCast(&startup_info),
         &process_info,
-    ) == 0) {
-        log.err("CreateProcessW failed for daemon: {}", .{windows.kernel32.GetLastError()});
+    ) == windows.FALSE) {
+        log.err("CreateProcessW failed for daemon: {}", .{windows.GetLastError()});
         return error.DaemonStartFailed;
     }
 
@@ -1448,7 +1430,7 @@ fn startDaemon(distro: ?[:0]const u8, port: u32) Error!void {
 
     // Wait for wsl.exe to exit. The daemon double-forks so its direct child
     // exits immediately, allowing wsl.exe to terminate quickly.
-    _ = windows.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
+    _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 5000);
 
     log.info("daemon start requested on port {d}", .{port});
     wsl_log.print("startDaemon: wsl.exe launched for port {d}", .{port});
