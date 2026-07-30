@@ -4,6 +4,7 @@ const Window = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.win32_window);
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
 const CoreSurface = @import("../../Surface.zig");
@@ -36,6 +37,7 @@ const WM_CAPTURECHANGED: UINT = 0x0215;
 const WM_SETCURSOR: UINT = 0x0020;
 const SW_HIDE: c_int = 0;
 const TCM_FIRST: UINT = 0x1300;
+const TCM_GETITEMCOUNT: UINT = TCM_FIRST + 4;
 const TCM_GETCURSEL: UINT = TCM_FIRST + 11;
 const TCM_SETCURSEL: UINT = TCM_FIRST + 12;
 const TCM_DELETEITEM: UINT = TCM_FIRST + 8;
@@ -666,7 +668,18 @@ fn tabSubclassProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callco
     const orig = window.tab_orig_proc orelse return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
 
     switch (msg) {
-        0x0014 => return 1, // WM_ERASEBKGND: suppress — let previous content stay until WM_DRAWITEM
+        0x0014 => { // WM_ERASEBKGND
+            const hdc: ?*anyopaque = @ptrFromInt(wparam);
+            var rect: RECT = std.mem.zeroes(RECT);
+            _ = sys.GetClientRect(hwnd, &rect);
+            const bg = brighten(configColorToRef(window.app.config.background), 20);
+            const brush = CreateSolidBrush(bg);
+            if (brush != null) {
+                _ = FillRect(hdc, &rect, brush);
+                _ = DeleteObject(brush);
+            }
+            return 1;
+        },
         WM_LBUTTONDOWN => {
             const x: i32 = @as(i16, @truncate(lparam & 0xFFFF));
             const y: i32 = @as(i16, @truncate((lparam >> 16) & 0xFFFF));
@@ -1144,11 +1157,43 @@ fn showTabSurfaces(_: *Window, tab: *TabState) void {
 
 fn rebuildTabControl(self: *Window) void {
     const hwnd = self.tab_hwnd orelse return;
-    _ = sys.SendMessageW(hwnd, TCM_DELETEALLITEMS, 0, 0);
-    for (self.tabs.items, 0..) |_, i| self.insertTabControlItem(i) catch {};
-    if (self.tabs.items.len > 0) {
-        _ = sys.SendMessageW(hwnd, TCM_SETCURSEL, self.current_tab, 0);
+
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        _ = sys.SendMessageW(hwnd, TCM_DELETEALLITEMS, 0, 0);
+        // Apply the new fixed item width before inserting items. Otherwise adding a
+        // tab briefly lays out the new item count using the old, wider tab width,
+        // and comctl32 can retain a horizontal scroll offset after the rebuild.
+        self.updateTabMetrics();
+
+        var inserted_all = true;
+        for (self.tabs.items, 0..) |_, i| {
+            self.insertTabControlItem(i) catch |err| {
+                log.warn("failed to insert native tab item {d}: {}", .{ i, err });
+                inserted_all = false;
+                break;
+            };
+        }
+
+        const native_count = sys.SendMessageW(hwnd, TCM_GETITEMCOUNT, 0, 0);
+        const expected_count = self.tabs.items.len;
+        const count_matches = native_count >= 0 and @as(usize, @intCast(native_count)) == expected_count;
+        if (inserted_all and count_matches) {
+            if (expected_count > 0) {
+                _ = sys.SendMessageW(hwnd, TCM_SETCURSEL, self.current_tab, 0);
+            }
+            self.updateTabMetrics();
+            return;
+        }
+
+        log.warn("native tab control rebuild mismatch on attempt {d}: expected {d}, native {d}", .{
+            attempt + 1,
+            expected_count,
+            native_count,
+        });
     }
+
+    if (self.tabs.items.len > 0) _ = sys.SendMessageW(hwnd, TCM_SETCURSEL, self.current_tab, 0);
     self.updateTabMetrics();
 }
 
@@ -1166,7 +1211,7 @@ fn updateTabMetrics(self: *Window) void {
     const width = @max(110, @divTrunc(total_width - button_area - 8, tabs_i32));
     const size_param: LPARAM = (@as(LPARAM, TAB_HEIGHT) << 16) | @as(LPARAM, @intCast(width & 0xFFFF));
     _ = sys.SendMessageW(hwnd, TCM_SETITEMSIZE, 0, size_param);
-    _ = sys.InvalidateRect(hwnd, null, 0);
+    _ = sys.InvalidateRect(hwnd, null, 1);
 }
 
 fn insertTabControlItem(self: *Window, index: usize) !void {
@@ -1177,7 +1222,8 @@ fn insertTabControlItem(self: *Window, index: usize) !void {
         .mask = TCIF_TEXT,
         .pszText = utf16.ptr,
     };
-    _ = sys.SendMessageW(hwnd, TCM_INSERTITEMW, index, @bitCast(@intFromPtr(&item)));
+    const result = sys.SendMessageW(hwnd, TCM_INSERTITEMW, index, @bitCast(@intFromPtr(&item)));
+    if (result < 0) return error.TabControlInsertFailed;
 }
 
 fn updateTabControlTitle(self: *Window, index: usize) void {
