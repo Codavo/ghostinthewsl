@@ -13,20 +13,24 @@ because they depend on upstream-only Namespace runner infrastructure.
    git pull --ff-only origin main
    ```
 
-2. Bump the app version in `build.zig.zon`.
+2. Bump the app version in `build.zig.zon`:
 
-   The release tag must match this value exactly. For example, tag `v0.1.2`
+   ```sh
+   ./scripts/prepare-release.sh <next-version>
+   ```
+
+   The release tag must match this value exactly. For example, tag `v0.1.3`
    requires:
 
    ```zig
-   .version = "0.1.2",
+   .version = "0.1.3",
    ```
 
-3. Commit and push the version bump:
+3. Commit and push the version bump using the commands printed by the script:
 
    ```sh
    git add build.zig.zon
-   git commit -m "build: bump version to v0.1.2"
+   git commit -m "build: bump version to v0.1.3"
    git push origin main
    ```
 
@@ -35,8 +39,8 @@ because they depend on upstream-only Namespace runner infrastructure.
 Create an annotated tag for the same version and push it:
 
 ```sh
-git tag -a v0.1.2 -m "v0.1.2"
-git push origin v0.1.2
+git tag -a v0.1.3 -m "v0.1.3"
+git push origin v0.1.3
 ```
 
 Pushing a `v*` tag starts the Windows Release workflow. That workflow builds
@@ -70,8 +74,8 @@ Fix it by committing the version bump, moving the tag, and force-pushing only
 the tag:
 
 ```sh
-git tag -f -a v0.1.2 -m "v0.1.2" HEAD
-git push --force origin v0.1.2
+git tag -f -a v0.1.3 -m "v0.1.3" HEAD
+git push --force origin v0.1.3
 ```
 
 Do not force-push `main` for this case.
