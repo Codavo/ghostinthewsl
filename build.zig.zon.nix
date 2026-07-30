@@ -233,11 +233,11 @@ in
       };
     }
     {
-      name = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F";
+      name = "libxev-0.0.0-86vtc5wRFACNWWZ6BsfuyKGp8ue7opNeNDgTo7vGtF2p";
       path = fetchZigArtifact {
         name = "libxev";
-        url = "https://deps.files.ghostty.org/libxev-9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz";
-        hash = "sha256-fOU1oxIxfoEgoLuWz7fVX6M+zmqpo7gqZObWiH/aDE0=";
+        url = "https://github.com/Codavo/libxev/archive/7052b78bd0bf958e5a04a604bdfa41f11fd4d6d3.tar.gz";
+        hash = "sha256-fZHIN7q4MrBSiX94Z+ckvRqCJwAHG7+sVtmWhCvHdpI=";
         unpack = true;
       };
     }

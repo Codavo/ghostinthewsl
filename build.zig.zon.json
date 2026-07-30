@@ -74,10 +74,10 @@
     "url": "https://deps.files.ghostty.org/libpng-1220aa013f0c83da3fb64ea6d327f9173fa008d10e28bc9349eac3463457723b1c66.tar.gz",
     "hash": "sha256-/syVtGzwXo4/yKQUdQ4LparQDYnp/fF16U/wQcrxoDo="
   },
-  "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F": {
+  "libxev-0.0.0-86vtc5wRFACNWWZ6BsfuyKGp8ue7opNeNDgTo7vGtF2p": {
     "name": "libxev",
-    "url": "https://deps.files.ghostty.org/libxev-9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz",
-    "hash": "sha256-fOU1oxIxfoEgoLuWz7fVX6M+zmqpo7gqZObWiH/aDE0="
+    "url": "https://github.com/Codavo/libxev/archive/7052b78bd0bf958e5a04a604bdfa41f11fd4d6d3.tar.gz",
+    "hash": "sha256-fZHIN7q4MrBSiX94Z+ckvRqCJwAHG7+sVtmWhCvHdpI="
   },
   "N-V-__8AAG3RoQEyRC2Vw7Qoro5SYBf62IHn3HjqtNVY6aWK": {
     "name": "libxml2",

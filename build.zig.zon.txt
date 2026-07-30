@@ -15,7 +15,7 @@ https://deps.files.ghostty.org/gtk4-layer-shell-1.1.0.tar.gz
 https://deps.files.ghostty.org/harfbuzz-11.0.0.tar.xz
 https://deps.files.ghostty.org/highway-66486a10623fa0d72fe91260f96c892e41aceb06.tar.gz
 https://deps.files.ghostty.org/libpng-1220aa013f0c83da3fb64ea6d327f9173fa008d10e28bc9349eac3463457723b1c66.tar.gz
-https://deps.files.ghostty.org/libxev-9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz
+https://github.com/Codavo/libxev/archive/7052b78bd0bf958e5a04a604bdfa41f11fd4d6d3.tar.gz
 https://deps.files.ghostty.org/libxml2-2.11.5.tar.gz
 https://deps.files.ghostty.org/oniguruma-1220c15e72eadd0d9085a8af134904d9a0f5dfcbed5f606ad60edc60ebeccd9706bb.tar.gz
 https://deps.files.ghostty.org/pixels-12207ff340169c7d40c570b4b6a97db614fe47e0d83b5801a932dcd44917424c8806.tar.gz
