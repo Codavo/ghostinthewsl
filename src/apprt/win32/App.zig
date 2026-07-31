@@ -49,6 +49,7 @@ const COPYDATASTRUCT = sys.COPYDATASTRUCT;
 
 // Additional externs not in sys.zig
 extern "user32" fn ClientToScreen(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) BOOL;
+extern "user32" fn ScreenToClient(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) BOOL;
 extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(.winapi) BOOL;
 extern "user32" fn GetWindowTextW(hWnd: HWND, lpString: [*]u16, nMaxCount: c_int) callconv(.winapi) c_int;
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
@@ -1749,9 +1750,21 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         0x020A => {
             if (surface.core_surface) |core| {
+                // Unlike WM_MOUSEMOVE and the button messages, WM_MOUSEWHEEL
+                // carries the pointer position in *screen* coordinates, so it
+                // has to be converted before it can be used as a surface
+                // position. Without this, mouse reporting silently drops every
+                // wheel event whenever the window is positioned such that the
+                // screen coordinates fall outside the surface (see
+                // mouse_encode.posOutOfViewport).
+                var pt: POINT = .{
+                    .x = @as(i16, @truncate(lparam & 0xFFFF)),
+                    .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+                };
+                _ = ScreenToClient(hwnd, &pt);
                 surface.cursor_pos = .{
-                    .x = @floatFromInt(@as(i16, @truncate(lparam & 0xFFFF))),
-                    .y = @floatFromInt(@as(i16, @truncate((lparam >> 16) & 0xFFFF))),
+                    .x = @floatFromInt(pt.x),
+                    .y = @floatFromInt(pt.y),
                 };
                 const delta: i16 = @truncate(@as(isize, @bitCast(wparam)) >> 16);
                 const yoff: f64 = @as(f64, @floatFromInt(delta)) / 120.0;
