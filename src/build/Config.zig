@@ -361,6 +361,19 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         .ReleaseFast, .ReleaseSmall => true,
     };
 
+    // Zig 0.16.0 miscompiles stripped private TLS symbols for AArch64 COFF.
+    // https://codeberg.org/ziglang/zig/issues/31865
+    if (config.strip and
+        target.result.cpu.arch == .aarch64 and
+        target.result.os.tag == .windows and
+        builtin.zig_version.major == 0 and
+        builtin.zig_version.minor == 16 and
+        builtin.zig_version.patch == 0)
+    {
+        std.log.warn("disabling stripping for AArch64 Windows due to Zig 0.16.0 TLS miscompilation", .{});
+        config.strip = false;
+    }
+
     //---------------------------------------------------------------
     // Artifacts to Emit
 
