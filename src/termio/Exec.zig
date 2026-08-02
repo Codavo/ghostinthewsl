@@ -325,31 +325,31 @@ pub fn resize(
 ) !void {
     try self.subprocess.resize(grid_size, screen_size);
 
-    // In WSL/vsock mode, send the resize APC through xev's write path.
-    // We can't call WriteFile directly because the data pipe uses
-    // FILE_FLAG_OVERLAPPED for IOCP — synchronous WriteFile with
-    // lpOverlapped=NULL is undefined behavior on such handles.
-    // Check vsock_socket (runtime state) rather than config to correctly
-    // handle auto mode that fell back to ConPTY.
+    // WSL controls use a shared per-distro connection, leaving terminal
+    // input as an unambiguous raw byte stream.
     if (comptime builtin.os.tag == .windows) {
-        if (self.subprocess.vsock_socket != null) {
-            const cols = std.math.cast(u16, grid_size.columns) orelse 80;
-            const rows = std.math.cast(u16, grid_size.rows) orelse 24;
+        if (self.subprocess.vsock_session_id) |session_id| {
+            const cols = @max(std.math.cast(u16, grid_size.columns) orelse 80, 1);
+            const rows = @max(std.math.cast(u16, grid_size.rows) orelse 24, 1);
             const xpixel = std.math.cast(u16, screen_size.width) orelse 0;
             const ypixel = std.math.cast(u16, screen_size.height) orelse 0;
-            var buf: [96]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "\x1b_Gwsl;resize;{d};{d};{d};{d}\x1b\\", .{
-                cols, rows, xpixel, ypixel,
-            }) catch return;
-
-            const t0 = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
-            try self.queueWrite(alloc, td, msg, false);
-            const t1 = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
-            wsl_log.print("resize: {d}x{d} ({d}x{d}px) queueWrite took {d}ms", .{
-                cols, rows, xpixel, ypixel, t1 - t0,
+            self.subprocess.vsock_resize_serial +%= 1;
+            if (self.subprocess.vsock_resize_serial == 0) self.subprocess.vsock_resize_serial = 1;
+            const VsockBridge = @import("../apprt/win32/VsockBridge.zig");
+            VsockBridge.queueResize(self.subprocess.wsl_distro, session_id, self.subprocess.vsock_resize_serial, .{
+                .ws_col = cols,
+                .ws_row = rows,
+                .ws_xpixel = xpixel,
+                .ws_ypixel = ypixel,
+            });
+            wsl_log.print("resize: queued control serial={d} size={d}x{d} ({d}x{d}px)", .{
+                self.subprocess.vsock_resize_serial, cols, rows, xpixel, ypixel,
             });
         }
     }
+
+    _ = alloc;
+    _ = td;
 }
 
 fn processExitCommon(td: *termio.Termio.ThreadData, exit_code: u32) void {
@@ -794,6 +794,13 @@ const Subprocess = struct {
     /// socket can cause write completions to fail, corrupting the connection.
     vsock_socket: if (builtin.os.tag == .windows) ?usize else void =
         if (builtin.os.tag == .windows) null else {},
+
+    /// Capability and serial for commands sent over the shared WSL control
+    /// connection. The capability is assigned by the daemon per PTY session.
+    vsock_session_id: if (builtin.os.tag == .windows) ?[16]u8 else void =
+        if (builtin.os.tag == .windows) null else {},
+    vsock_resize_serial: if (builtin.os.tag == .windows) u64 else void =
+        if (builtin.os.tag == .windows) 0 else {},
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -1364,8 +1371,8 @@ const Subprocess = struct {
         const VsockBridge = @import("../apprt/win32/VsockBridge.zig");
 
         const wsl_size = ptypkg.winsize{
-            .ws_row = std.math.cast(u16, self.grid_size.rows) orelse 24,
-            .ws_col = std.math.cast(u16, self.grid_size.columns) orelse 80,
+            .ws_row = @max(std.math.cast(u16, self.grid_size.rows) orelse 24, 1),
+            .ws_col = @max(std.math.cast(u16, self.grid_size.columns) orelse 80, 1),
             .ws_xpixel = std.math.cast(u16, self.screen_size.width) orelse 800,
             .ws_ypixel = std.math.cast(u16, self.screen_size.height) orelse 600,
         };
@@ -1391,10 +1398,12 @@ const Subprocess = struct {
         const sock_handle = vsock.socketAsHandle();
         self.wsl_in_pipe = sock_handle;
         self.vsock_socket = vsock.socket;
+        self.vsock_session_id = vsock.session_id;
+        self.vsock_resize_serial = 0;
 
         self.pty = .{
             .out_pipe = sock_handle, // same socket for both directions
-            .in_pipe = sock_handle, // xev write stream; read uses recv()
+            .in_pipe = sock_handle, // writes use send(); reads use recv()
             .out_pipe_pty = undefined,
             .in_pipe_pty = undefined,
             .pseudo_console = undefined,
@@ -1429,6 +1438,7 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        self.forgetVsockSession();
         self.process = null;
     }
 
@@ -1437,6 +1447,7 @@ const Subprocess = struct {
     /// for it to terminate, so it will not block.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
+        self.forgetVsockSession();
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
                 // Note: this will also wait for the command to exit, so
@@ -1456,6 +1467,16 @@ const Subprocess = struct {
         self.process = null;
     }
 
+    fn forgetVsockSession(self: *Subprocess) void {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.vsock_session_id) |session_id| {
+                const VsockBridge = @import("../apprt/win32/VsockBridge.zig");
+                VsockBridge.forgetSession(self.wsl_distro, session_id);
+                self.vsock_session_id = null;
+            }
+        }
+    }
+
     /// Resize the pty subprocess. This is safe to call anytime.
     pub fn resize(
         self: *Subprocess,
@@ -1465,8 +1486,8 @@ const Subprocess = struct {
         self.grid_size = grid_size;
         self.screen_size = screen_size;
 
-        // In WSL/vsock mode, skip ConPTY's ResizePseudoConsole — the resize
-        // APC is sent by Exec.resize() through xev's queueWrite instead.
+        // In WSL/vsock mode, skip ConPTY's ResizePseudoConsole. Exec.resize()
+        // sends the dimensions over the shared daemon control connection.
         // We just update the local pty.size for any code that reads it.
         // Check vsock_socket (runtime state) to correctly handle auto mode
         // that fell back to ConPTY.
@@ -1474,8 +1495,8 @@ const Subprocess = struct {
             if (self.vsock_socket != null) {
                 if (self.pty) |*pty| {
                     pty.size = .{
-                        .ws_row = std.math.cast(u16, grid_size.rows) orelse 24,
-                        .ws_col = std.math.cast(u16, grid_size.columns) orelse 80,
+                        .ws_row = @max(std.math.cast(u16, grid_size.rows) orelse 24, 1),
+                        .ws_col = @max(std.math.cast(u16, grid_size.columns) orelse 80, 1),
                         .ws_xpixel = std.math.cast(u16, screen_size.width) orelse 0,
                         .ws_ypixel = std.math.cast(u16, screen_size.height) orelse 0,
                     };

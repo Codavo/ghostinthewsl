@@ -1,42 +1,25 @@
 /// Main bridge event loop: poll-based bidirectional I/O proxy between
-/// stdin/stdout and the PTY master, with APC command parsing on stdin.
+/// stdin/stdout or a socket and the PTY master.
 ///
 /// Architecture:
-///   stdin  → (APC parser) → PTY master  (keyboard input + control commands)
-///   PTY master → stdout                  (terminal output, zero filtering)
-///
-/// The APC parser intercepts `\x1b_Gwsl;...\x1b\\` sequences for control
-/// commands (resize, signal) and passes everything else through to the PTY
-/// unchanged — including non-Gwsl APC sequences like kitty graphics responses.
+///   stdin/socket → PTY master  (terminal input, zero filtering)
+///   PTY master → stdout/socket (terminal output, zero filtering)
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use nix::libc;
 use nix::poll::{PollFd, PollFlags};
 
-use crate::protocol::{ApcParser, Command};
+use crate::control::{Command, SessionControl};
 use crate::pty::PtyChild;
 
 const BUF_SIZE: usize = 64 * 1024; // 64KB read buffer
 
-/// Exit status report sent to the host when the child process exits.
-/// Uses OSC (Operating System Command) format: \x1b]9999;exit;CODE\x07
-///
-/// We use OSC instead of APC because Ghostty's APC handler dispatches
-/// \x1b_G to the kitty graphics parser, which would swallow our message.
-/// OSC 9999 is a private-use code that Ghostty ignores but we can detect
-/// on the Zig side if needed.
-fn write_exit_status(code: i32) {
-    let msg = format!("\x1b]9999;exit;{}\x07", code);
-    let _ = io::stdout().write_all(msg.as_bytes());
-    let _ = io::stdout().flush();
-}
-
 /// Run the bridge event loop.
 ///
 /// Proxies data bidirectionally:
-///   stdin  → (APC parser) → PTY master  (keyboard input + control commands)
-///   PTY master → stdout                  (terminal output)
+///   stdin → PTY master  (terminal input)
+///   PTY master → stdout (terminal output)
 ///
 /// Returns the child process exit code.
 pub fn run(child: &PtyChild) -> Result<i32, Box<dyn std::error::Error>> {
@@ -47,9 +30,7 @@ pub fn run(child: &PtyChild) -> Result<i32, Box<dyn std::error::Error>> {
     set_nonblocking(stdin_fd)?;
     set_nonblocking(master_fd)?;
 
-    let mut parser = ApcParser::new();
     let mut buf = vec![0u8; BUF_SIZE];
-    let mut last_resize: (u16, u16, u16, u16) = (0, 0, 0, 0);
 
     loop {
         // Poll on stdin and PTY master.
@@ -68,7 +49,6 @@ pub fn run(child: &PtyChild) -> Result<i32, Box<dyn std::error::Error>> {
                 if let Some(code) = child.try_wait()? {
                     // Drain any remaining PTY output.
                     drain_pty_to_stdout(master_fd, &mut buf);
-                    write_exit_status(code);
                     return Ok(code);
                 }
                 continue;
@@ -87,19 +67,7 @@ pub fn run(child: &PtyChild) -> Result<i32, Box<dyn std::error::Error>> {
                         log::info!("stdin EOF, waiting for child to exit");
                         return wait_for_child(child, master_fd, &mut buf);
                     }
-                    Ok(n) => {
-                        let result = parser.feed(&buf[..n]);
-
-                        // Forward passthrough data to PTY master.
-                        if !result.passthrough.is_empty() {
-                            write_all_fd(master_fd, &result.passthrough)?;
-                        }
-
-                        // Handle commands.
-                        for cmd in result.commands {
-                            handle_command(child, cmd, &mut last_resize);
-                        }
-                    }
+                    Ok(n) => write_all_fd(master_fd, &buf[..n])?,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -117,10 +85,8 @@ pub fn run(child: &PtyChild) -> Result<i32, Box<dyn std::error::Error>> {
                     Ok(0) => {
                         // PTY master EOF — child exited.
                         if let Some(code) = child.try_wait()? {
-                            write_exit_status(code);
                             return Ok(code);
                         }
-                        write_exit_status(0);
                         return Ok(0);
                     }
                     Ok(n) => {
@@ -139,10 +105,8 @@ pub fn run(child: &PtyChild) -> Result<i32, Box<dyn std::error::Error>> {
                         // EIO on PTY master means the slave side closed.
                         if e.raw_os_error() == Some(libc::EIO) {
                             if let Some(code) = child.try_wait()? {
-                                write_exit_status(code);
                                 return Ok(code);
                             }
-                            write_exit_status(0);
                             return Ok(0);
                         }
                         return Err(e.into());
@@ -155,25 +119,27 @@ pub fn run(child: &PtyChild) -> Result<i32, Box<dyn std::error::Error>> {
                 // is still readable in the buffer.
                 drain_pty_to_stdout(master_fd, &mut buf);
                 if let Some(code) = child.try_wait()? {
-                    write_exit_status(code);
                     return Ok(code);
                 }
-                write_exit_status(0);
                 return Ok(0);
             }
         }
     }
 }
 
-/// Handle a parsed APC command.
-///
 /// `last_resize` tracks the last resize dimensions to skip duplicate
 /// ioctl(TIOCSWINSZ) calls. Without this, rapid resize drags flood the
 /// child with SIGWINCHs, triggering re-render storms that cause
 /// backpressure on the socket and multi-second stalls.
 fn handle_command(child: &PtyChild, cmd: Command, last_resize: &mut (u16, u16, u16, u16)) {
     match cmd {
-        Command::Resize { cols, rows, xpixel, ypixel } => {
+        Command::Resize {
+            serial: _,
+            cols,
+            rows,
+            xpixel,
+            ypixel,
+        } => {
             let new = (cols, rows, xpixel, ypixel);
             if new == *last_resize {
                 return; // Skip duplicate — no SIGWINCH generated
@@ -200,7 +166,11 @@ fn handle_command(child: &PtyChild, cmd: Command, last_resize: &mut (u16, u16, u
 /// Draining during the wait ensures the child's final output is delivered and
 /// prevents the child from blocking on a full PTY buffer (which would prevent
 /// it from processing SIGHUP).
-fn wait_for_child(child: &PtyChild, master_fd: i32, buf: &mut [u8]) -> Result<i32, Box<dyn std::error::Error>> {
+fn wait_for_child(
+    child: &PtyChild,
+    master_fd: i32,
+    buf: &mut [u8],
+) -> Result<i32, Box<dyn std::error::Error>> {
     // Send SIGHUP — this is what a real terminal does when it closes.
     let _ = child.send_signal(libc::SIGHUP);
 
@@ -212,7 +182,6 @@ fn wait_for_child(child: &PtyChild, master_fd: i32, buf: &mut [u8]) -> Result<i3
 
         if let Some(code) = child.try_wait()? {
             drain_pty_to_stdout(master_fd, buf);
-            write_exit_status(code);
             return Ok(code);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -228,14 +197,11 @@ fn wait_for_child(child: &PtyChild, master_fd: i32, buf: &mut [u8]) -> Result<i3
 
         if let Some(code) = child.try_wait()? {
             drain_pty_to_stdout(master_fd, buf);
-            write_exit_status(code);
             return Ok(code);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    // Give up — report as killed.
-    write_exit_status(128 + libc::SIGKILL);
     Ok(128 + libc::SIGKILL)
 }
 
@@ -273,17 +239,18 @@ const MAX_WRITE_BUF: usize = 4 * 1024 * 1024;
 /// Same logic as `run()` but reads input from `fd` instead of stdin and
 /// writes PTY output to `fd` instead of stdout.
 ///
-/// Uses non-blocking writes with a buffer for socket output. This prevents
-/// the daemon from stalling on a full socket send buffer (backpressure from
-/// a slow consumer on the host side) while incoming resize APCs accumulate
-/// unread — the root cause of multi-second stalls during window drag.
-pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error::Error>> {
+/// Uses non-blocking writes with a buffer for socket output. Control commands
+/// arrive through the session's pollable queue rather than the terminal stream.
+pub fn run_with_fd(
+    child: &PtyChild,
+    fd: i32,
+    control: &SessionControl,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let master_fd = child.master.as_raw_fd();
 
     set_nonblocking(fd)?;
     set_nonblocking(master_fd)?;
 
-    let mut parser = ApcParser::new();
     let mut buf = vec![0u8; BUF_SIZE];
     let mut write_buf: Vec<u8> = Vec::new();
     let mut last_resize: (u16, u16, u16, u16) = (0, 0, 0, 0);
@@ -300,6 +267,7 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
             [
                 PollFd::new(BorrowedFd::borrow_raw(fd), socket_events),
                 PollFd::new(BorrowedFd::borrow_raw(master_fd), PollFlags::POLLIN),
+                PollFd::new(BorrowedFd::borrow_raw(control.wake_fd()), PollFlags::POLLIN),
             ]
         };
 
@@ -308,7 +276,6 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
                 if let Some(code) = child.try_wait()? {
                     flush_write_buf(fd, &mut write_buf)?;
                     drain_fd(master_fd, fd, &mut buf);
-                    write_exit_status_fd(fd, code);
                     return Ok(code);
                 }
                 continue;
@@ -316,6 +283,15 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
             Ok(_) => {}
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => return Err(e.into()),
+        }
+
+        // Apply controls before terminal input when both are ready.
+        if let Some(revents) = fds[2].revents() {
+            if revents.intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP) {
+                for command in control.take_commands() {
+                    handle_command(child, command, &mut last_resize);
+                }
+            }
         }
 
         // Check for socket events.
@@ -332,15 +308,7 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
                         log::info!("socket EOF, waiting for child to exit");
                         return wait_for_child_fd(child, fd, master_fd, &mut buf);
                     }
-                    Ok(n) => {
-                        let result = parser.feed(&buf[..n]);
-                        if !result.passthrough.is_empty() {
-                            write_all_fd(master_fd, &result.passthrough)?;
-                        }
-                        for cmd in result.commands {
-                            handle_command(child, cmd, &mut last_resize);
-                        }
-                    }
+                    Ok(n) => write_all_fd(master_fd, &buf[..n])?,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -358,10 +326,8 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
                     Ok(0) => {
                         flush_write_buf(fd, &mut write_buf)?;
                         if let Some(code) = child.try_wait()? {
-                            write_exit_status_fd(fd, code);
                             return Ok(code);
                         }
-                        write_exit_status_fd(fd, 0);
                         return Ok(0);
                     }
                     Ok(n) => {
@@ -384,11 +350,7 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
                                 "write buffer overflow ({} bytes), host not consuming data",
                                 write_buf.len()
                             );
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "socket write buffer overflow",
-                            )
-                            .into());
+                            return Err(io::Error::other("socket write buffer overflow").into());
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -396,10 +358,8 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
                         if e.raw_os_error() == Some(libc::EIO) {
                             flush_write_buf(fd, &mut write_buf)?;
                             if let Some(code) = child.try_wait()? {
-                                write_exit_status_fd(fd, code);
                                 return Ok(code);
                             }
-                            write_exit_status_fd(fd, 0);
                             return Ok(0);
                         }
                         return Err(e.into());
@@ -411,20 +371,12 @@ pub fn run_with_fd(child: &PtyChild, fd: i32) -> Result<i32, Box<dyn std::error:
                 flush_write_buf(fd, &mut write_buf)?;
                 drain_fd(master_fd, fd, &mut buf);
                 if let Some(code) = child.try_wait()? {
-                    write_exit_status_fd(fd, code);
                     return Ok(code);
                 }
-                write_exit_status_fd(fd, 0);
                 return Ok(0);
             }
         }
     }
-}
-
-/// Write exit status report to an arbitrary fd.
-fn write_exit_status_fd(fd: i32, code: i32) {
-    let msg = format!("\x1b]9999;exit;{}\x07", code);
-    let _ = write_all_fd(fd, msg.as_bytes());
 }
 
 /// Drain remaining PTY output to a socket fd.
@@ -449,7 +401,12 @@ fn drain_fd(master_fd: i32, out_fd: i32, buf: &mut [u8]) {
 /// Shut down the child and report exit status to a socket fd.
 /// Drains PTY output during the wait to prevent the child from blocking
 /// on a full PTY buffer and to deliver final output to the host.
-fn wait_for_child_fd(child: &PtyChild, fd: i32, master_fd: i32, buf: &mut [u8]) -> Result<i32, Box<dyn std::error::Error>> {
+fn wait_for_child_fd(
+    child: &PtyChild,
+    fd: i32,
+    master_fd: i32,
+    buf: &mut [u8],
+) -> Result<i32, Box<dyn std::error::Error>> {
     let _ = child.send_signal(libc::SIGHUP);
 
     for _ in 0..200 {
@@ -457,7 +414,6 @@ fn wait_for_child_fd(child: &PtyChild, fd: i32, master_fd: i32, buf: &mut [u8]) 
 
         if let Some(code) = child.try_wait()? {
             drain_fd(master_fd, fd, buf);
-            write_exit_status_fd(fd, code);
             return Ok(code);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -471,13 +427,11 @@ fn wait_for_child_fd(child: &PtyChild, fd: i32, master_fd: i32, buf: &mut [u8]) 
 
         if let Some(code) = child.try_wait()? {
             drain_fd(master_fd, fd, buf);
-            write_exit_status_fd(fd, code);
             return Ok(code);
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    write_exit_status_fd(fd, 128 + libc::SIGKILL);
     Ok(128 + libc::SIGKILL)
 }
 

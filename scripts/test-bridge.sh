@@ -3,9 +3,9 @@
 #
 # Tests the bridge binary's ability to:
 # 1. Launch a shell and execute commands
-# 2. Parse and handle APC resize commands
-# 3. Report exit status via APC
-# 4. Handle stdin EOF gracefully
+# 2. Return the child exit status
+# 3. Forward terminal input without buffering escape bytes
+# 4. Handle custom and default shells
 #
 # Run from inside WSL.
 
@@ -26,6 +26,8 @@ NC='\033[0m'
 
 PASSED=0
 FAILED=0
+OUTPUT_FILE=$(mktemp)
+trap 'rm -f "$OUTPUT_FILE"' EXIT
 
 pass() { echo -e "${GREEN}PASS${NC}: $1"; PASSED=$((PASSED + 1)); }
 fail() { echo -e "${RED}FAIL${NC}: $1 - $2"; FAILED=$((FAILED + 1)); }
@@ -33,66 +35,79 @@ fail() { echo -e "${RED}FAIL${NC}: $1 - $2"; FAILED=$((FAILED + 1)); }
 echo "=== wsl-pty-bridge integration tests ==="
 echo ""
 
-# Helper: run bridge and capture output, ignoring the process exit code
-# (the bridge exits with the shell's exit code)
+# Run the bridge and save its rendered output and process status.
 run_bridge() {
     local input="$1"
     shift
-    printf '%s' "$input" | timeout 5 "$BRIDGE" "$@" 2>/dev/null | cat -v || true
+    set +e
+    { printf '%s' "$input"; sleep 0.5; } |
+        timeout 5 "$BRIDGE" "$@" >"$OUTPUT_FILE" 2>/dev/null
+    RUN_STATUS=${PIPESTATUS[1]}
+    set -e
+    RUN_OUTPUT=$(cat -v "$OUTPUT_FILE")
 }
 
-# Test 1: Bridge starts and reports exit status
-echo "Test 1: Bridge starts and reports exit code"
-OUTPUT=$(run_bridge $'exit 42\n' --shell /bin/sh --cols 80 --rows 24)
-if echo "$OUTPUT" | grep -q "Gwsl;exit;42"; then
-    pass "Exit code 42 reported correctly"
+# Test 1: Bridge starts and returns the child exit status.
+echo "Test 1: Bridge returns child exit code"
+run_bridge $'exit 42\n' --shell /bin/sh --cols 80 --rows 24
+if [ "$RUN_STATUS" -eq 42 ]; then
+    pass "Exit code 42 returned correctly"
 else
-    fail "Exit code reporting" "Expected Gwsl;exit;42, got: $OUTPUT"
+    fail "Exit code reporting" "Expected 42, got: $RUN_STATUS ($RUN_OUTPUT)"
 fi
 
-# Test 2: Bridge reports exit code 0
-echo "Test 2: Bridge reports exit code 0"
-OUTPUT=$(run_bridge $'exit 0\n' --shell /bin/sh --cols 80 --rows 24)
-if echo "$OUTPUT" | grep -q "Gwsl;exit;0"; then
-    pass "Exit code 0 reported correctly"
+# Test 2: Normal terminal output is forwarded.
+echo "Test 2: Bridge forwards terminal output"
+run_bridge $'printf GHOSTWSL_RAW_OK\nexit 0\n' --shell /bin/sh --cols 80 --rows 24
+if [ "$RUN_STATUS" -eq 0 ] && echo "$RUN_OUTPUT" | grep -q "GHOSTWSL_RAW_OK"; then
+    pass "Terminal output forwarded"
 else
-    fail "Exit code 0 reporting" "Expected Gwsl;exit;0, got: $OUTPUT"
+    fail "Terminal output" "status=$RUN_STATUS output=$RUN_OUTPUT"
 fi
 
-# Test 3: APC resize command doesn't crash
-echo "Test 3: APC resize command is handled"
-OUTPUT=$(run_bridge $'\033_Gwsl;resize;120;40\033\\exit 0\n' --shell /bin/sh --cols 80 --rows 24)
-if echo "$OUTPUT" | grep -q "Gwsl;exit;0"; then
-    pass "Resize APC handled without crash"
+# Test 3: A standalone ESC is delivered without waiting for another byte.
+echo "Test 3: Standalone ESC is forwarded immediately"
+set +e
+{
+    printf 'stty raw -echo; dd bs=1 count=1 2>/dev/null | od -An -t u1; exit\n'
+    sleep 1
+    printf '\033'
+    sleep 0.25
+} | timeout 5 "$BRIDGE" --shell /bin/sh --cols 80 --rows 24 >"$OUTPUT_FILE" 2>/dev/null
+RUN_STATUS=${PIPESTATUS[1]}
+set -e
+RUN_OUTPUT=$(cat -v "$OUTPUT_FILE")
+if [ "$RUN_STATUS" -eq 0 ] && echo "$RUN_OUTPUT" | grep -Eq '(^|[[:space:]])27([[:space:]]|$)'; then
+    pass "Standalone ESC forwarded immediately"
 else
-    fail "Resize APC handling" "Bridge may have crashed: $OUTPUT"
+    fail "Standalone ESC forwarding" "status=$RUN_STATUS output=$RUN_OUTPUT"
 fi
 
 # Test 4: Custom shell argument
 echo "Test 4: Custom shell argument"
-OUTPUT=$(run_bridge $'exit 0\n' --shell /bin/bash --cols 80 --rows 24)
-if echo "$OUTPUT" | grep -q "Gwsl;exit;0"; then
+run_bridge $'exit 0\n' --shell /bin/bash --cols 80 --rows 24
+if [ "$RUN_STATUS" -eq 0 ]; then
     pass "Custom shell (/bin/bash) works"
 else
-    fail "Custom shell" "Expected exit code, got: $OUTPUT"
+    fail "Custom shell" "Expected status 0, got: $RUN_STATUS ($RUN_OUTPUT)"
 fi
 
 # Test 5: Default shell (from $SHELL)
 echo "Test 5: Default shell from \$SHELL"
-OUTPUT=$(run_bridge $'exit 0\n' --cols 80 --rows 24)
-if echo "$OUTPUT" | grep -q "Gwsl;exit;0"; then
+run_bridge $'exit 0\n' --cols 80 --rows 24
+if [ "$RUN_STATUS" -eq 0 ]; then
     pass "Default shell works"
 else
-    fail "Default shell" "Expected exit code, got: $OUTPUT"
+    fail "Default shell" "Expected status 0, got: $RUN_STATUS ($RUN_OUTPUT)"
 fi
 
 # Test 6: Help flag
 echo "Test 6: --help flag"
-OUTPUT=$("$BRIDGE" --help 2>&1 || true)
-if echo "$OUTPUT" | grep -q "wsl-pty-bridge"; then
+RUN_OUTPUT=$("$BRIDGE" --help 2>&1 || true)
+if echo "$RUN_OUTPUT" | grep -q "wsl-pty-bridge"; then
     pass "--help shows program name"
 else
-    fail "--help" "Expected help text, got: $OUTPUT"
+    fail "--help" "Expected help text, got: $RUN_OUTPUT"
 fi
 
 echo ""

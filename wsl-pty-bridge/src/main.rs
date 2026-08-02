@@ -1,6 +1,6 @@
 mod bridge;
+mod control;
 mod daemon;
-mod protocol;
 mod pty;
 
 use clap::Parser;
@@ -100,12 +100,7 @@ fn main() {
     );
 
     // Spawn the PTY child process.
-    let child = match pty::PtyChild::spawn(
-        &args.shell,
-        args.cols,
-        args.rows,
-        args.cwd.as_deref(),
-    ) {
+    let child = match pty::PtyChild::spawn(&args.shell, args.cols, args.rows, args.cwd.as_deref()) {
         Ok(child) => child,
         Err(e) => {
             log::error!("Failed to spawn shell: {}", e);

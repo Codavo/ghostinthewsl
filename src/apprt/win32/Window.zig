@@ -1559,6 +1559,24 @@ pub fn relayout(self: *Window) void {
 fn relayoutCb(surface: *Surface, rect: SplitTree.Rect) void {
     surface.setLayoutRect(rect.x, rect.y, rect.w, rect.h);
     _ = sys.SetWindowPos(surface.hwnd, null, rect.x, rect.y, rect.w, rect.h, 0x0004);
+
+    // SetWindowPos normally results in WM_SIZE, but Windows can omit that
+    // notification for hidden child windows during tab changes and restores.
+    // Keep the terminal grid and PTY geometry synchronized with the layout
+    // bounds even in that case. sizeCallback ignores duplicate dimensions.
+    if (rect.w <= 0 or rect.h <= 0) return;
+    const width: u32 = @intCast(rect.w);
+    const height: u32 = @intCast(rect.h);
+    surface.width = width;
+    surface.height = height;
+    if (surface.core_surface) |core| {
+        core.sizeCallback(.{
+            .width = width,
+            .height = height,
+        }) catch |err| {
+            log.err("layout size callback error: {}", .{err});
+        };
+    }
 }
 
 pub fn newTab(self: *Window, opts: CreateOptions) !void {

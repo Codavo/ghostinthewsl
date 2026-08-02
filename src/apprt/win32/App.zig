@@ -367,7 +367,10 @@ fn initWslBackground(self: *App, distro: ?[:0]const u8) void {
         if (distro) |d| d else "(default)",
     });
 
-    VsockBridge.ensureWslRunning(distro);
+    if (!VsockBridge.ensureWslRunning(distro)) {
+        wsl_log.print("initWslBackground: WSL warm-up failed", .{});
+        return;
+    }
 
     wsl_log.print("initWslBackground: WSL warm-up complete, starting keepalive", .{});
 

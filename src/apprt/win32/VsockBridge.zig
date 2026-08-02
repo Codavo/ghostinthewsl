@@ -132,6 +132,7 @@ extern "ws2_32" fn WSASocketA(af: i32, socket_type: i32, protocol: i32, lpProtoc
 extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
 extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
 extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: i32, argp: *u32) callconv(.winapi) i32;
+extern "ws2_32" fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
 
 const select_fn = struct {
     extern "ws2_32" fn select(nfds: i32, readfds: ?*fd_set, writefds: ?*fd_set, exceptfds: ?*fd_set, timeout: ?*const timeval) callconv(.winapi) i32;
@@ -150,6 +151,11 @@ const recv_fn = struct {
 
 /// Win32 constant: WAIT_TIMEOUT (0x00000102).
 const WAIT_TIMEOUT: windows.DWORD = 0x00000102;
+const SOL_SOCKET: i32 = 0xFFFF;
+const SO_SNDTIMEO: i32 = 0x1005;
+const SO_RCVTIMEO: i32 = 0x1006;
+const CONTROL_ROLE: u8 = 2;
+const CONTROL_RESIZE: u8 = 1;
 
 // ─── VsockBridge struct ─────────────────────────────────────────────
 
@@ -162,7 +168,12 @@ size: ptypkg.winsize,
 /// PTY ID assigned by the daemon.
 pty_id: u32,
 
+/// Unpredictable capability used to address this session on the shared
+/// control connection.
+session_id: [16]u8,
+
 pub const Error = error{
+    WslStartFailed,
     WsaStartupFailed,
     SocketCreateFailed,
     ConnectFailed,
@@ -193,26 +204,153 @@ var wsa_initialized = std.atomic.Value(bool).init(false);
 /// Bridge deployment guard (default distro fast path).
 var bridge_deployed = std.atomic.Value(bool).init(false);
 
+/// Serialize deployment, daemon replacement, and cold-start connection setup.
+/// Multiple surfaces can initialize on separate IO threads at the same time.
+var bootstrap_lock: std.Io.Mutex = .init;
+
+/// Successful `wsl.exe -- true` probes, keyed by the same per-distro port used
+/// by the daemon. The app keepalive makes these valid for its lifetime; if WSL
+/// is externally shut down, the daemon cold path starts it again.
+var wsl_ready_ports: std.AutoHashMap(u32, void) = std.AutoHashMap(u32, void).init(std.heap.page_allocator);
+var wsl_readiness_lock: std.Io.Mutex = .init;
+
 /// Thread-safe per-port authentication token cache.
 /// Each daemon has its own token, so we cache per port.
 var token_cache: std.AutoHashMap(u32, [32]u8) = std.AutoHashMap(u32, [32]u8).init(std.heap.page_allocator);
 var token_cache_lock: std.Io.Mutex = .init;
 
+const PendingResize = struct {
+    session_id: [16]u8,
+    serial: u64,
+    cols: u16,
+    rows: u16,
+    xpixel: u16,
+    ypixel: u16,
+};
+
+const ControlManager = struct {
+    mutex: std.Io.Mutex = .init,
+    ready: std.Io.Condition = .init,
+    pending: std.AutoHashMap([16]u8, PendingResize),
+    stopped: bool = false,
+    vm_id: GUID,
+    service_guid: GUID,
+    token: [32]u8,
+
+    fn create(vm_id: GUID, service_guid: GUID, token: [32]u8) !*ControlManager {
+        const manager = try std.heap.page_allocator.create(ControlManager);
+        manager.* = .{
+            .pending = std.AutoHashMap([16]u8, PendingResize).init(std.heap.page_allocator),
+            .vm_id = vm_id,
+            .service_guid = service_guid,
+            .token = token,
+        };
+        return manager;
+    }
+
+    fn destroyUnstarted(self: *ControlManager) void {
+        self.pending.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
+
+    fn queueResize(self: *ControlManager, resize: PendingResize) void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        if (self.stopped) return;
+        self.pending.put(resize.session_id, resize) catch return;
+        self.ready.signal(global.io());
+    }
+
+    fn forgetSession(self: *ControlManager, session_id: [16]u8) void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        _ = self.pending.remove(session_id);
+    }
+
+    fn stop(self: *ControlManager) void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        self.stopped = true;
+        self.pending.clearRetainingCapacity();
+        self.ready.signal(global.io());
+    }
+
+    fn nextResize(self: *ControlManager) ?PendingResize {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        while (!self.stopped and self.pending.count() == 0) {
+            self.ready.waitUncancelable(global.io(), &self.mutex);
+        }
+        if (self.stopped) return null;
+
+        var it = self.pending.valueIterator();
+        return it.next().?.*;
+    }
+
+    fn markSent(self: *ControlManager, resize: PendingResize) void {
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
+        if (self.pending.get(resize.session_id)) |current| {
+            if (current.serial == resize.serial) _ = self.pending.remove(resize.session_id);
+        }
+    }
+
+    fn threadMain(self: *ControlManager) void {
+        var socket: ?SOCKET = null;
+        defer {
+            if (socket) |sock| _ = closesocket(sock);
+        }
+
+        while (self.nextResize()) |resize| {
+            if (socket == null) {
+                socket = connectControl(self.vm_id, self.service_guid, self.token);
+                if (socket == null) {
+                    std.Io.sleep(global.io(), .fromMilliseconds(250), .awake) catch {};
+                    continue;
+                }
+            }
+
+            if (!sendControlResize(socket.?, resize)) {
+                _ = closesocket(socket.?);
+                socket = null;
+                std.Io.sleep(global.io(), .fromMilliseconds(100), .awake) catch {};
+                continue;
+            }
+            self.markSent(resize);
+        }
+    }
+};
+
+var control_managers: std.AutoHashMap(u32, *ControlManager) = std.AutoHashMap(u32, *ControlManager).init(std.heap.page_allocator);
+var control_managers_lock: std.Io.Mutex = .init;
+
 // ─── Public API ─────────────────────────────────────────────────────
 
 /// Ensure WSL is running by executing a trivial command.
 /// On cold start this blocks ~10-15s while WSL boots.
-/// On warm start this returns in ~100ms.
+/// After the first successful probe for a distro this returns without spawning
+/// another wsl.exe process.
 /// Idempotent and safe to call from multiple threads.
-pub fn ensureWslRunning(distro: ?[:0]const u8) void {
+pub fn ensureWslRunning(distro: ?[:0]const u8) bool {
+    const port = portForDistro(distro);
+
+    // Hold this through the probe so background warm-up and the first tab do
+    // not launch duplicate wsl.exe processes.
+    wsl_readiness_lock.lockUncancelable(global.io());
+    defer wsl_readiness_lock.unlock(global.io());
+    if (wsl_ready_ports.contains(port)) {
+        wsl_log.print("ensureWslRunning: cached ready (port={d})", .{port});
+        return true;
+    }
+
     var cmd_buf: [256]u8 = undefined;
     const cmd_line = if (distro) |d|
-        std.fmt.bufPrint(&cmd_buf, "wsl.exe -d {s} -- true", .{d}) catch return
+        std.fmt.bufPrint(&cmd_buf, "wsl.exe -d {s} -- true", .{d}) catch return false
     else
-        std.fmt.bufPrint(&cmd_buf, "wsl.exe -- true", .{}) catch return;
+        std.fmt.bufPrint(&cmd_buf, "wsl.exe -- true", .{}) catch return false;
 
     var cmd_w_buf: [256]u16 = undefined;
-    const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch return;
+    const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch return false;
     cmd_w_buf[cmd_w_len] = 0;
 
     var startup_info = std.mem.zeroes(windows.STARTUPINFOW);
@@ -235,29 +373,47 @@ pub fn ensureWslRunning(distro: ?[:0]const u8) void {
         &process_info,
     ) == windows.FALSE) {
         wsl_log.print("ensureWslRunning: CreateProcessW failed", .{});
-        return;
+        return false;
     }
 
     defer _ = windows.CloseHandle(process_info.hProcess);
     defer _ = windows.CloseHandle(process_info.hThread);
 
-    // Wait up to 30s for WSL to boot
-    _ = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 30000);
+    // Wait up to 30s for WSL to boot.
+    const wait_result = windows.exp.kernel32.WaitForSingleObject(process_info.hProcess, 30000);
+    if (wait_result != 0) { // WAIT_OBJECT_0
+        if (wait_result == WAIT_TIMEOUT)
+            wsl_log.print("ensureWslRunning: timed out", .{})
+        else
+            wsl_log.print("ensureWslRunning: wait failed (result={d})", .{wait_result});
+        _ = windows.exp.kernel32.TerminateProcess(process_info.hProcess, 1);
+        return false;
+    }
 
     var exit_code: windows.DWORD = 1;
     _ = windows.exp.kernel32.GetExitCodeProcess(process_info.hProcess, &exit_code);
 
     wsl_log.print("ensureWslRunning: done (exit_code={d})", .{exit_code});
+    if (exit_code != 0) return false;
+
+    wsl_ready_ports.put(port, {}) catch {
+        // A cache allocation failure only loses the optimization; WSL is up.
+        return true;
+    };
+    return true;
 }
 
 /// Open a vsock connection to the WSL PTY daemon.
 ///
 /// Sequential bootstrap: ensures WSL is running, deploys the bridge,
-/// discovers VM ID, then connects. All wsl.exe calls are serialized
-/// to avoid overwhelming WSL's init process during cold boot.
+/// discovers VM ID, then connects. Per-surface bootstrap calls are serialized
+/// to avoid deployment and daemon-start races during cold boot.
 pub fn open(config: Config) Error!VsockBridge {
     const port = portForDistro(config.distro);
     const service_guid = makeVsockServiceGuid(port);
+
+    bootstrap_lock.lockUncancelable(global.io());
+    defer bootstrap_lock.unlock(global.io());
 
     wsl_log.print("VsockBridge.open: distro={s} port={d}", .{
         if (config.distro) |d| @as([]const u8, d) else "(default)", port,
@@ -267,7 +423,7 @@ pub fn open(config: Config) Error!VsockBridge {
     ensureWsa() catch return error.WsaStartupFailed;
 
     // 2. Ensure WSL is running (idempotent, fast if bg thread already did this).
-    ensureWslRunning(config.distro);
+    if (!ensureWslRunning(config.distro)) return error.WslStartFailed;
 
     // 3. Deploy bridge binary + install terminfo (idempotent, fast since WSL is up).
     ensureDeployed(config) catch |err| {
@@ -288,6 +444,7 @@ pub fn open(config: Config) Error!VsockBridge {
                 readAndCacheToken(config.distro, port);
             }
             if (tryHandshake(sock, config, port, vm_id, service_guid)) |bridge| {
+                ensureControlManager(port, vm_id, service_guid);
                 return bridge;
             } else |_| {
                 wsl_log.print("VsockBridge.open: fast path handshake failed", .{});
@@ -298,7 +455,9 @@ pub fn open(config: Config) Error!VsockBridge {
     // 6. Cold path: start daemon, then retry with short backoffs.
     //    WSL is already booted, so daemon starts in ~1s.
     wsl_log.print("VsockBridge.open: starting daemon...", .{});
-    _ = startDaemon(config.distro, port) catch {};
+    startDaemon(config.distro, port) catch |err| {
+        wsl_log.print("VsockBridge.open: daemon start failed: {s}", .{@errorName(err)});
+    };
 
     // New daemon means new token; VM ID might also be stale.
     vm_id_ready.store(false, .release);
@@ -320,11 +479,23 @@ pub fn open(config: Config) Error!VsockBridge {
                     readAndCacheToken(config.distro, port);
                 }
                 if (tryHandshake(sock, config, port, vm_id, service_guid)) |bridge| {
+                    ensureControlManager(port, vm_id, service_guid);
                     return bridge;
                 } else |_| {
                     wsl_log.print("VsockBridge.open: cold path handshake failed on attempt {d}", .{attempt});
                 }
             }
+        }
+
+        // startDaemon only observes the short-lived launcher process. The
+        // detached daemon can still fail to bind, most notably while a daemon
+        // replaced during deployment is releasing the port. Request another
+        // idempotent start before the next connection attempt.
+        if (attempt + 1 < delays.len) {
+            wsl_log.print("VsockBridge.open: requesting daemon restart after attempt {d}", .{attempt});
+            startDaemon(config.distro, port) catch |err| {
+                wsl_log.print("VsockBridge.open: daemon restart failed: {s}", .{@errorName(err)});
+            };
         }
     }
 
@@ -336,6 +507,36 @@ pub fn open(config: Config) Error!VsockBridge {
 pub fn deinit(self: *VsockBridge) void {
     _ = closesocket(self.socket);
     self.* = undefined;
+}
+
+/// Queue a resize on the shared per-distro control connection. The latest
+/// dimensions replace any older unsent resize for the same session.
+pub fn queueResize(
+    distro: ?[:0]const u8,
+    session_id: [16]u8,
+    serial: u64,
+    size: ptypkg.winsize,
+) void {
+    const port = portForDistro(distro);
+    control_managers_lock.lockUncancelable(global.io());
+    const manager = control_managers.get(port);
+    control_managers_lock.unlock(global.io());
+    if (manager) |value| value.queueResize(.{
+        .session_id = session_id,
+        .serial = serial,
+        .cols = @max(size.ws_col, 1),
+        .rows = @max(size.ws_row, 1),
+        .xpixel = size.ws_xpixel,
+        .ypixel = size.ws_ypixel,
+    });
+}
+
+pub fn forgetSession(distro: ?[:0]const u8, session_id: [16]u8) void {
+    const port = portForDistro(distro);
+    control_managers_lock.lockUncancelable(global.io());
+    const manager = control_managers.get(port);
+    control_managers_lock.unlock(global.io());
+    if (manager) |value| value.forgetSession(session_id);
 }
 
 /// Get the socket as a Windows HANDLE for ReadFile/WriteFile.
@@ -425,6 +626,30 @@ fn invalidateTokenForPort(port: u32) void {
     _ = token_cache.remove(port);
 }
 
+fn ensureControlManager(port: u32, vm_id: GUID, service_guid: GUID) void {
+    const token = getTokenForPort(port) orelse return;
+
+    control_managers_lock.lockUncancelable(global.io());
+    defer control_managers_lock.unlock(global.io());
+
+    if (control_managers.get(port)) |existing| {
+        if (std.mem.eql(u8, &existing.token, &token)) return;
+        existing.stop();
+    }
+
+    const manager = ControlManager.create(vm_id, service_guid, token) catch return;
+    control_managers.put(port, manager) catch {
+        manager.destroyUnstarted();
+        return;
+    };
+    const thread = std.Thread.spawn(.{}, ControlManager.threadMain, .{manager}) catch {
+        _ = control_managers.remove(port);
+        manager.destroyUnstarted();
+        return;
+    };
+    thread.detach();
+}
+
 /// Start the daemon in the background without blocking the caller.
 pub fn startDaemonBackground(distro: ?[:0]const u8) void {
     const port = portForDistro(distro);
@@ -501,7 +726,7 @@ const BRIDGE_HASH_SHELL_PATH = "$HOME/.local/bin/wsl-pty-bridge.hash";
 /// The shell script checks the hash sidecar first; if it matches, only
 /// terminfo is verified. If it differs (or is missing), the bridge binary
 /// is read from stdin, deployed via atomic rename, the hash is written,
-/// the old daemon is killed, and terminfo is installed.
+/// the old daemon is stopped and awaited, and terminfo is installed.
 ///
 /// Stdin protocol: bridge binary bytes (exactly embedded_bridge.len),
 /// followed by terminfo source bytes (rest of stream until EOF).
@@ -509,6 +734,8 @@ const BRIDGE_HASH_SHELL_PATH = "$HOME/.local/bin/wsl-pty-bridge.hash";
 pub fn ensureDeployed(config: Config) Error!void {
     // Fast-path for default distro: skip if already deployed this session.
     if (config.distro == null and bridge_deployed.load(.acquire)) return;
+
+    const port = portForDistro(config.distro);
 
     log.info("ensureDeployed: checking bridge + terminfo (single wsl.exe call)", .{});
     wsl_log.print("ensureDeployed: starting consolidated deploy check", .{});
@@ -521,8 +748,9 @@ pub fn ensureDeployed(config: Config) Error!void {
     // The script:
     //   1. Checks hash sidecar — if match, drains stdin, checks terminfo, exits
     //   2. On mismatch: reads binary from stdin (head -c N), deploys atomically,
-    //      writes hash, kills old daemon, then reads+installs terminfo from stdin
-    var cmd_buf: [2048]u8 = undefined;
+    //      writes hash, stops the old daemon and waits for it to release its
+    //      port, then reads+installs terminfo from stdin
+    var cmd_buf: [4096]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&cmd_buf);
 
     writer.writeAll("wsl.exe") catch return error.Unexpected;
@@ -535,6 +763,7 @@ pub fn ensureDeployed(config: Config) Error!void {
             "EXPECTED={s}; " ++
             "BIN_PATH={s}; " ++
             "BIN_LEN={d}; " ++
+            "DAEMON_PATTERN=\"[w]sl-pty-bridge --daemon --port {d}\"; " ++
             "CURRENT=$(cat \"$HASH_FILE\" 2>/dev/null); " ++
             "if [ \"$CURRENT\" = \"$EXPECTED\" ]; then " ++
             "  cat >/dev/null; " ++ // drain stdin (binary + terminfo)
@@ -549,7 +778,20 @@ pub fn ensureDeployed(config: Config) Error!void {
             "chmod +x \"$BIN_PATH.tmp\" && " ++
             "mv -f \"$BIN_PATH.tmp\" \"$BIN_PATH\" && " ++
             "echo \"$EXPECTED\" > \"$HASH_FILE\" && " ++
-            "pkill -f \"[w]sl-pty-bridge --daemon\" 2>/dev/null || true; " ++ // [w] trick avoids self-match
+            // Stop only this distro's daemon port. pkill is asynchronous, so
+            // wait for the listener process to disappear before returning.
+            "pkill -f \"$DAEMON_PATTERN\" 2>/dev/null || true; " ++
+            "i=0; while pgrep -f \"$DAEMON_PATTERN\" >/dev/null 2>&1 && [ \"$i\" -lt 40 ]; do " ++
+            "  sleep 0.05; i=$((i + 1)); " ++
+            "done; " ++
+            // The daemon has no graceful shutdown work. Force termination if
+            // SIGTERM did not release the listener within two seconds.
+            "if pgrep -f \"$DAEMON_PATTERN\" >/dev/null 2>&1; then " ++
+            "  pkill -9 -f \"$DAEMON_PATTERN\" 2>/dev/null || true; " ++
+            "  i=0; while pgrep -f \"$DAEMON_PATTERN\" >/dev/null 2>&1 && [ \"$i\" -lt 20 ]; do " ++
+            "    sleep 0.05; i=$((i + 1)); " ++
+            "  done; " ++
+            "fi; " ++
             // Install terminfo from remaining stdin
             "infocmp xterm-ghostty >/dev/null 2>&1 && {{ cat >/dev/null; exit 0; }}; " ++
             "if command -v tic >/dev/null 2>&1; then " ++
@@ -564,12 +806,13 @@ pub fn ensureDeployed(config: Config) Error!void {
             hash_str,
             BRIDGE_SHELL_PATH,
             embedded_bridge.len,
+            port,
         },
     ) catch return error.Unexpected;
 
     const cmd_line = writer.buffered();
 
-    var cmd_w_buf: [2048]u16 = undefined;
+    var cmd_w_buf: [4096]u16 = undefined;
     const cmd_w_len = std.unicode.utf8ToUtf16Le(&cmd_w_buf, cmd_line) catch
         return error.Unexpected;
     cmd_w_buf[cmd_w_len] = 0;
@@ -1083,15 +1326,71 @@ fn tryConnect(vm_id: GUID, service_guid: GUID) ?SOCKET {
     return sock;
 }
 
+fn connectControl(vm_id: GUID, service_guid: GUID, token: [32]u8) ?SOCKET {
+    const sock = tryConnect(vm_id, service_guid) orelse return null;
+    errdefer _ = closesocket(sock);
+
+    var timeout_ms: u32 = 2000;
+    const timeout_ptr: [*]const u8 = @ptrCast(&timeout_ms);
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, timeout_ptr, @sizeOf(u32)) == SOCKET_ERROR or
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, timeout_ptr, @sizeOf(u32)) == SOCKET_ERROR)
+    {
+        return null;
+    }
+
+    var request: [38]u8 = undefined;
+    @memcpy(request[0..5], "GWSL\x03");
+    request[5] = CONTROL_ROLE;
+    @memcpy(request[6..38], &token);
+    if (sendAll(sock, &request) != request.len) return null;
+
+    var response: [4]u8 = undefined;
+    if (recvExact(sock, &response) == null or !std.mem.eql(u8, &response, "OKC\x01")) {
+        return null;
+    }
+    return sock;
+}
+
+fn sendControlResize(sock: SOCKET, resize: PendingResize) bool {
+    var message: [35]u8 = undefined;
+    encodeControlResize(&message, resize);
+    return sendAll(sock, &message) == message.len;
+}
+
+fn encodeControlResize(message: *[35]u8, resize: PendingResize) void {
+    message[0] = CONTROL_RESIZE;
+    message[1] = 0;
+    message[2] = 32;
+    @memcpy(message[3..19], &resize.session_id);
+    writeU64Be(message[19..27], resize.serial);
+    writeU16Be(message[27..29], resize.cols);
+    writeU16Be(message[29..31], resize.rows);
+    writeU16Be(message[31..33], resize.xpixel);
+    writeU16Be(message[33..35], resize.ypixel);
+}
+
+fn writeU16Be(out: *[2]u8, value: u16) void {
+    out[0] = @intCast(value >> 8);
+    out[1] = @intCast(value & 0xFF);
+}
+
+fn writeU64Be(out: *[8]u8, value: u64) void {
+    inline for (0..8) |index| {
+        out[index] = @intCast(value >> @intCast((7 - index) * 8));
+    }
+}
+
 /// Send handshake and read response.
 fn doHandshake(sock: SOCKET, config: Config, token: [32]u8) Error!VsockBridge {
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
 
-    // Magic (v2)
-    const magic = "GWSL\x02";
+    // Magic (v3) and data-connection role.
+    const magic = "GWSL\x03";
     @memcpy(buf[pos..][0..magic.len], magic);
     pos += magic.len;
+    buf[pos] = 1;
+    pos += 1;
 
     // Authentication token (32 bytes)
     @memcpy(buf[pos..][0..32], &token);
@@ -1131,14 +1430,14 @@ fn doHandshake(sock: SOCKET, config: Config, token: [32]u8) Error!VsockBridge {
         return error.HandshakeFailed;
     }
 
-    // Read response: "OK\x01" + pty_id:u32be = 7 bytes
-    var resp: [7]u8 = undefined;
+    // Read response: "OK\x02" + pty_id:u32be + session_id = 23 bytes
+    var resp: [23]u8 = undefined;
     if (recvExact(sock, &resp) == null) {
         _ = closesocket(sock);
         return error.HandshakeFailed;
     }
 
-    if (resp[0] != 'O' or resp[1] != 'K' or resp[2] != 0x01) {
+    if (resp[0] != 'O' or resp[1] != 'K' or resp[2] != 0x02) {
         log.err("invalid handshake response", .{});
         _ = closesocket(sock);
         return error.HandshakeFailed;
@@ -1148,6 +1447,8 @@ fn doHandshake(sock: SOCKET, config: Config, token: [32]u8) Error!VsockBridge {
         @as(u32, resp[4]) << 16 |
         @as(u32, resp[5]) << 8 |
         @as(u32, resp[6]);
+    var session_id: [16]u8 = undefined;
+    @memcpy(&session_id, resp[7..23]);
 
     log.info("vsock connected, pty_id={}", .{pty_id});
 
@@ -1155,6 +1456,7 @@ fn doHandshake(sock: SOCKET, config: Config, token: [32]u8) Error!VsockBridge {
         .socket = sock,
         .size = config.size,
         .pty_id = pty_id,
+        .session_id = session_id,
     };
 }
 
@@ -1541,43 +1843,23 @@ test "portForDistro: deterministic" {
     try std.testing.expectEqual(p1, p2);
 }
 
-test "handshake encoding" {
-    var buf: [512]u8 = undefined;
-    var pos: usize = 0;
+test "control resize encoding" {
+    const session_id = [_]u8{0xA5} ** 16;
+    var message: [35]u8 = undefined;
+    encodeControlResize(&message, .{
+        .session_id = session_id,
+        .serial = 0x0102030405060708,
+        .cols = 120,
+        .rows = 40,
+        .xpixel = 1920,
+        .ypixel = 1080,
+    });
 
-    const magic_str = "GWSL\x01";
-    @memcpy(buf[pos..][0..magic_str.len], magic_str);
-    pos += magic_str.len;
-
-    buf[pos] = 0;
-    buf[pos + 1] = 80;
-    pos += 2;
-    buf[pos] = 0;
-    buf[pos + 1] = 24;
-    pos += 2;
-    buf[pos] = 0;
-    buf[pos + 1] = 0;
-    pos += 2;
-    buf[pos] = 0;
-    buf[pos + 1] = 0;
-    pos += 2;
-
-    buf[pos] = 0;
-    buf[pos + 1] = 8;
-    pos += 2;
-    @memcpy(buf[pos..][0..8], "/bin/zsh");
-    pos += 8;
-
-    buf[pos] = 0;
-    buf[pos + 1] = 0;
-    pos += 2;
-
-    try std.testing.expectEqualSlices(u8, "GWSL\x01", buf[0..5]);
-    try std.testing.expectEqual(@as(u8, 0), buf[5]);
-    try std.testing.expectEqual(@as(u8, 80), buf[6]);
-    try std.testing.expectEqual(@as(u8, 0), buf[7]);
-    try std.testing.expectEqual(@as(u8, 24), buf[8]);
-    try std.testing.expectEqual(@as(usize, 25), pos);
+    try std.testing.expectEqualSlices(u8, &.{ CONTROL_RESIZE, 0, 32 }, message[0..3]);
+    try std.testing.expectEqualSlices(u8, &session_id, message[3..19]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, message[19..27]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 120, 0, 40 }, message[27..31]);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 128, 4, 56 }, message[31..35]);
 }
 
 test "windowsToWslPath: drive letter" {

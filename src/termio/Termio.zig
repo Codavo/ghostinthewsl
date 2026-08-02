@@ -71,7 +71,7 @@ surface_mailbox: apprt.surface.Mailbox,
 /// The cached size info
 size: renderer.Size,
 
-/// Last grid size sent to the backend (resize APC). Tracked explicitly
+/// Last grid size sent to the backend. Tracked explicitly
 /// instead of deriving from self.size.grid() because the grid()
 /// computation goes through float arithmetic (screen_width / cell_width)
 /// which can produce inconsistent results across calls with identical
@@ -508,8 +508,8 @@ pub fn resize(
 ) (Allocator.Error || error{InvalidValue})!void {
     const grid_size = size.grid();
 
-    // Only send the resize APC to the backend when the grid actually
-    // changed. We compare against explicitly stored u16 values instead
+    // Only notify the backend when the terminal grid actually changed.
+    // We compare against explicitly stored u16 values instead
     // of self.size.grid() because the grid() computation goes through
     // float division which can produce inconsistent results.
     const cols: u16 = std.math.cast(u16, grid_size.columns) orelse 0;

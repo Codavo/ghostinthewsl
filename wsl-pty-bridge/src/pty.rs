@@ -108,7 +108,9 @@ impl PtyChild {
 
                 // Change working directory using libc::chdir (async-signal-safe).
                 if let Some(ref dir) = c_cwd {
-                    unsafe { libc::chdir(dir.as_ptr()); }
+                    unsafe {
+                        libc::chdir(dir.as_ptr());
+                    }
                 }
 
                 // Set environment using libc::setenv (avoids Rust's internal
@@ -128,7 +130,9 @@ impl PtyChild {
 
                 // If even /bin/sh fails, use _exit (not process::exit which
                 // runs atexit handlers — not async-signal-safe).
-                unsafe { libc::_exit(127); }
+                unsafe {
+                    libc::_exit(127);
+                }
             }
             ForkResult::Parent { child } => {
                 // Drop slave fd in parent — we only use the master side.
@@ -143,7 +147,13 @@ impl PtyChild {
     }
 
     /// Resize the PTY.
-    pub fn resize(&self, cols: u16, rows: u16, xpixel: u16, ypixel: u16) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn resize(
+        &self,
+        cols: u16,
+        rows: u16,
+        xpixel: u16,
+        ypixel: u16,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         set_winsize(self.master.as_raw_fd(), cols, rows, xpixel, ypixel)
     }
 
@@ -190,7 +200,13 @@ impl PtyChild {
 }
 
 /// Set the window size on a PTY fd.
-fn set_winsize(fd: RawFd, cols: u16, rows: u16, xpixel: u16, ypixel: u16) -> Result<(), Box<dyn std::error::Error>> {
+fn set_winsize(
+    fd: RawFd,
+    cols: u16,
+    rows: u16,
+    xpixel: u16,
+    ypixel: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let ws = libc::winsize {
         ws_col: cols,
         ws_row: rows,
