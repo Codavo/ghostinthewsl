@@ -134,7 +134,7 @@ _ghostty_executing=""
 _ghostty_last_reported_cwd=""
 
 function __ghostty_precmd() {
-  local ret="$?"
+  local ret="${1:-$?}"
   if test "$_ghostty_executing" != "0"; then
     _GHOSTTY_SAVE_PS1="$PS1"
     _GHOSTTY_SAVE_PS2="$PS2"
