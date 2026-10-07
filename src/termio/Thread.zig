@@ -298,7 +298,7 @@ fn drainMailbox(
 
     // If we're draining, we just drain the mailbox and return.
     if (self.flags.drain) {
-        while (mailbox.pop(global.io())) |_| {}
+        while (mailbox.pop(global.io())) |msg| msg.deinit();
         return;
     }
 
@@ -339,6 +339,14 @@ fn drainMailbox(
             .resize => |v| self.handleResize(cb, v),
 
             // These don't change visual terminal state:
+            .kitty_clipboard_grant_read => |v| {
+                defer v.alloc.free(v.pw);
+                try io.kittyClipboardGrant(v.pw, .read);
+            },
+            .kitty_clipboard_grant_write => |v| {
+                defer v.alloc.free(v.pw);
+                try io.kittyClipboardGrant(v.pw, .write);
+            },
             .write_small => |v| try io.queueWrite(
                 data,
                 v.data[0..v.len],

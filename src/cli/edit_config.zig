@@ -99,63 +99,37 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
         return 0;
     }
 
-    // Get our editor
-    const editor = env: {
-        // VISUAL vs. EDITOR: https://unix.stackexchange.com/questions/4859/visual-vs-editor-what-s-the-difference
-        if (try global.environ().containsUnempty(alloc, "VISUAL")) {
-            break :env try global.environ().getAlloc(alloc, "VISUAL");
+    const command = internal_os.getConfigEditCommand(alloc, path, .{ .default_editor = .failure }) catch |err| {
+        switch (err) {
+            error.NoEditorConfigured => {
+                try stderr.print(
+                    \\The $EDITOR or $VISUAL environment variable is not set or is empty.
+                    \\This environment variable is required to edit the Ghostty configuration
+                    \\via this CLI command.
+                    \\
+                    \\Please set the environment variable to your preferred terminal
+                    \\text editor and try again.
+                    \\
+                    \\If you prefer to edit the configuration file another way,
+                    \\you can find the configuration file at the following path:
+                    \\
+                    \\
+                ,
+                    .{},
+                );
+
+                // Output the path using the OSC8 sequence so that it is linked.
+                try stderr.print(
+                    "\x1b]8;;file://{s}\x1b\\{s}\x1b]8;;\x1b\\\n",
+                    .{ path, path },
+                );
+
+                return 1;
+            },
+            error.WriteFailed,
+            error.OutOfMemory,
+            => |e| return e,
         }
-
-        if (try global.environ().containsUnempty(alloc, "EDITOR")) {
-            break :env try global.environ().getAlloc(alloc, "EDITOR");
-        }
-
-        break :env "";
-    };
-    defer alloc.free(editor);
-
-    // If we don't have `$EDITOR` set then we can't do anything
-    // but we can still print a helpful message.
-    if (editor.len == 0) {
-        try stderr.print(
-            \\The $EDITOR or $VISUAL environment variable is not set or is empty.
-            \\This environment variable is required to edit the Ghostty configuration
-            \\via this CLI command.
-            \\
-            \\Please set the environment variable to your preferred terminal
-            \\text editor and try again.
-            \\
-            \\If you prefer to edit the configuration file another way,
-            \\you can find the configuration file at the following path:
-            \\
-            \\
-        ,
-            .{},
-        );
-
-        // Output the path using the OSC8 sequence so that it is linked.
-        try stderr.print(
-            "\x1b]8;;file://{s}\x1b\\{s}\x1b]8;;\x1b\\\n",
-            .{ path, path },
-        );
-
-        return 1;
-    }
-
-    // Build the command
-    const command = command: {
-        var buffer: std.Io.Writer.Allocating = .init(alloc);
-        defer buffer.deinit();
-        const writer = &buffer.writer;
-        try writer.writeAll(editor);
-        try writer.writeByte(' ');
-        {
-            var sh: internal_os.ShellEscapeWriter = .init(writer);
-            try sh.writer.writeAll(path);
-            try sh.writer.flush();
-        }
-        try writer.flush();
-        break :command try buffer.toOwnedSliceSentinel(0);
     };
     defer alloc.free(command);
 
@@ -170,16 +144,23 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
 
     // If we reached this point then exec failed.
     try stderr.print(
-        \\Failed to execute the editor (E{s}).
+        \\Failed to execute the editor (E{t}).
         \\
         \\This is usually due to the executable path not existing, invalid
         \\permissions, or the shell environment not being set up
         \\correctly.
         \\
-        \\Editor: {s}
-        \\Path: {s}
+        \\Command: {s}
         \\
-    , .{ @tagName(err), editor, path });
+    , .{
+        err,
+        command,
+    });
+    // Output the path using the OSC8 sequence so that it is linked.
+    try stderr.print(
+        "Path: \x1b]8;;file://{s}\x1b\\{s}\x1b]8;;\x1b\\\n",
+        .{ path, path },
+    );
     return 1;
 }
 

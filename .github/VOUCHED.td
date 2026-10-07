@@ -23,8 +23,10 @@
 00jciv00
 04cb
 0xdvc
+12ya
 -4rh1t3ct0r7
 52dyd
+a-lang
 aalhendi
 aaron-ang
 abdurrahmanski
@@ -38,16 +40,19 @@ akimiojr
 alaasdk
 alanmoyano
 alaviss
+alex19ep
 alexbathome
 alexfeijoo44
 alexjuca
 alosarjos
 amadeus
+and-rs
 andrejdaskalov
 anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+arneshbanerjee
 arvin7liu
 athaapa
 atomk
@@ -57,6 +62,7 @@ b0uks
 b1nar10
 balazs-szucs
 barutsrb
+basteez
 bch
 bennettp123
 benodiwal
@@ -69,6 +75,7 @@ bo2themax
 bousii
 brentschroeter
 brianc442
+by-nelson
 c0x0o
 carldaws
 carlvillads
@@ -88,14 +95,20 @@ damyanbogoev
 danneu
 danulqua
 dariogriffo
+dave92082
 davidsanchez222
 deblasis
 dervedro
 devsunb
 diaaeddin
+-didouougha slingshotting LLM output
+diego-moment
+diegoarmstrong
 dkinzler
 dmehala
+dmunozv04
 dobbylee
+dolzenko
 doprz
 douglance
 douglas
@@ -104,6 +117,7 @@ drepper
 dzhlobo
 ekaterinepapava
 elias8
+elitex45
 -enkr1
 enzowilliam
 ephemera
@@ -116,33 +130,41 @@ exlee
 -f1813483-netizen
 fallintoplace
 faukah
+figelwump
 filip7
 flou
 fornwall
 francescarpi
 fru1tworld
+gadgetman6
 gagbo
 ghokun
 gmile
 gordonbondon
+gotenksin
 gpanders
 guilhermetk
+-guysoft LLM communication (likely automated)
 h3nock
 hakonhagland
 halosatrio
 heaths
 heddxh heddxh
+helium777
 -highimpact-dev Disrespectful AI user
 hlcfan
 hqnna
 hulet
 i999rri
+ibaios
 icodesign
 illiakrauchanka
+j-c-m
 j0hnm4r5
 jacobsandlund
 jake-stewart
-jamesarch
+jakeriksen
+-jamesarch Bad AI etiquette
 jamylak
 jarred-sumner
 jcollie
@@ -156,6 +178,7 @@ josephmart
 jparise
 juniqlim
 justonia
+jzillmann
 karesansui-u
 kataokatsuki
 kawarimidoll
@@ -165,10 +188,12 @@ khipp
 kierancanter
 kirwiisp
 kjvdven
+kleshzz
 kloneets
 knu
 -kody-w
 koranir
+korikhin
 kostich
 kristina8888
 kristofersoler
@@ -179,6 +204,7 @@ lepips
 liby
 linustalacko
 lonsagisawa
+lotheac
 louisunlimited
 luisnquin
 lynicis
@@ -192,6 +218,7 @@ marrocco-simone
 masterflitzer
 matkotiric
 mattn
+mgsloan
 micaeljarniac
 michielvk
 miguelelgallo
@@ -215,6 +242,7 @@ mustafa0x
 nagato-yuzuru
 natesmyth
 neo773
+neoto
 neurosnap
 nicholas-ochoa
 nicosuave
@@ -226,6 +254,7 @@ nolinmcfarland
 nouritsu
 nwehg
 ocean6954
+ollioddi
 oshdubh
 otomn
 paaloeye
@@ -233,6 +262,7 @@ pan93412
 pangoraw
 pauley-unsaturated
 pearkes
+pedronaugusto
 peilingjiang
 peterdavehello
 philocalyst
@@ -242,7 +272,10 @@ pluiedev
 pouwerkerk
 poweruser64
 prakhar54-byte
+preiter93
+prihlop
 priyans-hu
+pssalman
 puzza007
 qappell
 quinnypig
@@ -255,6 +288,7 @@ rgehan
 rhodes-b
 rightaditya
 rjwittams
+rkoten
 rmengelbrecht
 rmunn
 rockorager
@@ -270,27 +304,40 @@ sanjj1
 secrus
 seruman
 seyoungjeong
+sghng
+shorsher
 silveirapf
 simonbcn
+slowdub
 slsrepo
+steven-tk
 sunshine-syz
+svector-anu
 svmhdvn
+tacherasasi
+-tangivis
 tasselx
 tbrundige
 tdgroot
 tdslot
 thirstycrow
+-thomas-trijindev No human in the loop
 thoutbeckers
 ticclick
 tnagatomi
+tothedarktowercame
 trag1c
 tristan957
+tsacha
+tuananh
 turbolent
 tweedbeetle
 uhojin
 unphased
+unsaltedscholar
 uzaaft
 vancluever
+vasilmytsyk
 vaughanandrews
 -vectorpeak Stupid bot cosplaying as a maintainer
 vegerot
@@ -304,6 +351,8 @@ yak3d
 yamshta
 ydah
 -zaviro
+zenangst
 zenyr
 zeshi09
+zlitus
 zubb

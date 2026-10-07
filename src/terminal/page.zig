@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("terminal_options");
+const lib = @import("../lib/main.zig");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const assert = @import("../quirks.zig").inlineAssert;
@@ -23,7 +24,6 @@ const BitmapAllocator = @import("bitmap_allocator.zig").BitmapAllocator;
 const hash_map = @import("hash_map.zig");
 const AutoOffsetHashMap = hash_map.AutoOffsetHashMap;
 const alignForward = std.mem.alignForward;
-const alignBackward = std.mem.alignBackward;
 
 const log = std.log.scoped(.page);
 
@@ -89,6 +89,7 @@ const AllocWindows = struct {
 /// for alignment.
 const grapheme_chunk_len = 4;
 const grapheme_chunk = grapheme_chunk_len * @sizeOf(u21);
+pub const grapheme_max_len = 64;
 const GraphemeAlloc = BitmapAllocator(grapheme_chunk);
 const grapheme_count_default = GraphemeAlloc.bitmap_bit_size;
 pub const grapheme_bytes_default = grapheme_count_default * grapheme_chunk;
@@ -125,6 +126,19 @@ const hyperlink_count_default = 4;
 const hyperlink_bytes_default = hyperlink_count_default * @sizeOf(hyperlink.Set.Item);
 const hyperlink_cell_multiplier = 16;
 
+/// The alignment of the start of a page's cell array. Align it to a cache
+/// line so that row cells always start on a cache line. This avoids
+/// a scenario where cells in every row always start mid-cache line and
+/// straddle an extra.
+const cells_align: usize = @max(
+    @alignOf(Cell),
+    @min(
+        std.atomic.cache_line,
+        // Cap it at page size for freestanding targets.
+        std.heap.page_size_min,
+    ),
+);
+
 /// A page represents a specific section of terminal screen. The primary
 /// idea of a page is that it is a fully self-contained unit that can be
 /// serialized, copied, etc. as a convenient way to represent a section
@@ -146,18 +160,9 @@ pub const Page = struct {
         // alignment is always divisible by this.
         assert(std.heap.page_size_min % @max(
             @alignOf(Row),
-            @alignOf(Cell),
-            StyleSet.base_align.toByteUnits(),
+            cells_align,
+            MetaLayout.alignment,
         ) == 0);
-
-        // The PageList memory pool requires that initBuf overwrites at
-        // least the first pointer-size bytes of the backing buffer:
-        // std.heap.MemoryPool stores its free list node there when a
-        // page buffer is returned to it, and pool reuse skips zeroing
-        // in release builds. This holds because the rows array is at
-        // offset 0 (see layout), a page always has at least one row,
-        // and initBuf fully rewrites every row.
-        assert(@sizeOf(Row) >= @sizeOf(usize));
     }
 
     /// The backing memory for the page. A page is always made up of a
@@ -249,13 +254,16 @@ pub const Page = struct {
 
     /// Initialize a new page using the given backing memory.
     /// It is up to the caller to not call deinit on these pages.
+    ///
+    /// The backing memory must be zero-filled. A page treats zero as the
+    /// empty state everywhere: cells are blank when zero, and every
+    /// metadata member initializes from zeroed memory without writing
+    /// anything. Only the row headers are written, so the OS pages behind
+    /// everything else stay untouched until first use.
     pub inline fn initBuf(buf: OffsetBuf, l: Layout) Page {
         const cap = l.capacity;
 
-        // A page must always have at least one row. Aside from being
-        // useless otherwise, the row initialization below must always
-        // overwrite the start of the buffer for pool reuse. See the
-        // comptime assert at the top of Page.
+        // A page must always have at least one row.
         assert(cap.rows > 0);
 
         const rows = buf.member(Row, l.rows_start);
@@ -277,28 +285,28 @@ pub const Page = struct {
             .memory = @alignCast(buf.start()[0..l.total_size]),
             .rows = rows,
             .cells = cells,
-            .styles = StyleSet.init(
+            .styles = StyleSet.initAssumeZeroed(
                 buf.add(l.styles_start),
                 l.styles_layout,
                 .{},
             ),
-            .string_alloc = .init(
+            .string_alloc = .initAssumeZeroed(
                 buf.add(l.string_alloc_start),
                 l.string_alloc_layout,
             ),
-            .grapheme_alloc = .init(
+            .grapheme_alloc = .initAssumeZeroed(
                 buf.add(l.grapheme_alloc_start),
                 l.grapheme_alloc_layout,
             ),
-            .grapheme_map = .init(
+            .grapheme_map = .initAssumeZeroed(
                 buf.add(l.grapheme_map_start),
                 l.grapheme_map_layout,
             ),
-            .hyperlink_map = .init(
+            .hyperlink_map = .initAssumeZeroed(
                 buf.add(l.hyperlink_map_start),
                 l.hyperlink_map_layout,
             ),
-            .hyperlink_set = .init(
+            .hyperlink_set = .initAssumeZeroed(
                 buf.add(l.hyperlink_set_start),
                 l.hyperlink_set_layout,
                 .{},
@@ -1289,6 +1297,18 @@ pub const Page = struct {
         @memset(@as([]u64, @ptrCast(cells)), 0);
     }
 
+    /// Reset the given row to the default state: all cells zeroed and
+    /// all row metadata reset, as if the row was never used. This
+    /// reclaims memory used by graphemes, styles, etc. like clearCells.
+    ///
+    /// This must be used instead of clearCells whenever a row's storage
+    /// is recycled. Clearing the cells alone is not enough because row
+    /// metadata such as the wrap state and semantic prompt remain.
+    pub inline fn resetRow(self: *Page, row: *Row) void {
+        self.clearCells(row, 0, self.size.cols);
+        row.reset();
+    }
+
     /// Returns the hyperlink ID for the given cell.
     pub inline fn lookupHyperlink(self: *const Page, cell: *const Cell) ?hyperlink.Id {
         const cell_offset = getOffset(Cell, self.memory, cell);
@@ -1502,7 +1522,8 @@ pub const Page = struct {
     }
 
     /// Set the graphemes for the given cell. This asserts that the cell
-    /// has no graphemes set, and only contains a single codepoint.
+    /// has no graphemes set, and only contains a single codepoint. Input
+    /// beyond grapheme_max_len is ignored.
     pub inline fn setGraphemes(
         self: *Page,
         row: *Row,
@@ -1516,14 +1537,15 @@ pub const Page = struct {
 
         const cell_offset = getOffset(Cell, self.memory, cell);
         var map = self.grapheme_map.map(self.memory);
+        const stored_cps = cps[0..@min(cps.len, grapheme_max_len)];
 
-        const slice = self.grapheme_alloc.alloc(u21, self.memory, cps.len) catch |e| {
+        const slice = self.grapheme_alloc.alloc(u21, self.memory, stored_cps.len) catch |e| {
             comptime assert(@TypeOf(e) == error{OutOfMemory});
             // The grapheme alloc capacity needs to be increased.
             return error.GraphemeAllocOutOfMemory;
         };
         errdefer self.grapheme_alloc.free(self.memory, slice);
-        @memcpy(slice, cps);
+        @memcpy(slice, stored_cps);
 
         map.putNoClobber(cell_offset, .{
             .offset = getOffset(u21, self.memory, @ptrCast(slice.ptr)),
@@ -1541,7 +1563,8 @@ pub const Page = struct {
         return;
     }
 
-    /// Append a codepoint to the given cell as a grapheme.
+    /// Append a codepoint to the given cell as a grapheme. Once the cell has
+    /// grapheme_max_len suffix codepoints, additional codepoints are ignored.
     pub fn appendGrapheme(self: *Page, row: *Row, cell: *Cell, cp: u21) Allocator.Error!void {
         defer self.assertIntegrity();
 
@@ -1574,6 +1597,10 @@ pub const Page = struct {
         assert(row.grapheme);
 
         const slice = map.getPtr(cell_offset).?;
+
+        // Terminal input is untrusted. In addition to bounding memory, this
+        // prevents repeated chunk growth and copying from becoming quadratic.
+        if (slice.len >= grapheme_max_len) return;
 
         // If our slice len doesn't divide evenly by the grapheme chunk
         // length then we can utilize the additional chunk space.
@@ -1721,61 +1748,32 @@ pub const Page = struct {
 
     /// The memory layout for a page given a desired minimum cols
     /// and rows size.
+    ///
+    /// The backing memory is laid out as the row headers, the cell
+    /// array, and then the metadata block (see `MetaLayout`):
+    ///
+    ///   [rows][cells][styles, graphemes, strings, hyperlinks]
+    ///
+    /// Row headers always start at offset zero. The cell array is aligned
+    /// to a cache line (see `cells_align`). Initializing a page writes only
+    /// the row headers: the cells and every metadata member treat zero as
+    /// their empty state, so the OS pages behind everything past the row
+    /// headers stay untouched until something is stored in them.
     pub inline fn layout(cap: Capacity) Layout {
-        const rows_count: usize = @intCast(cap.rows);
+        const meta: MetaLayout = .init(cap);
 
-        // The rows array must stay at offset 0: the PageList memory
-        // pool relies on initBuf overwriting the first bytes of a
-        // reused page buffer, which hold the pool's free list node.
-        // See the comptime assert at the top of Page.
+        const rows_count: usize = @intCast(cap.rows);
         const rows_start = 0;
         const rows_end: usize = rows_start + (rows_count * @sizeOf(Row));
 
         const cells_count: usize = @as(usize, cap.cols) * @as(usize, cap.rows);
-        const cells_start = alignForward(usize, rows_end, @alignOf(Cell));
+        const cells_start = alignForward(usize, rows_end, cells_align);
         const cells_end = cells_start + (cells_count * @sizeOf(Cell));
 
-        const styles_layout: StyleSet.Layout = .init(cap.styles);
-        const styles_start = alignForward(usize, cells_end, StyleSet.base_align.toByteUnits());
-        const styles_end = styles_start + styles_layout.total_size;
+        const meta_start = alignForward(usize, cells_end, MetaLayout.alignment);
+        const meta_end = meta_start + meta.total_size;
 
-        const grapheme_alloc_layout = GraphemeAlloc.layout(cap.grapheme_bytes);
-        const grapheme_alloc_start = alignForward(usize, styles_end, GraphemeAlloc.base_align.toByteUnits());
-        const grapheme_alloc_end = grapheme_alloc_start + grapheme_alloc_layout.total_size;
-
-        const grapheme_count: usize = count: {
-            if (cap.grapheme_bytes == 0) break :count 0;
-            // Use divCeil to match GraphemeAlloc.layout() which uses alignForward,
-            // ensuring grapheme_map has capacity when grapheme_alloc has chunks.
-            const base = std.math.divCeil(usize, cap.grapheme_bytes, grapheme_chunk) catch unreachable;
-            break :count std.math.ceilPowerOfTwo(usize, base) catch unreachable;
-        };
-        const grapheme_map_layout = GraphemeMap.layout(@intCast(grapheme_count));
-        const grapheme_map_start = alignForward(usize, grapheme_alloc_end, GraphemeMap.base_align.toByteUnits());
-        const grapheme_map_end = grapheme_map_start + grapheme_map_layout.total_size;
-
-        const string_layout = StringAlloc.layout(cap.string_bytes);
-        const string_start = alignForward(usize, grapheme_map_end, StringAlloc.base_align.toByteUnits());
-        const string_end = string_start + string_layout.total_size;
-
-        const hyperlink_count = @divFloor(cap.hyperlink_bytes, @sizeOf(hyperlink.Set.Item));
-        const hyperlink_set_layout: hyperlink.Set.Layout = .init(@intCast(hyperlink_count));
-        const hyperlink_set_start = alignForward(usize, string_end, hyperlink.Set.base_align.toByteUnits());
-        const hyperlink_set_end = hyperlink_set_start + hyperlink_set_layout.total_size;
-
-        const hyperlink_map_count: u32 = count: {
-            if (hyperlink_count == 0) break :count 0;
-            const mult = std.math.cast(
-                u32,
-                hyperlink_count * hyperlink_cell_multiplier,
-            ) orelse break :count std.math.maxInt(u32);
-            break :count mult;
-        };
-        const hyperlink_map_layout = hyperlink.Map.layout(hyperlink_map_count);
-        const hyperlink_map_start = alignForward(usize, hyperlink_set_end, hyperlink.Map.base_align.toByteUnits());
-        const hyperlink_map_end = hyperlink_map_start + hyperlink_map_layout.total_size;
-
-        const total_size = alignForward(usize, hyperlink_map_end, std.heap.page_size_min);
+        const total_size = alignForward(usize, meta_end, std.heap.page_size_min);
 
         return .{
             .total_size = total_size,
@@ -1783,21 +1781,111 @@ pub const Page = struct {
             .rows_size = rows_end - rows_start,
             .cells_start = cells_start,
             .cells_size = cells_end - cells_start,
-            .styles_start = styles_start,
-            .styles_layout = styles_layout,
-            .grapheme_alloc_start = grapheme_alloc_start,
-            .grapheme_alloc_layout = grapheme_alloc_layout,
-            .grapheme_map_start = grapheme_map_start,
-            .grapheme_map_layout = grapheme_map_layout,
-            .string_alloc_start = string_start,
-            .string_alloc_layout = string_layout,
-            .hyperlink_map_start = hyperlink_map_start,
-            .hyperlink_map_layout = hyperlink_map_layout,
-            .hyperlink_set_start = hyperlink_set_start,
-            .hyperlink_set_layout = hyperlink_set_layout,
+            .styles_start = meta_start + meta.styles_start,
+            .styles_layout = meta.styles_layout,
+            .grapheme_alloc_start = meta_start + meta.grapheme_alloc_start,
+            .grapheme_alloc_layout = meta.grapheme_alloc_layout,
+            .grapheme_map_start = meta_start + meta.grapheme_map_start,
+            .grapheme_map_layout = meta.grapheme_map_layout,
+            .string_alloc_start = meta_start + meta.string_alloc_start,
+            .string_alloc_layout = meta.string_alloc_layout,
+            .hyperlink_map_start = meta_start + meta.hyperlink_map_start,
+            .hyperlink_map_layout = meta.hyperlink_map_layout,
+            .hyperlink_set_start = meta_start + meta.hyperlink_set_start,
+            .hyperlink_set_layout = meta.hyperlink_set_layout,
             .capacity = cap,
         };
     }
+
+    /// Meta is everything that isn't the grid, such as styles, graphemes,
+    /// etc. `layout` places it directly after the grid.
+    pub const MetaLayout = struct {
+        /// The size of the block including internal alignment padding.
+        total_size: usize,
+        styles_start: usize,
+        styles_layout: StyleSet.Layout,
+        grapheme_alloc_start: usize,
+        grapheme_alloc_layout: GraphemeAlloc.Layout,
+        grapheme_map_start: usize,
+        grapheme_map_layout: GraphemeMap.Layout,
+        string_alloc_start: usize,
+        string_alloc_layout: StringAlloc.Layout,
+        hyperlink_set_start: usize,
+        hyperlink_set_layout: hyperlink.Set.Layout,
+        hyperlink_map_start: usize,
+        hyperlink_map_layout: hyperlink.Map.Layout,
+
+        /// The alignment of the block's start: the largest alignment any
+        /// member requires, so that the member offsets above don't depend
+        /// on where the block is placed.
+        pub const alignment = @max(
+            StyleSet.base_align.toByteUnits(),
+            GraphemeAlloc.base_align.toByteUnits(),
+            GraphemeMap.base_align.toByteUnits(),
+            StringAlloc.base_align.toByteUnits(),
+            hyperlink.Set.base_align.toByteUnits(),
+            hyperlink.Map.base_align.toByteUnits(),
+        );
+
+        /// Compute the layout of the block for the given capacity.
+        pub fn init(cap: Capacity) MetaLayout {
+            const styles_layout: StyleSet.Layout = .init(cap.styles);
+            const styles_start = 0;
+            const styles_end = styles_start + styles_layout.total_size;
+
+            const grapheme_alloc_layout = GraphemeAlloc.layout(cap.grapheme_bytes);
+            const grapheme_alloc_start = alignForward(usize, styles_end, GraphemeAlloc.base_align.toByteUnits());
+            const grapheme_alloc_end = grapheme_alloc_start + grapheme_alloc_layout.total_size;
+
+            const grapheme_count: usize = count: {
+                if (cap.grapheme_bytes == 0) break :count 0;
+                // Use divCeil to match GraphemeAlloc.layout() which uses alignForward,
+                // ensuring grapheme_map has capacity when grapheme_alloc has chunks.
+                const base = std.math.divCeil(usize, cap.grapheme_bytes, grapheme_chunk) catch unreachable;
+                break :count std.math.ceilPowerOfTwo(usize, base) catch unreachable;
+            };
+            const grapheme_map_layout = GraphemeMap.layout(@intCast(grapheme_count));
+            const grapheme_map_start = alignForward(usize, grapheme_alloc_end, GraphemeMap.base_align.toByteUnits());
+            const grapheme_map_end = grapheme_map_start + grapheme_map_layout.total_size;
+
+            const string_layout = StringAlloc.layout(cap.string_bytes);
+            const string_start = alignForward(usize, grapheme_map_end, StringAlloc.base_align.toByteUnits());
+            const string_end = string_start + string_layout.total_size;
+
+            const hyperlink_count = @divFloor(cap.hyperlink_bytes, @sizeOf(hyperlink.Set.Item));
+            const hyperlink_set_layout: hyperlink.Set.Layout = .init(@intCast(hyperlink_count));
+            const hyperlink_set_start = alignForward(usize, string_end, hyperlink.Set.base_align.toByteUnits());
+            const hyperlink_set_end = hyperlink_set_start + hyperlink_set_layout.total_size;
+
+            const hyperlink_map_count: u32 = count: {
+                if (hyperlink_count == 0) break :count 0;
+                const mult = std.math.cast(
+                    u32,
+                    hyperlink_count * hyperlink_cell_multiplier,
+                ) orelse break :count std.math.maxInt(u32);
+                break :count mult;
+            };
+            const hyperlink_map_layout = hyperlink.Map.layout(hyperlink_map_count);
+            const hyperlink_map_start = alignForward(usize, hyperlink_set_end, hyperlink.Map.base_align.toByteUnits());
+            const hyperlink_map_end = hyperlink_map_start + hyperlink_map_layout.total_size;
+
+            return .{
+                .total_size = hyperlink_map_end,
+                .styles_start = styles_start,
+                .styles_layout = styles_layout,
+                .grapheme_alloc_start = grapheme_alloc_start,
+                .grapheme_alloc_layout = grapheme_alloc_layout,
+                .grapheme_map_start = grapheme_map_start,
+                .grapheme_map_layout = grapheme_map_layout,
+                .string_alloc_start = string_start,
+                .string_alloc_layout = string_layout,
+                .hyperlink_set_start = hyperlink_set_start,
+                .hyperlink_set_layout = hyperlink_set_layout,
+                .hyperlink_map_start = hyperlink_map_start,
+                .hyperlink_map_layout = hyperlink_map_layout,
+            };
+        }
+    };
 };
 
 /// The standard capacity for a page that doesn't have special
@@ -1859,15 +1947,16 @@ pub const Capacity = struct {
     /// the amount of memory the original capacity will take. If you modify
     /// the original capacity to add rows, then you can fit more columns.
     pub fn maxCols(self: Capacity) ?size.CellCountInt {
-        const available_bits = self.availableBitsForGrid();
+        const available = self.availableBytesForGrid();
 
-        // If we can't even fit the row metadata, return null
-        if (available_bits <= @bitSizeOf(Row)) return null;
+        // A single row's header occupies a whole cell-aligned region
+        // ahead of the cells. If we can't even fit that, return null.
+        const row_region = alignForward(usize, @sizeOf(Row), cells_align);
+        if (available <= row_region) return null;
 
         // We do the math of how many columns we can fit in the remaining
-        // bits ignoring the metadata of a row.
-        const remaining_bits = available_bits - @bitSizeOf(Row);
-        const max_cols = remaining_bits / @bitSizeOf(Cell);
+        // bytes ignoring the metadata of a row.
+        const max_cols = (available - row_region) / @sizeOf(Cell);
 
         // Clamp to CellCountInt max
         return @min(std.math.maxInt(size.CellCountInt), max_cols);
@@ -1881,51 +1970,44 @@ pub const Capacity = struct {
     pub fn adjust(self: Capacity, req: Adjustment) Allocator.Error!Capacity {
         var adjusted = self;
         if (req.cols) |cols| {
-            const available_bits = self.availableBitsForGrid();
+            const total_size = Page.layout(self).total_size;
+            const available = self.availableBytesForGrid();
 
             // The size per row is:
             //   - The row metadata itself
             //   - The cells per row (n=cols)
-            const bits_per_row: usize = @bitSizeOf(Row) + @bitSizeOf(Cell) * @as(usize, @intCast(cols));
-            const new_rows: usize = @divFloor(available_bits, bits_per_row);
+            const bytes_per_row: usize = @sizeOf(Row) + @sizeOf(Cell) * @as(usize, @intCast(cols));
+            var new_rows: usize = @divFloor(available, bytes_per_row);
+
+            // The cell array is aligned to a cache line, so the padding
+            // between the row headers and the cells depends on the row
+            // count. Trim rows until the layout fits the original size.
+            // The padding is less than a cache line so this takes a
+            // handful of iterations at most.
+            adjusted.cols = cols;
+            while (new_rows > 0) : (new_rows -= 1) {
+                adjusted.rows = @intCast(new_rows);
+                if (Page.layout(adjusted).total_size <= total_size) break;
+            }
 
             // If our rows go to zero then we can't fit any row metadata
             // for the desired number of columns.
             if (new_rows == 0) return error.OutOfMemory;
-
-            adjusted.cols = cols;
-            adjusted.rows = @intCast(new_rows);
         }
 
         return adjusted;
     }
 
-    /// Computes the number of bits available for rows and cells in the page.
-    ///
-    /// This is done by laying out the "meta" members (styles, graphemes,
-    /// hyperlinks, strings) from the end of the page and finding where they
-    /// start, which gives us the space available for rows and cells.
-    fn availableBitsForGrid(self: Capacity) usize {
-        // The math below only works if there is no alignment gap between
-        // the end of the rows array and the start of the cells array.
-        //
-        // To guarantee this, we assert that Row's size is a multiple of
-        // Cell's alignment, so that any length array of Rows will end on
-        // a valid alignment for the start of the Cell array.
-        assert(@sizeOf(Row) % @alignOf(Cell) == 0);
+    /// Computes the number of bytes available for the row headers and
+    /// cells in the page: the page size minus the metadata block.
+    fn availableBytesForGrid(self: Capacity) usize {
+        comptime {
+            assert(cells_align % Page.MetaLayout.alignment == 0);
+            assert(@sizeOf(Cell) % Page.MetaLayout.alignment == 0);
+        }
 
         const l = Page.layout(self);
-
-        // Layout meta members from the end to find styles_start
-        const hyperlink_map_start = alignBackward(usize, l.total_size - l.hyperlink_map_layout.total_size, hyperlink.Map.base_align.toByteUnits());
-        const hyperlink_set_start = alignBackward(usize, hyperlink_map_start - l.hyperlink_set_layout.total_size, hyperlink.Set.base_align.toByteUnits());
-        const string_alloc_start = alignBackward(usize, hyperlink_set_start - l.string_alloc_layout.total_size, StringAlloc.base_align.toByteUnits());
-        const grapheme_map_start = alignBackward(usize, string_alloc_start - l.grapheme_map_layout.total_size, GraphemeMap.base_align.toByteUnits());
-        const grapheme_alloc_start = alignBackward(usize, grapheme_map_start - l.grapheme_alloc_layout.total_size, GraphemeAlloc.base_align.toByteUnits());
-        const styles_start = alignBackward(usize, grapheme_alloc_start - l.styles_layout.total_size, StyleSet.base_align.toByteUnits());
-
-        // Multiply by 8 to convert bytes to bits
-        return styles_start * 8;
+        return l.total_size - Page.MetaLayout.init(self).total_size;
     }
 };
 
@@ -2032,6 +2114,26 @@ pub const Row = packed struct(u64) {
         // Ordered on purpose for likelihood.
         return self.styled or self.hyperlink or self.grapheme;
     }
+
+    /// Reset all row metadata to the default state, preserving only
+    /// the cells offset, and mark the row dirty. This is a single
+    /// 8-byte store.
+    ///
+    /// This must be applied to any row whose storage is recycled as a
+    /// blank row or retired into unused page capacity, in addition to
+    /// clearing its cells (in either order; this doesn't touch cell
+    /// memory). See Page.resetRow, which does both, for details. This
+    /// exists separately for callers that clear the cells in a
+    /// specialized way (e.g. filling with a background-colored blank
+    /// cell rather than zeroing).
+    ///
+    /// Asserts that the row has no managed memory: releasing that is
+    /// the cell-clearing side's job and must happen while the flags
+    /// are still accurate.
+    pub inline fn reset(self: *Row) void {
+        assert(!self.managedMemory());
+        self.* = .{ .cells = self.cells, .dirty = true };
+    }
 };
 
 /// A cell represents a single terminal grid cell.
@@ -2136,6 +2238,51 @@ pub const Cell = packed struct(u64) {
         prompt = 2,
     };
 
+    /// Metadata for the C representation. All physical bit offsets and
+    /// widths are reflected from Cell.
+    pub const CLayout = lib.Packed(Cell, .{ .fields = .{
+        .content_tag = .{ .type_name = "GhosttyCellContentTag" },
+        .content = .{ .encoding = .{ .tagged_union = lib.PackedTaggedUnion(
+            Cell,
+            .content,
+            .content_tag,
+            .{ .arms = .{
+                .codepoint = .{ .codepoint = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "codepoint"),
+                    .{ .fields = .{
+                        .data = .{ .name = "codepoint" },
+                        ._pad = .{ .omit = true },
+                    } },
+                ) },
+                .codepoint_grapheme = .{ .codepoint = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "codepoint"),
+                    .{ .fields = .{
+                        .data = .{ .name = "codepoint" },
+                        ._pad = .{ .omit = true },
+                    } },
+                ) },
+                .bg_color_palette = .{ .color_palette = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "color_palette"),
+                    .{ .fields = .{
+                        .data = .{
+                            .name = "index",
+                            .type_name = "GhosttyColorPaletteIndex",
+                        },
+                        ._pad = .{ .omit = true },
+                    } },
+                ) },
+                .bg_color_rgb = .{ .color_rgb = lib.Packed(
+                    @FieldType(@FieldType(Cell, "content"), "color_rgb"),
+                    .{},
+                ) },
+            } },
+        ) } },
+        .style_id = .{ .type_name = "GhosttyStyleId" },
+        .wide = .{ .type_name = "GhosttyCellWide" },
+        .semantic_content = .{ .type_name = "GhosttyCellSemanticContent" },
+        ._padding = .{ .omit = true },
+    } });
+
     /// The backing integer of this packed struct. Prefer this over
     /// hardcoding the integer type so that code is resilient to the
     /// size changing.
@@ -2239,6 +2386,12 @@ pub const Cell = packed struct(u64) {
 /// struct T, used for masked compares of raw backing-integer values
 /// (e.g. `Row.Backing`, `Cell.Backing`). This is an implementation
 /// detail of `Mask`, which is the public API built on top of this.
+///
+/// A field may be a dot-separated path (e.g. "content.codepoint.data")
+/// to cover only a nested field of a packed struct or packed union
+/// member. This allows a mask to be more precise than a whole
+/// top-level field, e.g. covering the codepoint bits of a cell without
+/// its padding.
 fn fieldMask(
     comptime T: type,
     comptime fields: []const []const u8,
@@ -2246,16 +2399,33 @@ fn fieldMask(
     // Backing int of the packed struct
     const Int = @typeInfo(T).@"struct".backing_integer.?;
 
-    var mask: Int = 0;
-    inline for (fields) |field| {
+    comptime var mask: Int = 0;
+    inline for (fields) |path| {
+        // Walk the path to find the total bit offset and the type of
+        // the (possibly nested) field.
+        comptime var offset = 0;
+        comptime var Field = T;
+        comptime var it = std.mem.splitScalar(u8, path, '.');
+        inline while (comptime it.next()) |name| {
+            offset += switch (@typeInfo(Field)) {
+                .@"struct" => @bitOffsetOf(Field, name),
+
+                // Packed union members all share bit offset zero.
+                .@"union" => |u| offset: {
+                    comptime assert(u.layout == .@"packed");
+                    break :offset 0;
+                },
+
+                else => @compileError("invalid field path: " ++ path),
+            };
+            Field = @FieldType(Field, name);
+        }
+
         // The type that fits all the bits we need to set.
-        const Ones = std.meta.Int(
-            .unsigned,
-            @bitSizeOf(@FieldType(T, field)),
-        );
+        const Ones = std.meta.Int(.unsigned, @bitSizeOf(Field));
 
         // Mask out the ones
-        mask |= @as(Int, std.math.maxInt(Ones)) << @bitOffsetOf(T, field);
+        mask |= @as(Int, std.math.maxInt(Ones)) << offset;
     }
 
     return mask;
@@ -2378,6 +2548,21 @@ pub fn Mask(
             return pattern(v) == expected;
         }
 
+        /// Returns true if any value in the group of group_len values
+        /// starting at index i has masked fields equal to the expected
+        /// pattern (see `pattern`). This is the "any" counterpart to
+        /// `eql`: use it to detect the presence of a specific value
+        /// within a group, e.g. a run scan that must stop when it
+        /// encounters a sentinel codepoint anywhere in the group.
+        pub inline fn eqlAny(
+            values: []const T,
+            i: usize,
+            expected: Backing,
+        ) bool {
+            const masked = load(values, i) & @as(Group, @splat(mask));
+            return @reduce(.Or, masked == @as(Group, @splat(expected)));
+        }
+
         /// Like `eql` but returns the number of leading values whose
         /// masked fields equal the expected pattern, i.e. group_len if
         /// the entire group matches. This is useful for early-exit run
@@ -2496,6 +2681,59 @@ test "Mask" {
         styled_other.style_id = 6;
         try testing.expectEqual(M.strip(styled), M.strip(styled_other));
         try testing.expect(M.strip(styled) != M.strip(styled2));
+    }
+
+    // eqlAny: presence of a matching value anywhere in the group
+    {
+        const expected = M.pattern(styled);
+        var cells: [4]Cell = .{ plain, plain, plain, plain };
+        try testing.expect(!M.eqlAny(&cells, 0, expected));
+
+        cells[2] = styled;
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+
+        // Masked compare: same masked fields with a different
+        // codepoint still matches.
+        cells[2] = styled2;
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+    }
+}
+
+test "Mask nested field path" {
+    // Mask only the codepoint data bits of the content field, not
+    // the padding next to it or any other field.
+    const M = Mask(Cell, &.{"content.codepoint.data"}, 4);
+
+    const a: Cell = .init('A');
+    var b: Cell = .init('A');
+    b.style_id = 5;
+    b.wide = .wide;
+    const c: Cell = .init('C');
+
+    // Same codepoint matches regardless of other fields.
+    const expected = M.pattern(a);
+    try testing.expect(M.eqlScalar(b, expected));
+    try testing.expect(!M.eqlScalar(c, expected));
+
+    // The mask must cover exactly the codepoint data bits.
+    const cp_offset = @bitOffsetOf(Cell, "content");
+    try testing.expectEqual(
+        @as(u64, std.math.maxInt(u21)) << cp_offset,
+        comptime fieldMask(Cell, &.{"content.codepoint.data"}),
+    );
+
+    // Group variants
+    {
+        var cells: [4]Cell = .{ a, b, a, b };
+        try testing.expect(M.eql(&cells, 0, expected));
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+
+        cells[1] = c;
+        try testing.expect(!M.eql(&cells, 0, expected));
+        try testing.expect(M.eqlAny(&cells, 0, expected));
+
+        const none: [4]Cell = .{ c, c, c, c };
+        try testing.expect(!M.eqlAny(&none, 0, expected));
     }
 }
 
@@ -2738,6 +2976,49 @@ test "Page appendGrapheme larger than chunk" {
     for (0..count) |i| {
         try testing.expectEqual(@as(u21, @intCast(0x0A + i)), cps[i]);
     }
+}
+
+test "Page appendGrapheme caps codepoints per cell" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.* = .init('A');
+
+    for (0..grapheme_max_len + 16) |i| {
+        try page.appendGrapheme(rac.row, rac.cell, @intCast(0x0300 + i));
+    }
+
+    const cps = page.lookupGrapheme(rac.cell).?;
+    try testing.expectEqual(@as(usize, grapheme_max_len), cps.len);
+    for (0..grapheme_max_len) |i| {
+        try testing.expectEqual(@as(u21, @intCast(0x0300 + i)), cps[i]);
+    }
+}
+
+test "Page setGraphemes caps codepoints per cell" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    var input: [grapheme_max_len + 16]u21 = undefined;
+    for (&input, 0..) |*cp, i| cp.* = @intCast(0x0300 + i);
+
+    const rac = page.getRowAndCell(0, 0);
+    rac.cell.* = .init('A');
+    try page.setGraphemes(rac.row, rac.cell, &input);
+
+    try testing.expectEqual(
+        @as(usize, grapheme_max_len),
+        page.lookupGrapheme(rac.cell).?.len,
+    );
 }
 
 test "Page clearGrapheme not all cells" {
