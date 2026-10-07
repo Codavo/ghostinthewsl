@@ -943,6 +943,8 @@ pub fn performAction(
             const initial = switch (value) {
                 .surface => rt_surface.getTitle() orelse "",
                 .tab => window.getActiveTabTitle() orelse "",
+                // Window title overrides aren't supported on Win32 yet.
+                .window => return false,
             };
             self.prompt_dialog.open(
                 window,
@@ -950,6 +952,7 @@ pub fn performAction(
                 switch (value) {
                     .surface => .surface_title,
                     .tab => .tab_title,
+                    .window => unreachable,
                 },
                 initial,
             ) catch return false;
@@ -1065,6 +1068,11 @@ pub fn performAction(
             return window.gotoTab(value);
         },
         .show_gtk_inspector => return false,
+        // Not yet supported on Win32.
+        .export_terminal_io,
+        .set_window_title,
+        .move_tab_to_new_window,
+        => return false,
         .render_inspector => {
             const core = switch (target) {
                 .app => return false,
@@ -1176,6 +1184,8 @@ pub fn performIpc(
             }
             return true;
         },
+        // Not yet supported on Win32.
+        .new_tab => return false,
         .toggle_quick_terminal => {
             switch (target) {
                 .class => |class| {

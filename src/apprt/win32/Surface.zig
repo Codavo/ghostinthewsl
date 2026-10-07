@@ -930,28 +930,41 @@ pub fn clipboardRequest(
     self: *Self,
     _: apprt.Clipboard,
     req: apprt.ClipboardRequest,
-) !bool {
-    const surface = self.core_surface orelse return false;
+) !apprt.ClipboardReadResult {
+    const surface = self.core_surface orelse return .unsupported;
+
+    switch (req) {
+        .paste, .osc_52_read, .list => {},
+        // The Kitty clipboard protocol (OSC 5522) isn't supported on Win32
+        // yet. Reporting unsupported lets the core answer ENOSYS.
+        .kitty_read, .kitty_write => return .unsupported,
+        // OSC 52 writes go straight to setClipboard.
+        .osc_52_write => unreachable,
+    }
 
     // Try to read text from the Win32 clipboard synchronously
-    if (OpenClipboard(self.hwnd) == 0) return false;
+    if (OpenClipboard(self.hwnd) == 0) return .unavailable;
     defer _ = CloseClipboard();
 
     const CF_UNICODETEXT: UINT = 13;
     const handle = GetClipboardData(CF_UNICODETEXT);
-    if (handle == null) return false;
+    if (handle == null) return .unavailable;
 
     const ptr: ?[*:0]const u16 = @ptrCast(@alignCast(GlobalLock(handle)));
-    if (ptr == null) return false;
+    if (ptr == null) return .unavailable;
     defer _ = GlobalUnlock(handle);
 
     // Convert UTF-16 to UTF-8
     const alloc = if (self.app) |app| app.alloc else std.heap.page_allocator;
-    const utf8 = std.unicode.utf16LeToUtf8AllocZ(alloc, std.mem.span(ptr.?)) catch return false;
+    const utf8 = std.unicode.utf16LeToUtf8AllocZ(alloc, std.mem.span(ptr.?)) catch return .unavailable;
     defer alloc.free(utf8);
 
-    try surface.completeClipboardRequest(req, utf8, true);
-    return true;
+    try surface.completeClipboardRequest(req, .{
+        .contents = &.{.{ .mime = "text/plain", .data = utf8 }},
+        .available = &.{"text/plain"},
+        .confirmed = true,
+    });
+    return .started;
 }
 
 pub fn setClipboard(
