@@ -2429,6 +2429,14 @@ keybind: Keybinds = .{},
 /// Completely blank lines always have their whitespace trimmed.
 @"clipboard-trim-trailing-spaces": bool = true,
 
+/// Trims trailing newlines (`\r` and `\n`) from plain text data that is
+/// copied to the clipboard. Selections that extend past the end of the
+/// text, or over rows that only contain spaces (common in full-screen
+/// TUIs that pad their output), otherwise end with one or more line
+/// breaks. This does not affect data sent to the clipboard via
+/// `clipboard-write` or the HTML portion of a copy.
+@"clipboard-trim-trailing-newlines": bool = true,
+
 /// Require confirmation before pasting text that appears unsafe. This helps
 /// prevent a "copy/paste attack" where a user may accidentally execute unsafe
 /// commands by pasting text with newlines.

@@ -301,6 +301,7 @@ const DerivedConfig = struct {
     clipboard_read: configpkg.ClipboardAccess,
     clipboard_write: configpkg.ClipboardAccess,
     clipboard_trim_trailing_spaces: bool,
+    clipboard_trim_trailing_newlines: bool,
     clipboard_paste_protection: bool,
     clipboard_paste_bracketed_safe: bool,
     clipboard_codepoint_map: configpkg.Config.RepeatableClipboardCodepointMap,
@@ -380,6 +381,7 @@ const DerivedConfig = struct {
             .clipboard_read = config.@"clipboard-read",
             .clipboard_write = config.@"clipboard-write",
             .clipboard_trim_trailing_spaces = config.@"clipboard-trim-trailing-spaces",
+            .clipboard_trim_trailing_newlines = config.@"clipboard-trim-trailing-newlines",
             .clipboard_paste_protection = config.@"clipboard-paste-protection",
             .clipboard_paste_bracketed_safe = config.@"clipboard-paste-bracketed-safe",
             .clipboard_codepoint_map = try config.@"clipboard-codepoint-map".clone(alloc),
@@ -2242,6 +2244,13 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     };
 }
 
+/// Drop trailing line breaks from formatted plain text if configured.
+fn trimClipboardNewlines(self: *const Surface, aw: *std.Io.Writer.Allocating) void {
+    if (!self.config.clipboard_trim_trailing_newlines) return;
+    const trimmed = std.mem.trimEnd(u8, aw.written(), "\r\n");
+    aw.shrinkRetainingCapacity(trimmed.len);
+}
+
 fn copySelectionToClipboards(
     self: *Surface,
     sel: terminal.Selection,
@@ -2273,6 +2282,7 @@ fn copySelectionToClipboards(
             var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
+            self.trimClipboardNewlines(&aw);
             try contents.append(alloc, .{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
@@ -2318,6 +2328,7 @@ fn copySelectionToClipboards(
             var formatter: ScreenFormatter = .init(self.io.terminal.screens.active, opts);
             formatter.content = .{ .selection = sel };
             try formatter.format(&aw.writer);
+            self.trimClipboardNewlines(&aw);
             try contents.append(alloc, .{
                 .mime = "text/plain",
                 .data = try aw.toOwnedSliceSentinel(0),
