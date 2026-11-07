@@ -1880,10 +1880,26 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
                         0xC0 => '`',
                         else => 0,
                     };
+                    // A Ctrl-only press never reaches the core as text: the
+                    // WM_CHAR that TranslateMessage generates for it is a C0
+                    // control character, which handleTextInput drops. Pass the
+                    // key's unshifted character as text instead, like the GTK
+                    // apprt does for Ctrl combos, so the encoder applies the
+                    // same rules as on other platforms. Without this, keys the
+                    // encoder deliberately leaves to their text (Ctrl+[,
+                    // Ctrl+i and Ctrl+m are CSI u per fixterms) send nothing.
+                    var text_buf: [4]u8 = undefined;
+                    const text: []const u8 = text: {
+                        const ctrl_only = mods.ctrl and !mods.alt and !mods.shift and !mods.super;
+                        if (!ctrl_only or unshifted == 0) break :text "";
+                        const len = std.unicode.utf8Encode(unshifted, &text_buf) catch break :text "";
+                        break :text text_buf[0..len];
+                    };
                     const event = input.KeyEvent{
                         .action = .press,
                         .key = key,
                         .mods = mods,
+                        .utf8 = text,
                         .unshifted_codepoint = unshifted,
                     };
                     const effect = core.keyCallback(event) catch |err| {
